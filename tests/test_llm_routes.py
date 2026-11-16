@@ -176,6 +176,27 @@ def test_shared_endpoint_without_a_key_is_off(client, app, gated):
     assert client.get("/api/llm/status", headers=gated).get_json()["mode"] == "none"
 
 
+@pytest.mark.parametrize("who", ["gated", "outsider"])
+def test_status_says_the_platform_has_a_shared_key(client, who, request):
+    body = client.get("/api/llm/status", headers=request.getfixturevalue(who)).get_json()
+    assert body["shared_key_configured"] is True
+    assert body["shared_key_allowed"] is (who == "gated")
+
+
+@pytest.mark.parametrize("who", ["gated", "outsider"])
+def test_status_says_the_platform_has_no_shared_key(client, app, who, request):
+    app.config["LLM_SHARED_ENDPOINT"]["api_key"] = ""
+    body = client.get("/api/llm/status", headers=request.getfixturevalue(who)).get_json()
+    assert body["shared_key_configured"] is False
+    assert body["shared_key_allowed"] is False
+
+
+def test_shared_key_configured_reveals_nothing_about_the_key(client, outsider):
+    text = client.get("/api/llm/status", headers=outsider).get_data(as_text=True)
+    assert "shared-key" not in text
+    assert "llm.test/v1" not in text
+
+
 def test_acknowledgement_reaches_the_audit_hook_once(client, app, gated):
     events = []
     app.config["LLM_AUDIT_HOOK"] = lambda event, owner_id, **fields: events.append(
