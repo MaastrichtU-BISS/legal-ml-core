@@ -14,7 +14,13 @@ import uuid
 from flask import Blueprint, current_app, jsonify, request
 
 from ..auth import get_jwt_identity, jwt_required
-from ..compute.summarization import DEFAULT_MODEL, abstractive_available, allowed_models, parse_request
+from ..compute.summarization import (
+    DEFAULT_MODEL,
+    SummaryValidationError,
+    abstractive_available,
+    allowed_models,
+    parse_request,
+)
 from ..job_state import DEFAULT_STALE_SECONDS, worker_is_alive
 from ..queue_contract import SUMMARIZATION_QUEUE
 from ..summary_state import public_view, read_summary_status, write_summary_status
@@ -39,12 +45,13 @@ def submit_summary():
     body = request.get_json(silent=True)
     try:
         summary_request = parse_request(body, current_app.config)
-    except ValueError as e:
-        return jsonify({"error": str(e)}), 400
+    except SummaryValidationError as e:
+        return jsonify({"error": str(e), "field": e.field}), 400
 
     request_id = body.get("request_id") or str(uuid.uuid4())
-    if not isinstance(request_id, str) or not _REQUEST_ID.match(request_id):
-        return jsonify({"error": "request_id must be 1-128 letters, digits or _ . : -"}), 400
+    # "models" is GET /api/summarize/models, so it can never be a job id.
+    if not isinstance(request_id, str) or not _REQUEST_ID.match(request_id) or request_id == "models":
+        return jsonify({"error": "request_id must be 1-128 letters, digits or _ . : - and not 'models'", "field": "request_id"}), 400
 
     redis_client = current_app.redis_client
     if read_summary_status(redis_client, request_id) is not None:

@@ -177,7 +177,11 @@ def test_submit_rejects_bad_input_and_reused_ids(client, auth_headers):
     assert client.post("/api/summarize", json={"input_text": ""}, headers=auth_headers).status_code == 400
     assert client.post("/api/summarize", json={"input_text": "x", "model": "gpt"}, headers=auth_headers).status_code == 400
     bad_id = client.post("/api/summarize", json={"input_text": "x", "request_id": "a/b"}, headers=auth_headers)
-    assert bad_id.status_code == 400
+    assert bad_id.status_code == 400 and bad_id.get_json()["field"] == "request_id"
+    reserved = client.post("/api/summarize", json={"input_text": "x", "request_id": "models"}, headers=auth_headers)
+    assert reserved.status_code == 400
+    bad_model = client.post("/api/summarize", json={"input_text": "x", "model": "gpt"}, headers=auth_headers)
+    assert bad_model.get_json()["field"] == "model"
     assert client.post("/api/summarize", json={"input_text": "x", "request_id": "dup"}, headers=auth_headers).status_code == 202
     assert client.post("/api/summarize", json={"input_text": "x", "request_id": "dup"}, headers=auth_headers).status_code == 409
 

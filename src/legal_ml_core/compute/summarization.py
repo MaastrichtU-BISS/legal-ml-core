@@ -73,6 +73,14 @@ SummaryLength = Union[str, int]
 ProgressFn = Callable[[int], None]
 
 
+class SummaryValidationError(ValueError):
+    """A request the caller must fix; `field` names the offending body field."""
+
+    def __init__(self, message, field):
+        super().__init__(message)
+        self.field = field
+
+
 @dataclass(frozen=True)
 class SummaryRequest:
     input_text: str
@@ -137,42 +145,46 @@ def normalise_model(model: Optional[str], config=None) -> str:
     if model.startswith("hf:"):
         if model in {m["id"] for m in allowed_models(config)["abstractive"]}:
             return model
-        raise ValueError(f"Model '{model}' is not offered by this deployment")
-    raise ValueError(
-        f"Unknown model '{model}'. Use one of {sorted(_EXTRACTIVE_IDS)} or an hf: model from /api/summarize/models"
+        raise SummaryValidationError(f"Model '{model}' is not offered by this deployment", "model")
+    raise SummaryValidationError(
+        f"Unknown model '{model}'. Use one of {sorted(_EXTRACTIVE_IDS)} or an hf: model from /api/summarize/models",
+        "model",
     )
 
 
 def _unit_interval(value, name) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 <= value <= 1:
-        raise ValueError(f"priority.{name} must be a number between 0 and 1")
+        raise SummaryValidationError(f"priority.{name} must be a number between 0 and 1", f"priority.{name}")
     return float(value)
 
 
 def parse_request(body, config=None) -> SummaryRequest:
-    """Validate a POST /api/summarize body. Raises ValueError with a message
-    fit to return to the caller."""
+    """Validate a POST /api/summarize body. Raises SummaryValidationError
+    (a ValueError) with a message fit to return to the caller."""
     if not isinstance(body, dict):
-        raise ValueError("Request body must be a JSON object")
+        raise SummaryValidationError("Request body must be a JSON object", None)
 
     text = body.get("input_text")
     if not isinstance(text, str) or not text.strip():
-        raise ValueError("input_text is required")
+        raise SummaryValidationError("input_text is required", "input_text")
     max_chars = (config or {}).get("LEGAL_ML_SUMMARIZATION_MAX_INPUT_CHARS", DEFAULT_MAX_INPUT_CHARS)
     if len(text) > max_chars:
-        raise ValueError(f"input_text is longer than {max_chars} characters")
+        raise SummaryValidationError(f"input_text is longer than {max_chars} characters", "input_text")
 
     length = body.get("summary_length", "medium")
     if isinstance(length, bool) or not (
         length in SUMMARY_LENGTHS or (isinstance(length, int) and 0 < length <= MAX_TARGET_WORDS)
     ):
-        raise ValueError(f"summary_length must be one of {list(SUMMARY_LENGTHS)} or a word count from 1 to {MAX_TARGET_WORDS}")
+        raise SummaryValidationError(
+            f"summary_length must be one of {list(SUMMARY_LENGTHS)} or a word count from 1 to {MAX_TARGET_WORDS}",
+            "summary_length",
+        )
 
     priority = body.get("priority")
     if priority is None:
         priority = {}
     if not isinstance(priority, dict):
-        raise ValueError("priority must be an object")
+        raise SummaryValidationError("priority must be an object", "priority")
     relevance = _unit_interval(priority.get("relevance", 0.5), "relevance")
     readability = _unit_interval(priority.get("readability", 0.5), "readability")
 

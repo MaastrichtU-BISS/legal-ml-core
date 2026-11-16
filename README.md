@@ -173,11 +173,12 @@ package's worker on `summarization_queue`; job state is a Redis key
 
 | Route | |
 |---|---|
-| `POST /api/summarize` | Queue a summary. Body: `input_text` (required), `summary_length` (`short`/`medium`/`long` or a target word count), `priority` (`relevance`, `readability`, each 0-1), `model`, optional `request_id`. Answers 202 with the job's status. |
+| `POST /api/summarize` | Queue a summary. Body: `input_text` (required), `summary_length` (`short`/`medium`/`long` or a target word count, 1-5000), `priority` (`relevance`, `readability`, each 0-1), `model`, optional `request_id`. Answers 202 with the job's status. |
 | `GET /api/summarize/<request_id>` | Status: `queued` → `processing` → `complete` (with `summarized_text`) or `error`. Only the job's owner sees it; anyone else gets 404. A queued job carries `status_message` when no worker is running. |
 | `GET /api/summarize/models` | The catalogue: extractive `lex_rank` (default), `lsa`, `text_rank`, `luhn`, `edmundson`; abstractive `hf:` models; whether abstractive is available. |
 
-Clients poll; there is no SSE stream. Unknown models are rejected with 400
+Clients poll; there is no SSE stream. A 400 carries `error` and `field` (the body field to fix). `models` is not a
+valid `request_id`. Unknown models are rejected with 400
 (the old service silently fell back to LexRank), and a request can only name
 an `hf:` model the deployment offers, so no caller can make the worker
 download an arbitrary hub model.
