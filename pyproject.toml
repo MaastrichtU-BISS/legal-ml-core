@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "legal-ml-core"
 version = "0.1.0"
-description = "Core ML feature (datasets, training, prediction, visualization, EDA, annotation, experiment monitoring) for BAIGLE-style legal-ML apps — Flask blueprints, SQLAlchemy models, and the training/prediction/explanation compute engine, shared between the API process and the worker process."
+description = "Core ML feature (datasets, training, prediction, visualization, EDA, annotation, experiment monitoring, summarization) for BAIGLE-style legal-ML apps — Flask blueprints, SQLAlchemy models, and the training/prediction/explanation compute engine, shared between the API process and the worker process."
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.11"
@@ -23,6 +23,7 @@ dependencies = [
     "accelerate>=0.24",
     "spacy>=3.7,<4",
     "nltk>=3.8,<4",
+    "sumy>=0.11,<1",  # extractive summarisation (compute/summarization.py)
     "plotly>=5.17,<6",
     "lime>=0.2.0",
     "shap>=0.43",

@@ -1,4 +1,5 @@
-"""Worker entrypoint: consumes the training/prediction/explanation Redis queues.
+"""Worker entrypoint: consumes the training/prediction/explanation/summarization
+Redis queues.
 
 Runs as its own process (typically its own Docker container), sharing no
 Python objects with the Flask API process, but importing the exact same
@@ -25,12 +26,15 @@ from flask import Flask
 from .compute.tasks import process_explanation_task, process_prediction_task, process_training_task
 from .db import db, get_db, set_active_db
 from .compute.tasks import REDIS_DOWN_ERRORS
+from .compute import summarization
 from .job_state import ACTIVE_JOB_STATUSES, COULD_NOT_START_MESSAGE, transition
 from .liveness import DEFAULT_TIMINGS, start_worker_liveness
+from .summary_state import SUMMARY_FAILED_MESSAGE, write_summary_status
 from .queue_contract import (
     EXPLANATION_RESULT_TTL_SECONDS,
     JOB_STATUS_TTL_SECONDS,
     PREDICTION_RESULT_TTL_SECONDS,
+    SUMMARIZATION_QUEUE,
     explanation_result_key,
     job_status_key,
     prediction_result_key,
@@ -233,6 +237,41 @@ def _explanation_loop(
     _consume(redis_client, explanation_queue, handle, on_error, "explanation", sleep=sleep, stop=stop)
 
 
+def _summarization_loop(redis_client, summarization_queue=SUMMARIZATION_QUEUE, sleep=time.sleep, stop=None):
+    """Runs queued summaries. No database: state lives in Redis
+    (summary_state). A ValueError/RuntimeError from the summariser is the
+    caller's to read (bad model, missing dependency); anything else is logged
+    and reported as SUMMARY_FAILED_MESSAGE."""
+
+    def handle(raw):
+        task = json.loads(raw)
+        request_id, owner_id = task["request_id"], task["owner_id"]
+
+        def progress(pct):
+            write_summary_status(redis_client, request_id, owner_id, "processing", pct)
+
+        progress(10)
+        try:
+            text = summarization.summarize(summarization.SummaryRequest.from_payload(task), on_progress=progress)
+        except (ValueError, RuntimeError) as e:
+            logger.warning("summary %s failed: %s", request_id, e)
+            write_summary_status(redis_client, request_id, owner_id, "error", 100, error=str(e))
+            return
+        write_summary_status(redis_client, request_id, owner_id, "complete", 100, summarized_text=text)
+        logger.info("summary %s complete (%s)", request_id, task.get("model"))
+
+    def on_error(raw, exc):
+        try:
+            task = json.loads(raw)
+            request_id, owner_id = task["request_id"], task["owner_id"]
+        except Exception:
+            logger.error("summarization loop: unparseable task dropped (%s)", type(exc).__name__)
+            return
+        write_summary_status(redis_client, request_id, owner_id, "error", 100, error=SUMMARY_FAILED_MESSAGE)
+
+    _consume(redis_client, summarization_queue, handle, on_error, "summarization", sleep=sleep, stop=stop)
+
+
 def run_ml_worker(
     redis_url,
     database_url,
@@ -242,8 +281,9 @@ def run_ml_worker(
     prediction_queue="prediction_queue",
     explanation_queue="explanation_queue",
     liveness=DEFAULT_TIMINGS,
+    summarization_queue=SUMMARIZATION_QUEUE,
 ):
-    """Starts the training/prediction/explanation queue-consumer threads.
+    """Starts the training/prediction/explanation/summarization queue-consumer threads.
 
     Set `block=False` to start the threads and return immediately (e.g. when
     the host app's own worker process wants to run this alongside its own
@@ -258,11 +298,13 @@ def run_ml_worker(
     logging.basicConfig(level=logging.INFO)
     redis_client = _connect_redis(redis_url)
     app = _build_worker_app(database_url)
+    summarization.ensure_nltk_data()
 
     threads = [
         threading.Thread(target=_training_loop, args=(redis_client, model_storage_path, app, training_queue, liveness), daemon=True),
         threading.Thread(target=_prediction_loop, args=(redis_client, model_storage_path, app, prediction_queue), daemon=True),
         threading.Thread(target=_explanation_loop, args=(redis_client, model_storage_path, app, explanation_queue), daemon=True),
+        threading.Thread(target=_summarization_loop, args=(redis_client, summarization_queue), daemon=True),
     ]
     for t in threads:
         t.start()
@@ -270,7 +312,11 @@ def run_ml_worker(
     start_worker_liveness(redis_client, liveness)
 
     logger.info(
-        "legal_ml_core worker running (%s, %s, %s)", training_queue, prediction_queue, explanation_queue
+        "legal_ml_core worker running (%s, %s, %s, %s)",
+        training_queue,
+        prediction_queue,
+        explanation_queue,
+        summarization_queue,
     )
 
     if not block:
