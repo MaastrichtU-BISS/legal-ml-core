@@ -38,6 +38,26 @@ def test_train_classification_model_all_algorithms(fake_redis, classification_df
     assert fake_redis.get("confusion_matrix_test-model-1") is not None
 
 
+def _fitted_estimator(trainer):
+    calibrated = getattr(trainer.model, "calibrated_classifiers_", None)
+    return calibrated[0].estimator if calibrated else trainer.model
+
+
+@pytest.mark.parametrize(
+    "model_type", ["svm", "decision_tree", "random_forest", "logistic_regression"]
+)
+@pytest.mark.parametrize("chosen, expected", [("balanced", "balanced"), ("none", None)])
+def test_class_weight_reaches_the_estimator(fake_redis, classification_df, model_type, chosen, expected):
+    trainer = MLModelTrainer(redis_client=fake_redis)
+    texts, labels, _ = trainer.preprocess_data(classification_df, "classification", {})
+
+    trainer.train_classification_model(
+        texts, labels, model_type, {"model_id": "weighted", "class_weight": chosen}
+    )
+
+    assert _fitted_estimator(trainer).class_weight == expected
+
+
 @pytest.mark.parametrize("model_type", ["kmeans", "hierarchical", "dbscan"])
 def test_train_clustering_model(fake_redis, classification_df, model_type):
     trainer = MLModelTrainer(redis_client=fake_redis)
@@ -77,3 +97,17 @@ def test_save_and_reload_model(fake_redis, classification_df, tmp_path):
     assert loaded["model"] is not None
     assert loaded["vectorizer"] is not None
     assert loaded["label_encoder"] is not None
+
+
+@pytest.mark.parametrize("model_type", ["logistic_regression", "naive_bayes"])
+def test_labels_with_a_single_row_still_train(fake_redis, classification_df, model_type):
+    # A stratified split needs two rows of every label; with a label seen once
+    # (common in imported data) the split is made without stratifying.
+    rare = pd.DataFrame({"text": ["a one-off ruling on maritime salvage", "a lone tax matter"], "label": ["salvage", "tax"]})
+    df = pd.concat([classification_df, rare], ignore_index=True)
+    trainer = MLModelTrainer(redis_client=fake_redis)
+    texts, labels, _ = trainer.preprocess_data(df, "classification", {})
+
+    metrics = trainer.train_classification_model(texts, labels, model_type, {"model_id": "rare-1"})
+
+    assert 0.0 <= metrics["accuracy"] <= 1.0

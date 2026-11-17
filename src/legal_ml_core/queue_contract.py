@@ -6,10 +6,12 @@ make the previously-implicit dict shapes explicit, not to add a new
 validation layer that could reject payloads the working code already handles.
 
 Queue names (Redis lists, `LPUSH`/`BRPOP`):
-  training_queue, prediction_queue, explanation_queue, summarization_queue
+  training_queue, prediction_queue, explanation_queue, llm_queue, scoring_queue,
+  summarization_queue
 
 Result keys (Redis strings/lists, `SETEX`/`LPUSH` + `GET`/`BLPOP`):
   job_status_{job_id}, prediction_result_{prediction_id}, explanation_{explanation_id},
+  llm_job_status_{job_id},
   summary_status_{request_id} -- written by the API when a summary is queued and by
   the worker as it runs; carries the owner_id, which the API strips on read.
 
@@ -35,7 +37,10 @@ JOB_CANCEL_TTL_SECONDS = 24 * 3600
 JOB_STATUS_TTL_SECONDS = 3600
 
 PREDICTION_RESULT_TTL_SECONDS = 300
+BATCH_PREDICTION_RESULT_TTL_SECONDS = 1800
 EXPLANATION_RESULT_TTL_SECONDS = 3600
+LLM_JOB_STATUS_TTL_SECONDS = 24 * 3600
+MODEL_EXPORT_RESULT_TTL_SECONDS = 600
 
 WORKER_LIVENESS_KEY = "legal_ml_worker_alive"
 
@@ -56,8 +61,30 @@ def prediction_result_key(prediction_id):
     return f"prediction_result_{prediction_id}"
 
 
+def batch_prediction_request_key(batch_id):
+    return f"batch_prediction_{batch_id}"
+
+
+def batch_prediction_result_key(batch_id):
+    return f"batch_prediction_result_{batch_id}"
+
+
 def explanation_result_key(explanation_id):
     return f"explanation_{explanation_id}"
+
+
+def llm_seed_job_key(dataset_id):
+    """The LLM job choosing this dataset's first active learning batch."""
+    return f"al_seed_job_{dataset_id}"
+
+
+def model_export_result_key(export_id):
+    """Where the worker answers an export request (BAIGLE #69)."""
+    return f"model_export_result_{export_id}"
+
+
+def llm_job_status_key(job_id):
+    return f"llm_job_status_{job_id}"
 
 
 SUMMARIZATION_QUEUE = "summarization_queue"
@@ -83,6 +110,25 @@ class TrainingTaskPayload(TypedDict, total=False):
     preprocessing_options: dict
     test_size: float
     random_state: int
+    al_round_id: str  # set on an active learning round's run: rescore after it
+
+
+class ScoringTaskPayload(TypedDict):
+    """Sent once a round's model is saved. The worker rescores the pool."""
+
+    round_id: str
+    dataset_id: str
+    model_id: str
+    strategy: str
+
+
+class VerifyTaskPayload(TypedDict):
+    """Sent by POST /datasets/<id>/verify, on the same queue. The worker grades
+    the saved model on the holdout."""
+
+    action: str  # always "verify"
+    dataset_id: str
+    model_id: str
 
 
 class JobStatusUpdate(TypedDict, total=False):
@@ -121,6 +167,27 @@ class ExplanationResult(TypedDict, total=False):
     method: str
     model_id: str
     status: str
+    error: str
+
+
+class LLMAnnotationTaskPayload(TypedDict):
+    """Carries the credential *mode*, never a key: the worker reads keys from
+    the database or its own environment, so none pass through Redis."""
+
+    job_id: str
+    dataset_id: str
+    owner_id: str
+    mode: str  # "shared" | "byok"
+    task_ids: List[str]
+
+
+class LLMJobStatus(TypedDict, total=False):
+    owner_id: str
+    status: str  # "queued" | "running" | "completed" | "failed" | "budget_exhausted"
+    total: int
+    done: int
+    created: int
+    invalid: int
     error: str
 
 

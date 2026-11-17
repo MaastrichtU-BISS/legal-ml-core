@@ -1,5 +1,4 @@
-"""Worker entrypoint: consumes the training/prediction/explanation/summarization
-Redis queues.
+"""Worker entrypoint: consumes the training/prediction/batch prediction/explanation/LLM/scoring/summarization Redis queues.
 
 Runs as its own process (typically its own Docker container), sharing no
 Python objects with the Flask API process, but importing the exact same
@@ -23,26 +22,33 @@ from datetime import datetime
 import redis as redis_lib
 from flask import Flask
 
+from .active_learning.scoring import fail_scoring_round, process_scoring_task, requeue_unfinished_scoring
 from .compute.tasks import process_explanation_task, process_prediction_task, process_training_task
 from .db import db, get_db, set_active_db
 from .compute.tasks import REDIS_DOWN_ERRORS
 from .compute import summarization
 from .job_state import ACTIVE_JOB_STATUSES, COULD_NOT_START_MESSAGE, transition
 from .liveness import DEFAULT_TIMINGS, start_worker_liveness
+from .llm.suggest import fail_llm_job, process_llm_annotation_task
 from .summary_state import SUMMARY_FAILED_MESSAGE, write_summary_status
 from .queue_contract import (
+    BATCH_PREDICTION_RESULT_TTL_SECONDS,
     EXPLANATION_RESULT_TTL_SECONDS,
     JOB_STATUS_TTL_SECONDS,
+    MODEL_EXPORT_RESULT_TTL_SECONDS,
     PREDICTION_RESULT_TTL_SECONDS,
+    batch_prediction_result_key,
     SUMMARIZATION_QUEUE,
     explanation_result_key,
     job_status_key,
+    model_export_result_key,
     prediction_result_key,
 )
 
 logger = logging.getLogger(__name__)
 
 LOOP_ERROR_MESSAGE = COULD_NOT_START_MESSAGE
+BATCH_PREDICTION_FAILED_MESSAGE = "This batch could not be predicted. Try again."
 
 
 def _build_worker_app(database_url):
@@ -168,11 +174,14 @@ def _training_loop(
     liveness=DEFAULT_TIMINGS,
     sleep=time.sleep,
     stop=None,
+    scoring_queue="scoring_queue",
 ):
     def handle(raw):
         task_info = json.loads(raw)
         with app.app_context():
-            process_training_task(task_info, redis_client, model_storage_path, liveness=liveness)
+            process_training_task(
+                task_info, redis_client, model_storage_path, liveness=liveness, scoring_queue=scoring_queue
+            )
 
     _consume(
         redis_client,
@@ -190,6 +199,8 @@ def _prediction_loop(
 ):
     def handle(raw):
         task_info = json.loads(raw)
+        if task_info.get("action") == "export":
+            return _export(task_info)
         prediction_id = task_info["prediction_id"]
         with app.app_context():
             result = process_prediction_task(task_info, model_storage_path)
@@ -198,7 +209,25 @@ def _prediction_loop(
         redis_client.expire(result_key, PREDICTION_RESULT_TTL_SECONDS)
         logger.info("prediction completed (%s)", prediction_id)
 
+    def _export(task_info):
+        # Publishing asks for an export on this queue: it needs the same stack.
+        from .compute.export import process_export_task
+
+        with app.app_context():
+            result = process_export_task(task_info, model_storage_path)
+        _answer_export(task_info["export_id"], result)
+        logger.info("export completed (%s)", task_info["export_id"])
+
+    def _answer_export(export_id, result):
+        result_key = model_export_result_key(export_id)
+        redis_client.lpush(result_key, json.dumps(result))
+        redis_client.expire(result_key, MODEL_EXPORT_RESULT_TTL_SECONDS)
+
     def on_error(raw, exc):
+        export_id = _parse_field(raw, "export_id")
+        if export_id:
+            _answer_export(export_id, {"error": str(exc)})
+            return
         prediction_id = _parse_field(raw, "prediction_id")
         if prediction_id:
             result_key = prediction_result_key(prediction_id)
@@ -206,6 +235,38 @@ def _prediction_loop(
             redis_client.expire(result_key, PREDICTION_RESULT_TTL_SECONDS)
 
     _consume(redis_client, prediction_queue, handle, on_error, "prediction", sleep=sleep, stop=stop)
+
+
+def _batch_prediction_loop(
+    redis_client, model_storage_path, app, batch_prediction_queue="batch_prediction_queue", sleep=time.sleep, stop=None
+):
+    def store(batch_id, record):
+        redis_client.setex(
+            batch_prediction_result_key(batch_id), BATCH_PREDICTION_RESULT_TTL_SECONDS, json.dumps(record)
+        )
+
+    def handle(raw):
+        task_info = json.loads(raw)
+        batch_id = task_info["batch_id"]
+        with app.app_context():
+            result = process_prediction_task({**task_info, "prediction_id": batch_id}, model_storage_path)
+        # The owner_id is what lets the polling route check who is asking.
+        store(batch_id, {**result, "status": "completed", "owner_id": task_info["owner_id"]})
+        logger.info("batch prediction completed (%s)", batch_id)
+
+    def on_error(raw, exc):
+        batch_id = _parse_field(raw, "batch_id")
+        if batch_id:
+            store(
+                batch_id,
+                {
+                    "status": "failed",
+                    "error": BATCH_PREDICTION_FAILED_MESSAGE,
+                    "owner_id": _parse_field(raw, "owner_id"),
+                },
+            )
+
+    _consume(redis_client, batch_prediction_queue, handle, on_error, "batch prediction", sleep=sleep, stop=stop)
 
 
 def _explanation_loop(
@@ -235,6 +296,36 @@ def _explanation_loop(
             )
 
     _consume(redis_client, explanation_queue, handle, on_error, "explanation", sleep=sleep, stop=stop)
+
+
+def _llm_loop(redis_client, app, llm_queue="llm_queue", sleep=time.sleep, stop=None):
+    def handle(raw):
+        task_info = json.loads(raw)
+        with app.app_context():
+            process_llm_annotation_task(task_info, redis_client)
+
+    def on_error(raw, exc):
+        with app.app_context():
+            db.session.rollback()
+            fail_llm_job(raw, redis_client)
+
+    _consume(redis_client, llm_queue, handle, on_error, "llm", sleep=sleep, stop=stop)
+
+
+def _scoring_loop(
+    redis_client, model_storage_path, app, scoring_queue="scoring_queue", sleep=time.sleep, stop=None
+):
+    def handle(raw):
+        task_info = json.loads(raw)
+        with app.app_context():
+            process_scoring_task(task_info, model_storage_path)
+
+    def on_error(raw, exc):
+        with app.app_context():
+            db.session.rollback()
+            fail_scoring_round(_parse_field(raw, "round_id"))
+
+    _consume(redis_client, scoring_queue, handle, on_error, "scoring", sleep=sleep, stop=stop)
 
 
 def _summarization_loop(redis_client, summarization_queue=SUMMARIZATION_QUEUE, sleep=time.sleep, stop=None):
@@ -281,6 +372,10 @@ def run_ml_worker(
     prediction_queue="prediction_queue",
     explanation_queue="explanation_queue",
     liveness=DEFAULT_TIMINGS,
+    llm_queue="llm_queue",
+    usage_meter=None,
+    scoring_queue="scoring_queue",
+    batch_prediction_queue="batch_prediction_queue",
     summarization_queue=SUMMARIZATION_QUEUE,
 ):
     """Starts the training/prediction/explanation/summarization queue-consumer threads.
@@ -292,18 +387,35 @@ def run_ml_worker(
     `liveness` (LivenessTimings) sets the heartbeat interval (15s), the stale
     window (120s) and the job-status TTL (3600s). The API's sweep reads its
     stale window from `LEGAL_ML_HEARTBEAT_STALE_SECONDS`; keep the two equal.
+
+    `usage_meter` meters shared-key tokens for batch LLM jobs, and must be the
+    same kind the API uses (the API's `USAGE_METER`). It defaults to the DB
+    counter. The shared endpoint and encryption key come from the environment
+    (see llm/config.py).
     """
     # No-op when the host already configured logging; otherwise the worker's
     # startup and job lines go to stderr like the print()s they replaced.
     logging.basicConfig(level=logging.INFO)
     redis_client = _connect_redis(redis_url)
     app = _build_worker_app(database_url)
+    if usage_meter is not None:
+        app.config["USAGE_METER"] = usage_meter
+
+    try:
+        with app.app_context():
+            requeue_unfinished_scoring(redis_client, scoring_queue)
+    except Exception:
+        logger.exception("could not requeue unfinished scoring rounds")
+
     summarization.ensure_nltk_data()
 
     threads = [
-        threading.Thread(target=_training_loop, args=(redis_client, model_storage_path, app, training_queue, liveness), daemon=True),
+        threading.Thread(target=_training_loop, args=(redis_client, model_storage_path, app, training_queue, liveness), kwargs={"scoring_queue": scoring_queue}, daemon=True),
         threading.Thread(target=_prediction_loop, args=(redis_client, model_storage_path, app, prediction_queue), daemon=True),
+        threading.Thread(target=_batch_prediction_loop, args=(redis_client, model_storage_path, app, batch_prediction_queue), daemon=True),
         threading.Thread(target=_explanation_loop, args=(redis_client, model_storage_path, app, explanation_queue), daemon=True),
+        threading.Thread(target=_llm_loop, args=(redis_client, app, llm_queue), daemon=True),
+        threading.Thread(target=_scoring_loop, args=(redis_client, model_storage_path, app, scoring_queue), daemon=True),
         threading.Thread(target=_summarization_loop, args=(redis_client, summarization_queue), daemon=True),
     ]
     for t in threads:
@@ -312,10 +424,13 @@ def run_ml_worker(
     start_worker_liveness(redis_client, liveness)
 
     logger.info(
-        "legal_ml_core worker running (%s, %s, %s, %s)",
+        "legal_ml_core worker running (%s, %s, %s, %s, %s, %s, %s)",
         training_queue,
         prediction_queue,
+        batch_prediction_queue,
         explanation_queue,
+        llm_queue,
+        scoring_queue,
         summarization_queue,
     )
 

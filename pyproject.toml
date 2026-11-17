@@ -4,37 +4,67 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "legal-ml-core"
-version = "0.1.0"
+version = "0.14.0"
 description = "Core ML feature (datasets, training, prediction, visualization, EDA, annotation, experiment monitoring, summarization) for BAIGLE-style legal-ML apps — Flask blueprints, SQLAlchemy models, and the training/prediction/explanation compute engine, shared between the API process and the worker process."
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.11"
+authors = [{ name = "Shashank Chakravarthy" }]
+keywords = ["legal NLP", "no-code machine learning", "education", "Legal Blocks", "Flask"]
+classifiers = [
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Framework :: Flask",
+    "Intended Audience :: Education",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
 dependencies = [
     "Flask>=2.3,<3",
     "Flask-SQLAlchemy>=3.0.5,<4",
     "SQLAlchemy>=2.0,<3",
-    "PyJWT[crypto]>=2.8,<3",  # Keycloak/OIDC bearer-token validation (see auth.py)
+    "PyJWT[crypto]>=2.15,<3",  # Keycloak/OIDC bearer-token validation (see auth.py); 2.15 caps refreshes for unknown key ids
     "redis>=5.0,<6",
     "psycopg2-binary>=2.9.7,<3",  # legal_ml_core.worker builds its own engine against DATABASE_URL
     "pandas>=2.1,<3",
     "numpy>=1.24,<2",
-    "scikit-learn>=1.4,<2",  # AgglomerativeClustering `metric=`/NMF `alpha_W=` kwargs require >=1.4
+    # 1.8 is the first where LogisticRegression's l1_ratio picks the penalty on its own,
+    # which the trainer relies on (shashankmc/reducing_digital_divide#76). Lift the
+    # cap once the suite passes on 1.10.
+    "scikit-learn>=1.8,<1.10",
+    "plotly>=5.17,<6",
+    "joblib>=1.3",
+    "requests>=2.31,<3",  # OpenAI-compatible LLM endpoint calls (see llm/client.py)
+    "cryptography>=42",  # Fernet encryption of stored BYOK keys (see llm/access.py)
+]
+
+[project.urls]
+Homepage = "https://github.com/shashankmc/legal-ml-core"
+Repository = "https://github.com/shashankmc/legal-ml-core"
+Issues = "https://github.com/shashankmc/legal-ml-core/issues"
+Changelog = "https://github.com/shashankmc/legal-ml-core/blob/main/CHANGELOG.md"
+
+[project.optional-dependencies]
+# The worker's training, prediction and explanation stack. Install it where
+# `run_ml_worker` runs; the API process does not need it. Install CPU torch first
+# (`--index-url https://download.pytorch.org/whl/cpu`) unless you want the CUDA
+# build PyPI serves by default, which is several GB larger.
+compute = [
     "transformers[torch]>=4.35,<5",
     "accelerate>=0.24",
     "spacy>=3.7,<4",
     "nltk>=3.8,<4",
     "sumy>=0.11,<1",  # extractive summarisation (compute/summarization.py)
-    "plotly>=5.17,<6",
     "lime>=0.2.0",
     "shap>=0.43",
-    "joblib>=1.3",
+    "skops>=0.10",  # publishing exports scikit-learn Models as skops (compute/export.py)
 ]
-
-[project.optional-dependencies]
 test = [
+    "legal-ml-core[compute]",
     "pytest>=7.4",
     "pytest-cov>=4.1",
     "fakeredis>=2.20",
+    "PyYAML>=6.0",  # tests/test_openapi.py reads docs/openapi.yaml
+    "alembic>=1.13",  # tests build the migrations; hosts supply it at runtime
 ]
 
 [tool.setuptools.packages.find]

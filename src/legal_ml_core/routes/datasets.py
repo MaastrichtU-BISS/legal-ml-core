@@ -1,8 +1,21 @@
-from flask import Blueprint, request, jsonify, current_app
+from flask import Blueprint, request, jsonify, current_app, has_app_context
 from ..auth import jwt_required, get_jwt_identity
+from werkzeug.exceptions import RequestEntityTooLarge
 from werkzeug.utils import secure_filename
 from ..db import db
-from ..models import Dataset
+from ..dataset_creation import DatasetInvalid, create_dataset
+from ..models import AnnotationTask, Dataset
+from ..annotation_format import label_from_assignment, stored_payload
+from ..annotation_queue import LABEL_COLUMNS, create_annotation_tasks
+from ..kit_exchange import ExchangeError, rows_from_task_data, task_data_from_dataset
+from ..text_terms import (
+    LABEL_COL_NAMES,
+    TEXT_COL_NAMES,
+    find_column,
+    label_values,
+    text_values,
+    texts_containing,
+)
 import pandas as pd
 import os
 import uuid
@@ -11,7 +24,22 @@ import json
 datasets_bp = Blueprint("datasets", __name__)
 
 ALLOWED_EXTENSIONS = {"csv", "xlsx", "json"}
-MAX_ROWS = 10000
+# The row cap when the host sets none. Hosts set LEGAL_ML_MAX_ROWS to a whole
+# number, or to a function returning one (read on every upload, so a cap an
+# admin changes applies at once).
+MAX_ROWS = 1000
+
+
+def max_rows():
+    """The row cap for a new dataset: the host's LEGAL_ML_MAX_ROWS, else MAX_ROWS."""
+    cap = current_app.config.get("LEGAL_ML_MAX_ROWS") if has_app_context() else None
+    if callable(cap):
+        cap = cap()
+    if cap is None:
+        return MAX_ROWS
+    if isinstance(cap, bool) or not isinstance(cap, int) or cap <= 0:
+        raise ValueError(f"LEGAL_ML_MAX_ROWS must be a whole number above 0, not {cap!r}")
+    return cap
 
 # Single source of truth for upload task types. The frontend renders this
 # catalogue (via GET /datasets/task-types) so its task guidance cannot drift
@@ -145,6 +173,8 @@ def validate_dataset_file(file_path, task_type, annotation_mode=False):
         task_type: Type of task (classification, ner, etc.)
         annotation_mode: If True, label columns are optional. If False, they are required.
     """
+    # Outside the try: a misconfigured cap is the host's error, not the file's.
+    cap = max_rows()
     try:
         if file_path.endswith(".csv"):
             df = pd.read_csv(file_path)
@@ -156,8 +186,8 @@ def validate_dataset_file(file_path, task_type, annotation_mode=False):
             return None, "Unsupported file format"
 
         # Check row count limit
-        if len(df) > MAX_ROWS:
-            return None, f"Dataset exceeds maximum allowed rows ({MAX_ROWS})"
+        if len(df) > cap:
+            return None, f"Dataset exceeds maximum allowed rows ({cap})"
 
         # Enhanced validation based on task type
         columns = [col.lower() for col in df.columns]
@@ -260,6 +290,13 @@ def get_dataset(dataset_id):
         return jsonify({"error": str(e)}), 500
 
 
+def _too_large_message():
+    limit = current_app.config.get("MAX_CONTENT_LENGTH")
+    if not limit:
+        return "That file is too large."
+    return f"That file is too large. Upload a file under {limit / (1024 * 1024):g} MB."
+
+
 @datasets_bp.route("/upload", methods=["POST"])
 @jwt_required()
 def upload_dataset():
@@ -289,9 +326,7 @@ def upload_dataset():
         description = request.form.get("description", "").strip()
         task_type = request.form.get("task_type", "").strip()
         annotation_mode = request.form.get("annotation_mode", "false").lower() == "true"
-        labels_str = request.form.get(
-            "labels", ""
-        )  # Comma-separated labels or JSON array
+        labels_str = request.form.get("labels", "")
 
         if not name:
             return jsonify({"error": "Dataset name is required"}), 400
@@ -299,91 +334,138 @@ def upload_dataset():
         if not task_type:
             return jsonify({"error": "Task type is required"}), 400
 
-        # Parse labels
-        labels = []
-        if labels_str:
-            try:
-                # Try to parse as JSON array first
-                if labels_str.startswith("["):
-                    labels = json.loads(labels_str)
-                else:
-                    # Otherwise treat as comma-separated values
-                    labels = [
-                        label.strip()
-                        for label in labels_str.split(",")
-                        if label.strip()
-                    ]
-            except (json.JSONDecodeError, ValueError):
-                labels = [
-                    label.strip() for label in labels_str.split(",") if label.strip()
-                ]
-
-        # Validate task type
-        if task_type not in VALID_TASK_TYPES:
-            return (
-                jsonify(
-                    {
-                        "error": f'Invalid task type. Valid types: {", ".join(VALID_TASK_TYPES)}'
-                    }
-                ),
-                400,
-            )
-
-        # Save file
-        filename = secure_filename(file.filename)
-        unique_filename = f"{uuid.uuid4()}_{filename}"
-        file_path = os.path.join(current_app.config["UPLOAD_FOLDER"], unique_filename)
+        file_path = os.path.join(
+            current_app.config["UPLOAD_FOLDER"],
+            f"{uuid.uuid4()}_{secure_filename(file.filename)}",
+        )
         file.save(file_path)
 
-        # Validate dataset (pass annotation_mode to validation function)
-        df, error = validate_dataset_file(
-            file_path, task_type, annotation_mode=annotation_mode
-        )
-        if error:
-            os.remove(file_path)  # Clean up file
-            return jsonify({"error": error}), 400
-
-        # Get column information
-        columns_info = []
-        for col in df.columns:
-            col_info = {
-                "name": col,
-                "type": str(df[col].dtype),
-                "null_count": int(df[col].isnull().sum()),
-                "unique_count": int(df[col].nunique()),
-            }
-            columns_info.append(col_info)
-
-        # Create dataset record
-        dataset = Dataset(
-            owner_id=owner_id,
-            name=name,
-            description=description,
-            file_path=file_path,
-            row_count=len(df),
-            columns=columns_info,
-            task_type=task_type,
-            labels=labels if labels else None,
-        )
-
-        db.session.add(dataset)
-        db.session.commit()
+        try:
+            dataset = create_dataset(
+                owner_id=owner_id,
+                file_path=file_path,
+                name=name,
+                description=description,
+                task_type=task_type,
+                annotation_mode=annotation_mode,
+                labels=_parse_labels(labels_str),
+            )
+        except DatasetInvalid as refused:
+            os.remove(file_path)
+            return jsonify({"error": str(refused)}), 400
+        except Exception:
+            # Anything else is the host's to handle (BAIGLE's error handler
+            # logs it and shows a generic message); keep no orphaned file.
+            db.session.rollback()
+            os.remove(file_path)
+            raise
 
         return (
-            jsonify(
-                {
-                    "message": "Dataset uploaded successfully",
-                    "dataset": dataset.to_dict(),
-                }
-            ),
+            jsonify({"message": "Dataset uploaded successfully", "dataset": dataset.to_dict()}),
             201,
         )
 
-    except Exception as e:
-        db.session.rollback()
-        if "file_path" in locals() and os.path.exists(file_path):
-            os.remove(file_path)  # Clean up file
-        return jsonify({"error": str(e)}), 500
+    except RequestEntityTooLarge:
+        # Raised while the form is read, before anything is saved (BAIGLE #99).
+        return jsonify({"error": _too_large_message()}), 413
+
+
+KIT_FORMAT = "legal-annotation-kit"
+
+
+@datasets_bp.route("/<dataset_id>/annotations/export", methods=["GET"])
+@jwt_required()
+def export_annotations(dataset_id):
+    """The Dataset's annotation tasks as vue-legal-annotation-kit TaskData."""
+    dataset = Dataset.query.filter_by(id=dataset_id, owner_id=get_jwt_identity()).first()
+    if not dataset:
+        return jsonify({"error": "Dataset not found"}), 404
+    if request.args.get("format", KIT_FORMAT) != KIT_FORMAT:
+        return jsonify({"error": f"Annotations export as {KIT_FORMAT} only."}), 400
+
+    tasks = AnnotationTask.query.filter_by(dataset_id=dataset.id).all()
+    response = jsonify(task_data_from_dataset(dataset, tasks))
+    filename = secure_filename(f"{dataset.name}-annotations.json") or "annotations.json"
+    response.headers["Content-Disposition"] = f'attachment; filename="{filename}"'
+    return response, 200
+
+
+@datasets_bp.route(f"/import/{KIT_FORMAT}", methods=["POST"])
+@jwt_required()
+def import_kit_task():
+    """A vue-legal-annotation-kit task file as a new Dataset. Each document is an
+    item; the Assignment kept for it is saved on its task as a human label, so
+    the Dataset can train at once and the kit can reopen every item as it was."""
+    try:
+        owner_id = get_jwt_identity()
+        file = request.files.get("file")
+        name = request.form.get("name", "").strip()
+        if not file or not file.filename:
+            return jsonify({"error": "No file provided"}), 400
+        if not name:
+            return jsonify({"error": "Dataset name is required"}), 400
+        try:
+            plan = rows_from_task_data(json.load(file.stream))
+        except ValueError as e:  # ExchangeError, or a file that is not JSON
+            message = str(e) if isinstance(e, ExchangeError) else "The file is not JSON."
+            return jsonify({"error": message}), 400
+
+        label_name = LABEL_COLUMNS[plan.task_type]
+        # CSV, as training reads the stored file with pd.read_csv. Labels stay blank
+        # in the file: they live on the tasks, with their Assignments.
+        file_path = os.path.join(current_app.config["UPLOAD_FOLDER"], f"{uuid.uuid4()}_kit_import.csv")
+        pd.DataFrame({"text": [text for text, _ in plan.items], label_name: ""}).to_csv(file_path, index=False)
+        try:
+            dataset = create_dataset(
+                owner_id=owner_id,
+                file_path=file_path,
+                name=name,
+                description=request.form.get("description", "").strip(),
+                task_type=plan.task_type,
+                annotation_mode=True,
+                labels=plan.labels,
+            )
+            create_annotation_tasks(dataset)
+            db.session.flush()
+            tasks = {t.item_index: t for t in AnnotationTask.query.filter_by(dataset_id=dataset.id)}
+            labelled = 0
+            for index, (text, assignment) in enumerate(plan.items):
+                if assignment is None:
+                    continue
+                task = tasks[index]
+                task.annotation_label = label_from_assignment(plan.task_type, assignment, text, plan.labels)
+                task.annotation_payload = stored_payload(assignment, task)
+                task.status = "annotated"
+                task.label_source = "human"
+                labelled += 1
+            db.session.commit()
+        except DatasetInvalid as refused:
+            db.session.rollback()
+            os.remove(file_path)
+            return jsonify({"error": str(refused)}), 400
+        except Exception:
+            # create_dataset has already committed the Dataset; leave nothing half made.
+            db.session.rollback()
+            Dataset.query.filter_by(owner_id=owner_id, file_path=file_path).delete()
+            db.session.commit()
+            if os.path.exists(file_path):
+                os.remove(file_path)
+            raise
+
+        return jsonify({"dataset": dataset.to_dict(), "labelled": labelled, "set_aside": plan.set_aside}), 201
+
+    except RequestEntityTooLarge:
+        return jsonify({"error": _too_large_message()}), 413
+
+
+def _parse_labels(labels_str):
+    """Labels from the upload form: a JSON array, or comma-separated values."""
+    if labels_str.startswith("["):
+        try:
+            return json.loads(labels_str)
+        except ValueError:
+            pass
+    return [label.strip() for label in labels_str.split(",") if label.strip()]
 
 
 @datasets_bp.route("/task-types", methods=["GET"])
@@ -461,6 +543,21 @@ def paginated_dataset_rows(dataset_id):
             df = pd.read_json(dataset.file_path)
         else:
             return jsonify({"error": "Unsupported file format"}), 400
+
+        # Optional filters for opening a distinctive term from EDA. They match
+        # the way EDA counts texts, so the filtered total equals `in_class`.
+        term = request.args.get("term", default="", type=str).strip()
+        label = request.args.get("label", default=None, type=str)
+        if term:
+            text_col = find_column(df, TEXT_COL_NAMES)
+            if text_col is None:
+                return jsonify({"error": "This Dataset has no text column to search"}), 400
+            df = df[texts_containing(text_values(df, text_col), term).to_numpy()]
+        if label is not None:
+            label_col = find_column(df, LABEL_COL_NAMES)
+            if label_col is None:
+                return jsonify({"error": "This Dataset has no label column to filter by"}), 400
+            df = df[(label_values(df, label_col) == label).to_numpy()]
 
         total = len(df)
         window = df.iloc[offset : offset + limit]

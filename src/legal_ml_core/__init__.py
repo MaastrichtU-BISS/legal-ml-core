@@ -9,16 +9,25 @@ from .auth import (
     verify_bearer_token,
 )
 from .blueprint import init_ml_feature
+from .dataset_creation import DatasetInvalid, create_dataset
 from .db import MLBase, db, get_db, set_active_db
 from .models import (
+    ALConfig,
+    ALRound,
     AnnotationTask,
     Dataset,
+    LLMAcknowledgement,
+    LLMCredential,
+    LLMPrompt,
+    LLMSuggestion,
+    LLMUsage,
     MLProject,
     Model,
     ModelComparison,
     TrainingJob,
     TrainingMetricPoint,
 )
+from .llm import DBUsageMeter, UsageMeter, purge_owner_llm_data
 from .ownership import (
     HostModelOwnerRef,
     KeycloakOwnerRef,
@@ -26,7 +35,17 @@ from .ownership import (
     OwnerRef,
     owner_ref,
 )
-from .worker import run_ml_worker
+
+# The worker imports the training stack (torch, transformers, shap, lime, nltk),
+# which only `legal-ml-core[compute]` installs. Loading it on first use keeps
+# `import legal_ml_core` cheap for an API process without that extra.
+def __getattr__(name):
+    if name == "run_ml_worker":
+        from .worker import run_ml_worker
+
+        return run_ml_worker
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
 
 __all__ = [
     "AuthError",
@@ -40,6 +59,8 @@ __all__ = [
     "get_jwt",
     "get_jwt_identity",
     "init_ml_feature",
+    "create_dataset",
+    "DatasetInvalid",
     "jwt_required",
     "owner_ref",
     "run_ml_worker",
@@ -53,5 +74,15 @@ __all__ = [
     "TrainingJob",
     "ModelComparison",
     "AnnotationTask",
+    "ALConfig",
+    "ALRound",
     "TrainingMetricPoint",
+    "LLMAcknowledgement",
+    "LLMCredential",
+    "LLMPrompt",
+    "LLMSuggestion",
+    "LLMUsage",
+    "DBUsageMeter",
+    "UsageMeter",
+    "purge_owner_llm_data",
 ]

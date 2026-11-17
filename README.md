@@ -1,5 +1,8 @@
 # legal-ml-core
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![CI](https://github.com/shashankmc/legal-ml-core/actions/workflows/ci.yml/badge.svg)](https://github.com/shashankmc/legal-ml-core/actions/workflows/ci.yml)
+
 Core ML feature for BAIGLE-style legal-ML apps — dataset management, model
 training/prediction/explanation, visualization, EDA, annotation, and
 experiment monitoring — as an installable Flask package, extracted from the
@@ -16,17 +19,201 @@ representations of the same database schema).
 - Model catalog, configuration, training, prediction, LIME/SHAP explanation
 - Visualization (performance metrics, confusion matrix, clustering, topic modeling, model comparison)
 - Annotation task queue
+- Active learning: holdout, seed batch, five query strategies, user-triggered
+  retrain and pool scoring on the worker
 - Summarization: extractive (sumy) and abstractive (HuggingFace) text
   summaries as a queued operation, folded in from `legal-summarizer-service`
 - Experiment monitoring: per-training-job metric time series (dense for the
   HuggingFace Trainer path, coarse phase markers for classical sklearn
   algorithms) and cross-run hyperparameter-vs-performance comparison
+- LLM annotation: suggestions for a batch or a whole dataset, through one
+  OpenAI-compatible adapter, with a host-gated shared key or a user's own key
 - Pluggable ownership: opaque `owner_id` scoped by a Keycloak subject, a host
   resolver, or nothing (single-tenant) — no local user table required
 
 Out of scope (stays in the host app): auth, generic project CRUD, and the
 unrelated "learning platform" tutorials feature (including its sandboxed
 code-execution/package-installation queues).
+
+## Active learning
+
+A user-driven loop for single-label text classification, under
+`/api/active-learning`. `POST /datasets/<id>/start` draws the holdout once and
+shuffles a random seed batch. The queue then serves by score. Nothing retrains by
+itself: the state reports `retrain.suggested` once a batch of new labels exists
+and every label has its minimum, and `POST /datasets/<id>/retrain` trains. The
+worker then rescores the pool on `scoring_queue`, so the queue reorders.
+
+The first batch can instead be suggested by an LLM (`seed_source: "llm"`), so a
+rare label is in it from the start. The LLM labels three batches' worth of the
+random order on the worker, and the first batch is taken from that, each
+suggested label in turn, rarest first; every item in it comes with its
+suggestion. It needs labels named on the Dataset, the same access and
+acknowledgement as LLM annotation, and `confirm_estimate: true` after
+`POST /datasets/<id>/seed-estimate`. The state's `seed` reports the job. If the
+job fails, the random order stays.
+
+A Dataset that does not name its labels can get one wrong by a typo, so
+`PUT /datasets/<id>/labels` corrects a typed label on every saved item. With a loop
+started, every way to train keeps the minimum per label, not only `retrain`.
+
+Held-out rows are never queued, trained on or sent to an LLM, and are not drawn
+from rows an LLM has touched. Metrics come from
+them (`metrics.verification == "holdout"`). With the holdout off or too few of
+its rows labelled, or with a Model that has no `predict_proba` over a vectorizer
+(a transformer), `metrics.verification` is `not_independently_verified`, and a UI
+must show that instead of a grade. `GET queue/next?holdout=1` serves held-out
+items for labelling and `POST /datasets/<id>/verify` grades the saved model.
+
+Host config: `LEGAL_ML_AL_STRATEGIES` (allowed list, default all five),
+`LEGAL_ML_AL_DEFAULT_STRATEGY` (default `prediction_entropy`),
+`LEGAL_ML_AL_BATCH_SIZE` (20), `LEGAL_ML_AL_MIN_PER_CLASS` (5, also the floor),
+`LEGAL_ML_AL_CAP_BATCHES` (5: past this many batches of labels, a class short of
+its minimum no longer holds training back),
+`LEGAL_ML_AL_HOLDOUT_PERCENT` (20), `LEGAL_ML_AL_SCORING_STALE_SECONDS` (3600, how
+long a round waits for the scoring worker before it is called lost),
+`LEGAL_ML_SCORING_QUEUE` (`scoring_queue`, the same name passed to
+`run_ml_worker(scoring_queue=...)`).
+
+## Creating a dataset from a file
+
+The upload route is a thin wrapper over `create_dataset`, which hosts can call
+directly to bring data in another way (an import job, for example), so every
+dataset passes the same checks:
+
+```python
+from legal_ml_core import DatasetInvalid, create_dataset
+
+try:
+    dataset = create_dataset(
+        owner_id=user_id, file_path=path, name="LEDGAR sample", description="",
+        task_type="classification", annotation_mode=False, labels=None,
+    )
+except DatasetInvalid as refused:
+    ...  # str(refused) is safe to show a student
+```
+
+The caller owns the file: `create_dataset` neither moves nor deletes it. Any
+other exception is a bug or an outage and is left to the host.
+
+The row cap is 1,000 unless the host sets `LEGAL_ML_MAX_ROWS` to a whole number,
+or to a function returning one. A function is read on every upload, so a cap an
+admin changes applies at once. A cap of 0 or less raises `ValueError`.
+
+## Exporting a Model for publishing
+
+`request_model_export(redis_client, model, texts)` asks the worker to export a
+classification Model in a format safe to publish (BAIGLE #69), and waits up to
+110 seconds. The API process cannot do it itself: a saved Model's preprocessor
+needs nltk and a transformer needs torch. The worker writes, to
+`<model storage>/export_<model id>/`:
+
+- scikit-learn: `model.skops` (vectorizer and classifier), or transformers:
+  `model.safetensors`, `config.json` and the tokenizer files;
+- `preprocessing.json`: the text cleaning, the labels in output order, the
+  library versions, and for skops the types the file may contain;
+- `predict.py`: a reference script that cleans text and predicts with only
+  those files.
+
+It then runs that `predict.py` on `texts` and compares it with the platform's own
+predictions. The answer is `{"directory", "files", "round_trip": {"ok", "detail",
+"compared"}}`; publish only when `ok`. The request travels on the prediction
+queue as `{"action": "export", ...}`, so no extra worker loop is needed.
+
+## Annotation format
+
+A saved annotation is a
+[vue-legal-annotation-kit](https://github.com/shashankmc/vue-legal-annotation-kit)
+Assignment. `GET /api/annotation/tasks/<id>/assignment` opens a task with its
+text, Assignment, labels and annotation level (`document` for the single-label
+types, `word` for NER); `PUT` saves one. The Assignment is stored as sent in
+`annotation_payload`, and the label training reads, `annotation_label`, is
+derived from it in `legal_ml_core.annotation_format`:
+
+- **Single-label types:** exactly one document tag, from the Dataset's labels if
+  it names them. The tag's label is the label.
+- **NER:** spans inside the text that do not overlap, saved as the entity list
+  `[{text, start, end, type}]` in text order.
+
+A broken rule is a 400 that says which.
+
+Every row with text has a task. A row the uploaded file labels starts labelled
+(`label_source: file`, the file's value kept in `file_label`), so it trains as is
+and can be reviewed and changed; `GET /api/annotation/projects/<id>/tasks?status=annotated&label=…&limit=…&offset=…`
+lists labelled items for review. NER files name types, not spans, so their rows
+stay pending, with the types as `hint` on the assignment. Anything else that sets a label (the
+plain `/save`, confirming an LLM suggestion) replaces the Assignment, which is
+then rebuilt from the label when opened, as it is for tasks saved before the
+payload existed; correcting a typed label renames it inside the Assignment.
+
+### Exchanging annotations as kit JSON
+
+`GET /api/datasets/<id>/annotations/export` downloads a Dataset's annotation
+tasks as kit TaskData: one document per task, with an assignment for each
+labelled one. `POST /api/datasets/import/legal-annotation-kit` (multipart:
+`file`, `name`, `description`) makes a Dataset from such a file, for example one
+exported from Legal Blocks. Document-level tasks become classification, span
+tasks NER. Each kept assignment is saved on its task as a human label, so the
+Dataset trains at once and relations, confidence and metadata survive an export
+and re-import. A document with several assignments keeps the finished one with
+most annotations; the response counts the rest as `set_aside`.
+
+## LLM annotation
+
+Everything under `/api/llm` is described in `docs/openapi.yaml`. Suggestions never
+become labels by themselves: a human confirms them, or bulk-accepts after an
+agreement check. Single-label classification only.
+
+The package holds no policy. A host configures:
+
+```python
+app.config["FEATURE_GATE"] = lambda feature, claims: my_policy(feature, claims)
+app.config["LLM_SHARED_ENDPOINT"] = {
+    "base_url": "https://openrouter.ai/api/v1",
+    "api_key": os.environ["OPENROUTER_API_KEY"],
+    "model": "...",
+    "destination": "OpenRouter",  # shown to users before their text is sent
+    "extra_body": {"provider": {"zdr": True, "data_collection": "deny"}},
+}
+app.config["LLM_ENCRYPTION_KEY"] = os.environ["LLM_ENCRYPTION_KEY"]  # Fernet key
+```
+
+- The shared key needs a token whose `email_verified` is `true` **and** a gate that
+  says yes. Without a `FEATURE_GATE`, nobody gets it. In `AUTH_MODE="platform"` the
+  host must put `email_verified` in the tokens it signs.
+- For llama.cpp or vLLM, point `base_url` at the server and drop `extra_body`. The
+  endpoint counts as configured only with an `api_key`, so use any non-empty value
+  for a server without auth.
+- The worker reads the same settings from the environment: `LLM_SHARED_BASE_URL`,
+  `LLM_SHARED_API_KEY`, `LLM_SHARED_MODEL`, `LLM_SHARED_DESTINATION`,
+  `LLM_SHARED_EXTRA_BODY` (JSON) and `LLM_ENCRYPTION_KEY`.
+- `USAGE_METER` replaces the default DB counter (`LLM_MONTHLY_TOKEN_CAP`, default
+  200000). Pass the same kind to `run_ml_worker(usage_meter=...)`.
+- `LLM_BYOK_ALLOWED_HOSTS` limits where users' keys may go. Unset, any public https
+  host is allowed.
+- Call `purge_owner_llm_data(owner_id)` from account erasure.
+- `LLM_AUDIT_HOOK`, a callable `(event, owner_id, **fields)`, receives each new
+  acknowledgement for the host's audit log.
+
+Other settings and defaults are in `llm/config.py`.
+
+## Installing
+
+The API and the worker need different installs. The worker trains, predicts and
+explains, which needs torch, transformers, shap, lime and nltk; the API does not.
+
+```bash
+# API process
+pip install "legal-ml-core @ git+https://github.com/shashankmc/legal-ml-core.git@<tag>"
+
+# Worker process: CPU torch first, or PyPI serves the CUDA build, several GB larger
+pip install torch --index-url https://download.pytorch.org/whl/cpu
+pip install "legal-ml-core[compute] @ git+https://github.com/shashankmc/legal-ml-core.git@<tag>"
+```
+
+Importing `legal_ml_core` or mounting it with `init_ml_feature` never loads the
+training stack. `run_ml_worker` loads it on first use, and raises
+`ModuleNotFoundError` where the `[compute]` extra is missing.
 
 ## Installing into a host Flask app
 
@@ -136,6 +323,8 @@ argument).
 
 ## Running the worker
 
+Install the package with its `[compute]` extra wherever this runs (see Installing).
+
 ```python
 from legal_ml_core import run_ml_worker
 
@@ -163,6 +352,48 @@ own window is `run_ml_worker(liveness=legal_ml_core.liveness.LivenessTimings(sta
 ```python
 app.config["LEGAL_ML_HEARTBEAT_STALE_SECONDS"] = 120  # default
 ```
+
+## Monitoring settings
+
+Each training run is monitored by the settings under `parameters.monitoring`. A
+setting a run leaves out takes the host's default from `LEGAL_ML_MONITORING`,
+else the package's:
+
+```python
+app.config["LEGAL_ML_MONITORING"] = {
+    "log_every_n_steps": 10,   # how often fine-tuning logs, in steps
+    "eval_strategy": "epoch",  # or "steps", every eval_steps
+    "eval_steps": 100,
+    "include": ["*"],          # name globs of the points to store
+    "exclude": [],             # name globs of the points not to store
+    "learning_curve": False,   # classical classifiers: learning curve, slower
+    "system_metrics": False,   # record memory, GPU, speed and time left
+    "flush_every_points": 50,  # write waiting metric points once this many wait
+    "flush_every_seconds": 2.0,  # or once the oldest has waited this long
+}
+```
+
+Stage markers (`training_started`, `model_saved`, ...) are always stored. A bad
+setting in a run is refused with a 400 whose `field` is `monitoring.<setting>`; a
+bad host default stops `init_ml_feature`. Each run records the settings it used
+under `parameters.monitoring`.
+
+With `learning_curve` on, a classical Text Classification algorithm is also
+fitted on growing parts of its training split (10%, 25%, 50%, 75% and all of
+it). Each fit stores `learning_curve_train_accuracy` (group `train`) and
+`learning_curve_eval_accuracy` (group `eval`), with the part's size as
+`training_step`. Logistic regression also stores `loss` and `eval_loss` after up
+to 12 growing numbers of iterations, with the iteration as `training_step`.
+Training takes several times longer, so it is off by default. A Stop is
+honoured between fits.
+
+With `system_metrics` on, a run records `system` points: `memory_mb` (the worker
+process's memory), `gpu_memory_mb` and `gpu_use_percent` when CUDA is available,
+`samples_per_second` and, for fine-tuning, `seconds_remaining`. Fine-tuning takes
+them every `log_every_n_steps`; a classical run takes them at each stage, and its
+speed over the fit of the model it keeps, in training rows a second. Preparing the
+text, scoring and a learning curve's extra fits are not counted. Memory comes from psutil when it is installed, else from
+the standard library; GPU use needs pynvml.
 
 ## Summarization
 
@@ -201,10 +432,19 @@ epoch/step loop. Classical sklearn algorithms (SVM, decision tree, random
 forest, naive Bayes, logistic regression, KMeans/agglomerative/DBSCAN,
 LDA/NMF) fit synchronously with no epoch loop, so they only get coarse phase
 markers (`preprocessing_started`, `preprocessing_done`, `training_started`,
-`training_done`, `model_saved`). Cross-run hyperparameter-vs-performance
+`training_done`, `model_saved`), unless `monitoring.learning_curve` adds a
+learning curve to a Text Classification run (see Monitoring settings). Cross-run hyperparameter-vs-performance
 comparison (`GET /visualization/parameter-comparison`) works uniformly
 across all model types since it's retrospective, reading already-stored
 `Model.parameters`/`TrainingJob.metrics`.
+
+## API and data formats
+
+- [`docs/openapi.yaml`](docs/openapi.yaml): OpenAPI 3.1 description of every
+  HTTP route `init_ml_feature` registers (kept in sync by
+  `tests/test_openapi.py`).
+- [`docs/data-formats.md`](docs/data-formats.md): dataset upload columns per
+  task type, and how trained models are stored and exported.
 
 ## Development
 
@@ -212,3 +452,28 @@ across all model types since it's retrospective, reading already-stored
 pip install -e ".[test]"
 pytest
 ```
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for tests, releases and citation
+metadata, and [CHANGELOG.md](CHANGELOG.md) for what changed in each version.
+
+## How to cite
+
+If you use legal-ml-core in research or teaching, please cite it. The
+citation metadata is in [`CITATION.cff`](CITATION.cff) (GitHub's "Cite this
+repository" button reads it); [`codemeta.json`](codemeta.json) carries the
+same metadata in CodeMeta form.
+
+> Chakravarthy, S. (2026). *legal-ml-core* (Version 0.10.0) [Computer
+> software]. Maastricht University. https://github.com/shashankmc/legal-ml-core
+
+**DOI:** not yet assigned. Once the repository is connected to Zenodo, each
+GitHub release will be archived there and its DOI (and a DOI badge) will be
+added to this section and to `CITATION.cff`.
+
+The user interface for this backend is
+[vue-legal-ml-builder](https://github.com/shashankmc/vue-legal-ml-builder);
+cite both if you use both.
+
+## License
+
+[MIT](LICENSE) © 2026 Shashank Chakravarthy, Maastricht University.

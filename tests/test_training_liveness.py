@@ -236,6 +236,7 @@ def test_queued_job_has_no_waiting_message_while_a_worker_is_alive(
     fast_api, client, auth_headers, fake_redis, queued_job
 ):
     job_id = queued_job["job_id"]
+    fake_redis.lpush("training_queue", json.dumps({"job_id": job_id}))
     liveness = start_worker_liveness(fake_redis, FAST)
     try:
         time.sleep(FAST.stale_after * 2)  # survives past one stale window
@@ -256,6 +257,7 @@ def test_run_ml_worker_publishes_liveness(monkeypatch, fake_redis):
     monkeypatch.setattr(worker, "_training_loop", lambda *a, **k: None)
     monkeypatch.setattr(worker, "_prediction_loop", lambda *a, **k: None)
     monkeypatch.setattr(worker, "_explanation_loop", lambda *a, **k: None)
+    monkeypatch.setattr(worker, "_batch_prediction_loop", lambda *a, **k: None)
 
     started = []
     real_start = worker.start_worker_liveness
@@ -336,3 +338,12 @@ def test_stop_is_logged_with_job_id_and_owner(client, auth_headers, queued_job, 
 
     lines = [r.getMessage() for r in caplog.records if job_id in r.getMessage()]
     assert any("-> cancelled" in m and TEST_USER_ID in m for m in lines), lines
+
+
+def test_the_recovery_message_gives_a_no_code_user_a_next_step():
+    assert STALE_JOB_MESSAGE == (
+        "Training stopped before it finished, usually because the computer ran out of "
+        "memory. Your Dataset and labels are safe. Train again. If it stops a second "
+        "time, choose Logistic Regression, which needs the least memory, or use a "
+        "Dataset with fewer rows."
+    )

@@ -1,14 +1,44 @@
 from flask import Blueprint, request, jsonify, current_app
 from ..auth import jwt_required, get_jwt_identity
 from ..db import db
-from ..models import Model, Dataset, TrainingJob
+from ..active_learning.loop import training_refusal
+from ..annotation_queue import apply_saved_annotations
+from ..models import ALRound, Model, Dataset, TrainingJob
 from ..db_utils import project_belongs_to_owner
+from ..monitoring import monitoring_refusal, run_monitoring
+from ..job_state import (
+    ACTIVE_JOB_STATUSES,
+    COULD_NOT_START_MESSAGE,
+    DEFAULT_STALE_SECONDS,
+    sweep_lost_job,
+    transition,
+)
+import logging
 import os
 import json
 
+import pandas as pd
+from datetime import datetime
+
+logger = logging.getLogger(__name__)
+
 models_bp = Blueprint("models", __name__)
 
-# Available model types and their parameters
+# Rare labels count for more in training. Multinomial naive Bayes has no such option.
+CLASS_WEIGHT_PARAMETER = {
+    "type": "select",
+    "options": ["none", "balanced"],
+    "default": "none",
+    "label": "Balance Labels",
+    "description": "Give rare labels more weight in training",
+}
+
+# Available model types and their parameters: what the wizard offers and what
+# parameter_refusal accepts, read from the same table. A number stays within min
+# and max, and at_most_rows also keeps it within the Dataset's rows. A rule limits
+# `parameter` to `options` when its `when` holds, and `reason` says why in words.
+# `when` names parameter values, or `multiclass` for a Dataset of over two labels.
+# `label` is what the wizard calls a setting, and refusals call it the same.
 AVAILABLE_MODELS = {
     "classification": {
         "svm": {
@@ -16,31 +46,36 @@ AVAILABLE_MODELS = {
             "description": "Linear and non-linear classification using support vectors",
             "parameters": {
                 "kernel": {
+                    "label": "Kernel",
                     "type": "select",
                     "options": ["linear", "rbf", "poly", "sigmoid"],
                     "default": "rbf",
                     "description": "Kernel type",
                 },
                 "C": {
+                    "label": "Regularisation (C)",
                     "type": "float",
-                    "min": 0.1,
+                    "min": 0.001,
                     "max": 100.0,
                     "default": 1.0,
-                    "description": "Regularization parameter",
+                    "description": "Regularisation parameter",
                 },
                 "gamma": {
+                    "label": "Gamma",
                     "type": "select",
                     "options": ["scale", "auto"],
                     "default": "scale",
                     "description": "Kernel coefficient",
                 },
                 "degree": {
+                    "label": "Degree",
                     "type": "int",
-                    "min": 2,
+                    "min": 1,
                     "max": 10,
                     "default": 3,
                     "description": "Degree for polynomial kernel",
                 },
+                "class_weight": CLASS_WEIGHT_PARAMETER,
             },
         },
         "decision_tree": {
@@ -48,6 +83,7 @@ AVAILABLE_MODELS = {
             "description": "Tree-based classification with interpretable rules",
             "parameters": {
                 "max_depth": {
+                    "label": "Maximum Tree Depth",
                     "type": "int",
                     "min": 1,
                     "max": 50,
@@ -55,6 +91,7 @@ AVAILABLE_MODELS = {
                     "description": "Maximum tree depth",
                 },
                 "min_samples_split": {
+                    "label": "Min Samples to Split",
                     "type": "int",
                     "min": 2,
                     "max": 100,
@@ -62,6 +99,7 @@ AVAILABLE_MODELS = {
                     "description": "Minimum samples to split",
                 },
                 "min_samples_leaf": {
+                    "label": "Min Samples per Category",
                     "type": "int",
                     "min": 1,
                     "max": 50,
@@ -69,11 +107,13 @@ AVAILABLE_MODELS = {
                     "description": "Minimum samples per leaf",
                 },
                 "criterion": {
+                    "label": "Split Criterion",
                     "type": "select",
                     "options": ["gini", "entropy"],
                     "default": "gini",
                     "description": "Split criterion",
                 },
+                "class_weight": CLASS_WEIGHT_PARAMETER,
             },
         },
         "random_forest": {
@@ -81,13 +121,15 @@ AVAILABLE_MODELS = {
             "description": "Ensemble of decision trees for robust classification",
             "parameters": {
                 "n_estimators": {
+                    "label": "Number of Trees",
                     "type": "int",
-                    "min": 10,
+                    "min": 1,
                     "max": 1000,
                     "default": 100,
                     "description": "Number of trees",
                 },
                 "max_depth": {
+                    "label": "Maximum Tree Depth",
                     "type": "int",
                     "min": 1,
                     "max": 50,
@@ -95,6 +137,7 @@ AVAILABLE_MODELS = {
                     "description": "Maximum tree depth",
                 },
                 "min_samples_split": {
+                    "label": "Min Samples to Split",
                     "type": "int",
                     "min": 2,
                     "max": 100,
@@ -102,12 +145,14 @@ AVAILABLE_MODELS = {
                     "description": "Minimum samples to split",
                 },
                 "min_samples_leaf": {
+                    "label": "Min Samples per Leaf",
                     "type": "int",
                     "min": 1,
                     "max": 50,
                     "default": 1,
                     "description": "Minimum samples per leaf",
                 },
+                "class_weight": CLASS_WEIGHT_PARAMETER,
             },
         },
         "naive_bayes": {
@@ -115,13 +160,15 @@ AVAILABLE_MODELS = {
             "description": "Probabilistic classifier based on Bayes theorem",
             "parameters": {
                 "alpha": {
+                    "label": "Alpha (Smoothing)",
                     "type": "float",
-                    "min": 0.1,
+                    "min": 0.01,
                     "max": 10.0,
                     "default": 1.0,
                     "description": "Smoothing parameter",
                 },
                 "fit_prior": {
+                    "label": "Learn Class Probabilities",
                     "type": "boolean",
                     "default": True,
                     "description": "Learn class prior probabilities",
@@ -133,25 +180,63 @@ AVAILABLE_MODELS = {
             "description": "Linear classification with probabilistic output",
             "parameters": {
                 "C": {
+                    "label": "Regularisation (C)",
                     "type": "float",
-                    "min": 0.1,
+                    "min": 0.001,
                     "max": 100.0,
                     "default": 1.0,
-                    "description": "Inverse regularization strength",
+                    "description": "Inverse regularisation strength",
                 },
                 "penalty": {
+                    "label": "Penalty",
                     "type": "select",
-                    "options": ["l1", "l2", "elasticnet"],
+                    "options": ["l2", "l1", "elasticnet", "none"],
                     "default": "l2",
                     "description": "Regularization penalty",
                 },
                 "solver": {
+                    "label": "Solver",
                     "type": "select",
-                    "options": ["liblinear", "lbfgs", "saga"],
+                    "options": ["lbfgs", "newton-cg", "liblinear", "sag", "saga"],
                     "default": "lbfgs",
-                    "description": "Optimization algorithm",
+                    "description": "Optimisation algorithm",
                 },
+                "l1_ratio": {
+                    "label": "Elasticnet Mix",
+                    "type": "float",
+                    "min": 0.0,
+                    "max": 1.0,
+                    "default": 0.5,
+                    "description": "Share of l1 in the elasticnet penalty",
+                },
+                "class_weight": CLASS_WEIGHT_PARAMETER,
             },
+            "rules": [
+                {
+                    "when": {"penalty": "l1"},
+                    "parameter": "solver",
+                    "options": ["liblinear", "saga"],
+                    "reason": "The l1 penalty needs the liblinear or saga solver.",
+                },
+                {
+                    "when": {"penalty": "elasticnet"},
+                    "parameter": "solver",
+                    "options": ["saga"],
+                    "reason": "The elasticnet penalty needs the saga solver.",
+                },
+                {
+                    "when": {"penalty": "none"},
+                    "parameter": "solver",
+                    "options": ["lbfgs", "newton-cg", "sag", "saga"],
+                    "reason": "Training with no penalty cannot use the liblinear solver.",
+                },
+                {
+                    "when": {"multiclass": True},
+                    "parameter": "solver",
+                    "options": ["lbfgs", "newton-cg", "sag", "saga"],
+                    "reason": "The liblinear solver handles two labels only. Choose another solver for this Dataset.",
+                },
+            ],
         },
     },
     "clustering": {
@@ -160,26 +245,31 @@ AVAILABLE_MODELS = {
             "description": "Partition-based clustering algorithm",
             "parameters": {
                 "n_clusters": {
+                    "label": "Number of Clusters",
                     "type": "int",
                     "min": 2,
                     "max": 20,
+                    "at_most_rows": True,
                     "default": 8,
                     "description": "Number of clusters",
                 },
                 "init": {
+                    "label": "Initialisation Method",
                     "type": "select",
                     "options": ["k-means++", "random"],
                     "default": "k-means++",
-                    "description": "Initialization method",
+                    "description": "Initialisation method",
                 },
                 "max_iter": {
+                    "label": "Max Iterations",
                     "type": "int",
-                    "min": 100,
+                    "min": 10,
                     "max": 1000,
                     "default": 300,
                     "description": "Maximum iterations",
                 },
                 "random_state": {
+                    "label": "Random Seed",
                     "type": "int",
                     "min": 0,
                     "max": 1000,
@@ -193,45 +283,60 @@ AVAILABLE_MODELS = {
             "description": "Tree-based clustering with different linkage methods",
             "parameters": {
                 "n_clusters": {
+                    "label": "Number of Clusters",
                     "type": "int",
                     "min": 2,
                     "max": 20,
+                    "at_most_rows": True,
                     "default": 8,
                     "description": "Number of clusters",
                 },
                 "linkage": {
+                    "label": "Linkage Method",
                     "type": "select",
                     "options": ["ward", "complete", "average", "single"],
                     "default": "ward",
                     "description": "Linkage criterion",
                 },
                 "affinity": {
+                    "label": "Affinity (Distance Metric)",
                     "type": "select",
-                    "options": ["euclidean", "l1", "l2", "manhattan"],
+                    "options": ["euclidean", "l1", "l2", "manhattan", "cosine"],
                     "default": "euclidean",
                     "description": "Distance metric",
                 },
             },
+            "rules": [
+                {
+                    "when": {"linkage": "ward"},
+                    "parameter": "affinity",
+                    "options": ["euclidean", "l2"],
+                    "reason": "Ward linkage needs euclidean or l2 distance.",
+                },
+            ],
         },
         "dbscan": {
             "name": "DBSCAN",
             "description": "Density-based clustering with noise detection",
             "parameters": {
                 "eps": {
+                    "label": "Epsilon (Neighbourhood Size)",
                     "type": "float",
-                    "min": 0.1,
+                    "min": 0.01,
                     "max": 10.0,
                     "default": 0.5,
                     "description": "Maximum distance between samples",
                 },
                 "min_samples": {
+                    "label": "Min Cluster Size",
                     "type": "int",
                     "min": 1,
                     "max": 100,
                     "default": 5,
-                    "description": "Minimum samples in neighborhood",
+                    "description": "Minimum samples in neighbourhood",
                 },
                 "metric": {
+                    "label": "Distance Metric",
                     "type": "select",
                     "options": ["euclidean", "manhattan", "cosine"],
                     "default": "euclidean",
@@ -243,9 +348,10 @@ AVAILABLE_MODELS = {
     "topic_modeling": {
         "lda": {
             "name": "Latent Dirichlet Allocation",
-            "description": "Probabilistic topic modeling using LDA",
+            "description": "Probabilistic topic modelling using LDA",
             "parameters": {
                 "n_components": {
+                    "label": "Number of Topics",
                     "type": "int",
                     "min": 2,
                     "max": 50,
@@ -253,6 +359,7 @@ AVAILABLE_MODELS = {
                     "description": "Number of topics",
                 },
                 "max_iter": {
+                    "label": "Max Iterations",
                     "type": "int",
                     "min": 10,
                     "max": 1000,
@@ -260,6 +367,7 @@ AVAILABLE_MODELS = {
                     "description": "Maximum iterations",
                 },
                 "learning_decay": {
+                    "label": "Learning Decay",
                     "type": "float",
                     "min": 0.5,
                     "max": 1.0,
@@ -267,6 +375,7 @@ AVAILABLE_MODELS = {
                     "description": "Learning rate decay",
                 },
                 "random_state": {
+                    "label": "Random Seed",
                     "type": "int",
                     "min": 0,
                     "max": 1000,
@@ -276,10 +385,11 @@ AVAILABLE_MODELS = {
             },
         },
         "nmf": {
-            "name": "Non-negative Matrix Factorization",
-            "description": "Topic modeling using NMF decomposition",
+            "name": "Non-negative Matrix Factorisation",
+            "description": "Topic modelling using NMF decomposition",
             "parameters": {
                 "n_components": {
+                    "label": "Number of Topics",
                     "type": "int",
                     "min": 2,
                     "max": 50,
@@ -287,6 +397,7 @@ AVAILABLE_MODELS = {
                     "description": "Number of topics",
                 },
                 "max_iter": {
+                    "label": "Max Iterations",
                     "type": "int",
                     "min": 100,
                     "max": 2000,
@@ -294,18 +405,20 @@ AVAILABLE_MODELS = {
                     "description": "Maximum iterations",
                 },
                 "alpha": {
+                    "label": "Alpha (Regularisation)",
                     "type": "float",
                     "min": 0.0,
                     "max": 1.0,
                     "default": 0.0,
-                    "description": "L1 regularization",
+                    "description": "Regularisation strength",
                 },
-                "l1_ratio": {
-                    "type": "float",
-                    "min": 0.0,
-                    "max": 1.0,
-                    "default": 0.0,
-                    "description": "L1/L2 regularization ratio",
+                "random_state": {
+                    "label": "Random Seed",
+                    "type": "int",
+                    "min": 0,
+                    "max": 1000,
+                    "default": 42,
+                    "description": "Random seed",
                 },
             },
         },
@@ -316,12 +429,14 @@ AVAILABLE_MODELS = {
             "description": "BERT model fine-tuned on legal text",
             "parameters": {
                 "model_name": {
+                    "label": "Variant",
                     "type": "select",
-                    "options": ["nlpaueb/legal-bert-base-uncased", "lex_glue"],
+                    "options": ["nlpaueb/legal-bert-base-uncased"],
                     "default": "nlpaueb/legal-bert-base-uncased",
                     "description": "LegalBERT variant",
                 },
                 "max_length": {
+                    "label": "Maximum Document Length",
                     "type": "int",
                     "min": 128,
                     "max": 512,
@@ -329,6 +444,7 @@ AVAILABLE_MODELS = {
                     "description": "Maximum sequence length",
                 },
                 "learning_rate": {
+                    "label": "Learning Rate",
                     "type": "float",
                     "min": 1e-6,
                     "max": 1e-2,
@@ -336,13 +452,15 @@ AVAILABLE_MODELS = {
                     "description": "Learning rate",
                 },
                 "batch_size": {
+                    "label": "Batch Size",
                     "type": "int",
-                    "min": 8,
+                    "min": 4,
                     "max": 32,
                     "default": 16,
                     "description": "Training batch size",
                 },
                 "epochs": {
+                    "label": "Training Epochs",
                     "type": "int",
                     "min": 1,
                     "max": 10,
@@ -353,15 +471,17 @@ AVAILABLE_MODELS = {
         },
         "roberta": {
             "name": "RoBERTa",
-            "description": "Robustly optimized BERT approach",
+            "description": "Robustly optimised BERT approach",
             "parameters": {
                 "model_name": {
+                    "label": "Model Size",
                     "type": "select",
                     "options": ["roberta-base", "roberta-large"],
                     "default": "roberta-base",
                     "description": "RoBERTa model size",
                 },
                 "max_length": {
+                    "label": "Maximum Document Length",
                     "type": "int",
                     "min": 128,
                     "max": 512,
@@ -369,6 +489,7 @@ AVAILABLE_MODELS = {
                     "description": "Maximum sequence length",
                 },
                 "learning_rate": {
+                    "label": "Learning Rate",
                     "type": "float",
                     "min": 1e-6,
                     "max": 1e-2,
@@ -376,13 +497,15 @@ AVAILABLE_MODELS = {
                     "description": "Learning rate",
                 },
                 "batch_size": {
+                    "label": "Batch Size",
                     "type": "int",
-                    "min": 8,
+                    "min": 4,
                     "max": 32,
                     "default": 16,
                     "description": "Training batch size",
                 },
                 "epochs": {
+                    "label": "Training Epochs",
                     "type": "int",
                     "min": 1,
                     "max": 10,
@@ -394,6 +517,14 @@ AVAILABLE_MODELS = {
     },
 }
 
+
+# Whether a run can record a learning curve (`monitoring.learning_curve`,
+# BAIGLE #93): MLModelTrainer.train_classification_model records one for the
+# classical classifiers. Fine-tuning draws its own curves, and the groupings
+# have no labels to score.
+for _category, _models in AVAILABLE_MODELS.items():
+    for _info in _models.values():
+        _info["supports_learning_curve"] = _category == "classification"
 
 # Dataset task types whose training is not implemented in the worker yet. Kept
 # explicit so uploads/selection can explain the limitation instead of failing
@@ -428,6 +559,82 @@ def compatible_models_for_task(task_type):
     return result
 
 
+# What each model category needs, said when a Dataset's task type is the wrong one.
+_CATEGORY_NEEDS = {
+    "classification": "learns labels: it trains on Text Classification, Document Classification or Judgment Prediction Datasets.",
+    "transformer": "learns labels: it trains on Text Classification, Document Classification or Judgment Prediction Datasets.",
+    "clustering": "groups texts without labels: it trains on Clustering or Topic modelling Datasets.",
+    "topic_modeling": "finds topics in texts without labels: it trains on Topic modelling or Clustering Datasets.",
+}
+# Categories that learn from the label column, and the fewest examples per label
+# (on average) for the labels to count as categories rather than answers or free text.
+_LEARNS_LABELS = {"classification", "transformer"}
+MIN_EXAMPLES_PER_LABEL = 2
+
+
+def _task_label(task_type):
+    from .datasets import TASK_TYPES
+
+    return next((t["label"] for t in TASK_TYPES if t["value"] == task_type), task_type)
+
+
+def labels_not_categories(dataset):
+    """(labelled rows, different labels) when the labels are too many to be
+    categories, else None. Read from the counts stored with the Dataset."""
+    # Older Datasets store bare column names, with no counts to go by.
+    label = next((c for c in dataset.columns or [] if isinstance(c, dict) and c.get("name") == "label"), None)
+    if not label or label.get("unique_count") is None:
+        return None
+    labelled = (dataset.row_count or 0) - (label.get("null_count") or 0)
+    different = label["unique_count"]
+    if labelled > 0 and different > 1 and labelled < different * MIN_EXAMPLES_PER_LABEL:
+        return labelled, different
+    return None
+
+
+def model_fit_refusal(model_type, dataset):
+    """Why this model cannot train this Dataset, in words a student can act on, or None."""
+    category = model_category_for(model_type)
+    name = AVAILABLE_MODELS[category][model_type]["name"]
+    task_type = dataset.task_type
+    if task_type in UNSUPPORTED_TASK_TYPES or task_type not in _TASK_CATEGORIES:
+        return f"Training for {_task_label(task_type)} Datasets is not available yet."
+    if category not in _TASK_CATEGORIES[task_type]:
+        return f"{name} {_CATEGORY_NEEDS[category]}"
+    shape = labels_not_categories(dataset) if category in _LEARNS_LABELS else None
+    if shape:
+        labelled, different = shape
+        return (
+            f"{name} learns from labels that are categories, but this Dataset has {different:,} different "
+            f"labels in {labelled:,} labelled rows: fewer than {MIN_EXAMPLES_PER_LABEL} examples each."
+        )
+    return None
+
+
+NOT_CATEGORIES_ADVICE = (
+    "These labels look like answers or free text, not categories. Give the rows a few "
+    "categories (annotate them, or re-label the file) to train a model on them."
+)
+
+
+def model_fit(dataset):
+    """Every model, with whether it can train this Dataset and why not; and, when
+    none can, what would make the Dataset trainable."""
+    models = {}
+    for category, entries in AVAILABLE_MODELS.items():
+        for model_type, config in entries.items():
+            reason = model_fit_refusal(model_type, dataset)
+            models[model_type] = {**config, "category": category, "usable": reason is None, "reason": reason}
+    advice = None
+    if not any(m["usable"] for m in models.values()):
+        task_type = dataset.task_type
+        if task_type in UNSUPPORTED_TASK_TYPES or task_type not in _TASK_CATEGORIES:
+            advice = f"Training for {_task_label(task_type)} Datasets is not available yet."
+        elif labels_not_categories(dataset):
+            advice = NOT_CATEGORIES_ADVICE
+    return {"models": models, "advice": advice}
+
+
 def validate_model_task_compatibility(model_type, task_type):
     """Return (ok, error_message). Explains *why* a pairing is invalid."""
     if task_type in UNSUPPORTED_TASK_TYPES or task_type not in _TASK_CATEGORIES:
@@ -444,10 +651,108 @@ def validate_model_task_compatibility(model_type, task_type):
     return True, None
 
 
+def effective_parameters(model_type, parameters):
+    """The settings a run uses: the catalogue's defaults, then the Model's own
+    choices. Runs are recorded and compared on these, so a Model saved with a
+    few settings and the form's full copy of the same choices count as equal."""
+    category = model_category_for(model_type)
+    fields = AVAILABLE_MODELS[category][model_type]["parameters"] if category else {}
+    return {name: field["default"] for name, field in fields.items()} | dict(parameters or {})
+
+
+def _label_count(dataset):
+    """How many labels training would see, or None if the file cannot be read."""
+    try:
+        rows = apply_saved_annotations(pd.read_csv(dataset.file_path), dataset)
+    except (OSError, ValueError):
+        return None
+    return rows.iloc[:, 1].nunique() if rows.shape[1] > 1 else None
+
+
+def _rule_holds(rule, chosen, dataset):
+    if rule["when"].get("multiclass"):
+        return dataset is not None and (_label_count(dataset) or 0) > 2
+    return all(chosen.get(name) == value for name, value in rule["when"].items())
+
+
+def _plain_number(value):
+    """A limit as a person writes it: 0.000001, not 1e-06."""
+    return f"{value:f}".rstrip("0").rstrip(".")
+
+
+def _number_refusal(label, value, field):
+    """Why this value does not fit its catalogue entry, or None."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return f"{label} must be a number."
+    if field["type"] == "int" and not isinstance(value, int):
+        return f"{label} must be a whole number."
+    # Written so that NaN, which compares false, is refused too.
+    if not field["min"] <= value <= field["max"]:
+        return f"{label} must be between {_plain_number(field['min'])} and {_plain_number(field['max'])}."
+    return None
+
+
+def _field_refusal(name, value, field):
+    label = field["label"]
+    # "No limit" (e.g. max_depth) is a choice, and the wizard's default.
+    if value is None and field["default"] is None:
+        return None
+    if field["type"] in ("int", "float"):
+        return _number_refusal(label, value, field)
+    if field["type"] == "boolean" and not isinstance(value, bool):
+        return f"{label} must be true or false."
+    if field["type"] == "select" and value not in field["options"]:
+        return f'{label} must be one of: {", ".join(field["options"])}.'
+    return None
+
+
+def parameter_refusal(model_type, parameters, dataset=None):
+    """Why these parameters cannot train this model type, or None, as the body of
+    a 400: `error` in words, and `field` for the parameter to change when one is
+    at fault. Everything comes from the model's catalogue entry. With a Dataset,
+    its size and labels count too; reading the labels costs a file read, so only
+    a choice a `multiclass` rule forbids does so."""
+    if not isinstance(parameters, dict):
+        return {"error": "parameters must be an object"}
+    if "monitoring" in parameters:
+        refusal = monitoring_refusal(parameters["monitoring"])
+        if refusal:
+            return refusal
+
+    info = AVAILABLE_MODELS[model_category_for(model_type)][model_type]
+    fields = info["parameters"]
+    for name, value in parameters.items():
+        if name in fields:
+            refusal = _field_refusal(name, value, fields[name])
+            if refusal:
+                return {"error": refusal, "field": name}
+
+    chosen = effective_parameters(model_type, parameters)
+
+    if dataset is not None:
+        for name, field in fields.items():
+            if field.get("at_most_rows") and chosen[name] > dataset.row_count:
+                rows = "1 row" if dataset.row_count == 1 else f"{dataset.row_count} rows"
+                return {"error": f"{field['label']} cannot be more than the {rows} in this Dataset.", "field": name}
+
+    for rule in info.get("rules", []):
+        if chosen.get(rule["parameter"]) not in rule["options"] and _rule_holds(rule, chosen, dataset):
+            return {"error": rule["reason"], "field": rule["parameter"]}
+    return None
+
+
 @models_bp.route("/available", methods=["GET"])
 @jwt_required()
 def get_available_models():
     try:
+        # With a Dataset: every model, usable or not, and why (BAIGLE: model choice by data).
+        dataset_id = request.args.get("dataset_id")
+        if dataset_id:
+            dataset = Dataset.query.filter_by(id=dataset_id, owner_id=get_jwt_identity()).first()
+            if not dataset:
+                return jsonify({"error": "Dataset not found"}), 404
+            return jsonify(model_fit(dataset)), 200
+
         task_type = request.args.get("task_type")
 
         if task_type:
@@ -513,6 +818,66 @@ def get_model(model_id):
         return jsonify({"error": str(e)}), 500
 
 
+# The scores a run is compared on; the rest of a job's metrics (matrices,
+# reports, keywords) belong to the Model's current result, not to the list.
+HEADLINE_SCORES = (
+    "accuracy",
+    "precision",
+    "recall",
+    "f1_score",
+    "silhouette_score",
+    "n_clusters",
+    "n_topics",
+    "perplexity",
+)
+
+
+RUNS_LIMIT = 50
+
+
+def _run_dict(job):
+    metrics = job.metrics or {}
+    return {
+        "id": job.id,
+        "status": job.status,
+        "parameters": job.parameters,
+        "scores": {key: metrics[key] for key in HEADLINE_SCORES if key in metrics},
+        "error_message": job.error_message,
+        "created_at": job.created_at.isoformat(),
+        "started_at": job.started_at.isoformat() if job.started_at else None,
+        "completed_at": job.completed_at.isoformat() if job.completed_at else None,
+    }
+
+
+@models_bp.route("/<model_id>/runs", methods=["GET"])
+@jwt_required()
+def list_model_runs(model_id):
+    """A Model's training runs, newest first: settings, headline scores, status."""
+    try:
+        owner_id = get_jwt_identity()
+        model = Model.query.filter_by(id=model_id, owner_id=owner_id).first()
+        if not model:
+            return jsonify({"error": "Model not found"}), 404
+
+        # One past the limit tells whether older runs exist, so the oldest
+        # listed run is not taken for the Model's first.
+        jobs = (
+            TrainingJob.query.filter_by(model_id=model.id, owner_id=owner_id)
+            .order_by(TrainingJob.created_at.desc())
+            .limit(RUNS_LIMIT + 1)
+            .all()
+        )
+        return jsonify(
+            {
+                "runs": [_run_dict(job) for job in jobs[:RUNS_LIMIT]],
+                "has_more": len(jobs) > RUNS_LIMIT,
+            }
+        ), 200
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @models_bp.route("/", methods=["POST"])
 @jwt_required()
 def create_model():
@@ -532,6 +897,11 @@ def create_model():
         ).first()
         if not dataset:
             return jsonify({"error": "Dataset not found"}), 404
+
+        # Creating a Model starts its training, so say so here, not after.
+        refusal = training_refusal(dataset)
+        if refusal:
+            return jsonify({"error": refusal}), 409
 
         # Validate model type
         model_type = data["model_type"]
@@ -553,53 +923,15 @@ def create_model():
         )
         if not ok:
             return jsonify({"error": compat_error}), 400
+        # Labels that are not categories (answers, free text) teach a classifier nothing.
+        fit_error = model_fit_refusal(model_type, dataset)
+        if fit_error:
+            return jsonify({"error": fit_error}), 400
 
         # Validate parameters
-        if model_type in AVAILABLE_MODELS.get(model_category, {}):
-            expected_params = AVAILABLE_MODELS[model_category][model_type]["parameters"]
-            provided_params = data["parameters"]
-
-            # Validate parameter types and ranges
-            for param_name, param_value in provided_params.items():
-                if param_name in expected_params:
-                    param_config = expected_params[param_name]
-                    param_type = param_config["type"]
-
-                    if param_type == "int" and not isinstance(param_value, int):
-                        return (
-                            jsonify(
-                                {"error": f"Parameter {param_name} must be an integer"}
-                            ),
-                            400,
-                        )
-                    elif param_type == "float" and not isinstance(
-                        param_value, (int, float)
-                    ):
-                        return (
-                            jsonify(
-                                {"error": f"Parameter {param_name} must be a number"}
-                            ),
-                            400,
-                        )
-                    elif param_type == "boolean" and not isinstance(param_value, bool):
-                        return (
-                            jsonify(
-                                {"error": f"Parameter {param_name} must be a boolean"}
-                            ),
-                            400,
-                        )
-                    elif (
-                        param_type == "select"
-                        and param_value not in param_config["options"]
-                    ):
-                        return (
-                            jsonify(
-                                {
-                                    "error": f'Parameter {param_name} must be one of: {", ".join(param_config["options"])}'
-                                }
-                            ),
-                            400,
-                        )
+        refusal = parameter_refusal(model_type, data["parameters"], dataset)
+        if refusal:
+            return jsonify(refusal), 400
 
         # Resolve project_id: explicit payload value takes precedence over dataset's project.
         # `Project` belongs to the host app, not this package, so existence is checked via
@@ -609,6 +941,10 @@ def create_model():
             if not project_belongs_to_owner(db.session, explicit_project_id, owner_id):
                 return jsonify({"error": "Project not found"}), 404
             resolved_project_id = explicit_project_id
+            # A Dataset outside any Project joins the one its Model is made in, so
+            # the Project shows both. One already filed elsewhere stays there.
+            if dataset.project_id is None:
+                dataset.project_id = explicit_project_id
         else:
             resolved_project_id = dataset.project_id
 
@@ -637,17 +973,38 @@ def create_model():
         return jsonify({"error": str(e)}), 500
 
 
+def _update_refusal(model, active, data):
+    """(body, status) when this edit cannot apply, or None."""
+    if "parameters" not in data:
+        return None
+    # A run already has its settings; a rename can still go through. The form
+    # sends every setting, so compare with the defaults filled in.
+    if active and effective_parameters(model.model_type, data["parameters"]) != effective_parameters(
+        model.model_type, model.parameters
+    ):
+        return {"error": SETTINGS_LOCKED_MESSAGE, "job_id": str(active.id)}, 409
+    refusal = parameter_refusal(model.model_type, data["parameters"], model.dataset)
+    if refusal:
+        return refusal, 400
+    return None
+
+
 @models_bp.route("/<model_id>", methods=["PUT"])
 @jwt_required()
 def update_model(model_id):
     try:
         owner_id = get_jwt_identity()
-        model = Model.query.filter_by(id=model_id, owner_id=owner_id).first()
+        # Locked like a start, so a start and a settings change serialise.
+        model, active = _lock_model_and_find_active_job(model_id, owner_id)
 
         if not model:
             return jsonify({"error": "Model not found"}), 404
 
         data = request.get_json()
+        refused = _update_refusal(model, active, data)
+        if refused:
+            db.session.rollback()  # release the model row lock
+            return jsonify(refused[0]), refused[1]
 
         # Update name if provided
         if "name" in data:
@@ -1050,6 +1407,166 @@ def predict(model_id):
         return jsonify({"error": str(e)}), 500
 
 
+def training_queue():
+    return current_app.config.get("LEGAL_ML_TRAINING_QUEUE", "training_queue")
+
+
+def stale_after():
+    return current_app.config.get("LEGAL_ML_HEARTBEAT_STALE_SECONDS", DEFAULT_STALE_SECONDS)
+
+
+def _lock_model_and_find_active_job(model_id, owner_id):
+    """FOR UPDATE (Postgres; SQLite ignores it) holds the model row until the
+    caller commits or rolls back, so two concurrent starts serialise here and
+    the second one's active-job check sees the first one's job."""
+    while True:
+        model = (
+            Model.query.filter_by(id=model_id, owner_id=owner_id).with_for_update().first()
+        )
+        if not model:
+            return None, None
+        active = TrainingJob.query.filter(
+            TrainingJob.model_id == model_id, TrainingJob.status.in_(ACTIVE_JOB_STATUSES)
+        ).first()
+        # A lost job is not a run to return. Sweeping commits, which releases
+        # the lock, so look again.
+        if not (
+            active
+            and sweep_lost_job(active, current_app.redis_client, training_queue(), stale_after())
+        ):
+            return model, active
+
+
+MODEL_BUSY_MESSAGE = "This Model is already training. Retrain when it finishes."
+SETTINGS_LOCKED_MESSAGE = (
+    "This Model is training, so its settings cannot change. Adjust them when it finishes."
+)
+
+
+TEST_SIZE_MESSAGE = "The share of rows held out for testing must be more than 0 and less than 1."
+
+
+def _is_share(value):
+    # bool is an int to Python, and true is not a share.
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and 0 < value < 1
+
+
+def start_training_job(owner_id, model_id, data, al_round_id=None):
+    """The one way a training run starts; both start routes call it. Returns
+    (response body, status). Starting a model with an active job returns that
+    job, and a run that cannot be queued leaves a failed job, never a pending
+    one nothing will pick up. ``al_round_id`` ties the run to an active learning
+    round, so the worker rescores the pool after it; it never comes from a body.
+    A round cannot join a job already running: that job has no round to rescore
+    and did not see the round's labels, so the round is refused instead."""
+    if "test_size" in data and not _is_share(data["test_size"]):
+        return {"error": TEST_SIZE_MESSAGE}, 400
+
+    model, active = _lock_model_and_find_active_job(model_id, owner_id)
+    if not model:
+        return {"error": "Model not found"}, 404
+
+    # D9: one active job per model, so a double-clicked Train is a no-op.
+    if active:
+        job_id = str(active.id)
+        db.session.rollback()  # release the model row lock
+        if al_round_id:
+            return {"error": MODEL_BUSY_MESSAGE, "job_id": job_id}, 409
+        return (
+            {"message": "Training already started", "job_id": job_id, "model_id": str(model_id)},
+            200,
+        )
+
+    dataset = db.session.get(Dataset, model.dataset_id)
+    if not dataset:
+        return {"error": "Dataset not found"}, 404
+
+    refusal = training_refusal(dataset)
+    if refusal:
+        db.session.rollback()  # release the model row lock
+        return {"error": refusal}, 409
+
+    # Fail fast, with a reason, if this model cannot train on this dataset.
+    ok, compat_error = validate_model_task_compatibility(model.model_type, dataset.task_type)
+    if not ok:
+        return {"error": compat_error}, 400
+    fit_error = model_fit_refusal(model.model_type, dataset)
+    if fit_error:
+        db.session.rollback()  # release the model row lock
+        return {"error": fit_error}, 400
+
+    # A Model saved before a combination was refused must not reach the worker.
+    refusal = parameter_refusal(model.model_type, model.parameters or {}, dataset)
+    if refusal:
+        db.session.rollback()  # release the model row lock
+        return refusal, 400
+
+    # The monitoring the run uses, the host's defaults filled in (BAIGLE #89).
+    monitoring = run_monitoring(current_app.config, model.parameters)
+
+    # Create training job
+    # The settings snapshot is what Previous runs compares (BAIGLE #83).
+    training_job = TrainingJob(
+        owner_id=owner_id,
+        model_id=model_id,
+        status="pending",
+        parameters=effective_parameters(model.model_type, model.parameters) | {"monitoring": monitoring},
+    )
+    db.session.add(training_job)
+    if al_round_id:
+        # With the job, so no crash can leave a running job its round doesn't know.
+        db.session.flush()
+        ALRound.query.filter_by(id=al_round_id).update({"job_id": training_job.id})
+
+    # A retrain that cannot start must not cost the model its finished state.
+    status_before = "failed" if model.status == "training" else model.status
+    model.status = "training"
+
+    db.session.commit()
+    job_id = str(training_job.id)
+
+    try:
+        # ids are uuid.UUID on Postgres; the queue message is JSON.
+        task_data = {
+            "job_id": job_id,
+            "model_id": str(model_id),
+            "dataset_id": str(dataset.id),
+            "model_type": model.model_type,
+            "parameters": model.parameters,
+            "monitoring": monitoring,
+            "dataset_path": dataset.file_path,
+            "task_type": dataset.task_type,
+            "preprocessing_options": data.get("preprocessing_options", {}),
+            "test_size": data.get("test_size", 0.2),
+            "random_state": data.get("random_state", 42),
+        }
+        if al_round_id:
+            task_data["al_round_id"] = str(al_round_id)
+        current_app.redis_client.lpush(training_queue(), json.dumps(task_data))
+    except Exception:
+        logger.exception("training job %s (owner %s): could not be queued", job_id, owner_id)
+        transition(
+            job_id,
+            ACTIVE_JOB_STATUSES,
+            "failed",
+            model_status=status_before,
+            reason="could not queue",
+            error_message=COULD_NOT_START_MESSAGE,
+            completed_at=datetime.utcnow(),
+        )
+        return {"error": COULD_NOT_START_MESSAGE}, 503
+
+    return (
+        {
+            "message": "Training started",
+            "job_id": job_id,
+            "model_id": str(model_id),
+            "model": model.to_dict(),
+        },
+        200,
+    )
+
+
 @models_bp.route("/<model_id>/train", methods=["POST"])
 @jwt_required()
 def train_model(model_id):
@@ -1057,73 +1574,10 @@ def train_model(model_id):
     try:
         owner_id = get_jwt_identity()
         data = request.get_json() if request.is_json else {}
+        body, status = start_training_job(owner_id, model_id, data)
+        return jsonify(body), status
 
-        # Get model and verify ownership
-        model = Model.query.filter_by(id=model_id, owner_id=owner_id).first()
-        if not model:
-            return jsonify({"error": "Model not found"}), 404
-
-        # Check if model is already training
-        if model.status == "training":
-            return jsonify({"error": "Model is already being trained"}), 400
-
-        # Get dataset
-        dataset = Dataset.query.get(model.dataset_id)
-        if not dataset:
-            return jsonify({"error": "Dataset not found"}), 404
-
-        # Fail fast, with a reason, if this model cannot train on this dataset.
-        ok, compat_error = validate_model_task_compatibility(
-            model.model_type, dataset.task_type
-        )
-        if not ok:
-            return jsonify({"error": compat_error}), 400
-
-        # Create training job
-        training_job = TrainingJob(owner_id=owner_id, model_id=model_id, status="pending")
-
-        db.session.add(training_job)
-
-        # Update model status
-        model.status = "training"
-
-        db.session.commit()
-
-        # Prepare training task data
-        task_data = {
-            "job_id": str(training_job.id),
-            "model_id": str(model_id),
-            "dataset_id": str(dataset.id),
-            "model_type": model.model_type,
-            "parameters": model.parameters,
-            "dataset_path": dataset.file_path,
-            "task_type": dataset.task_type,
-            "preprocessing_options": data.get("preprocessing_options", {}),
-            "test_size": data.get("test_size", 0.2),
-            "random_state": data.get("random_state", 42),
-        }
-
-        # Try to add task to Redis queue if available
-        try:
-            current_app.redis_client.lpush(current_app.config.get("LEGAL_ML_TRAINING_QUEUE", "training_queue"), json.dumps(task_data))
-        except Exception as redis_err:
-            # Log Redis error but continue - we still have the job in database
-            current_app.logger.warning(
-                f"Redis error while queuing training task: {str(redis_err)}"
-            )
-
-        return (
-            jsonify(
-                {
-                    "message": "Training started successfully",
-                    "job_id": str(training_job.id),
-                    "model_id": str(model_id),
-                    "model": model.to_dict(),
-                }
-            ),
-            200,
-        )
-
-    except Exception as e:
+    except Exception:
         db.session.rollback()
-        return jsonify({"error": str(e)}), 500
+        logger.exception("could not start training for model %s", model_id)
+        return jsonify({"error": COULD_NOT_START_MESSAGE}), 500

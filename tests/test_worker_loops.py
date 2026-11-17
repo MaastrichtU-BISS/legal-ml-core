@@ -10,10 +10,15 @@ import logging
 import pytest
 import redis as redis_lib
 
-from legal_ml_core import Model, TrainingJob, db
+import pandas as pd
+
+from legal_ml_core import Dataset, Model, TrainingJob, db
+from legal_ml_core.compute.trainer import MLModelTrainer
 from legal_ml_core.queue_contract import job_status_key
+from legal_ml_core.storage import get_model_path
 from legal_ml_core.worker import (
     LOOP_ERROR_MESSAGE,
+    _batch_prediction_loop,
     _explanation_loop,
     _prediction_loop,
     _training_loop,
@@ -62,6 +67,88 @@ def test_malformed_training_task_fails_its_job_and_the_loop_keeps_serving(
     assert any(broken_id in line for line in loop_logs)
 
 
+@pytest.fixture
+def completed_model(app, fake_redis):
+    """A saved naive Bayes Model, ready for prediction."""
+    with app.app_context():
+        dataset = Dataset(
+            owner_id=TEST_USER_ID, name="D", file_path="/tmp/d.csv", row_count=8, columns=[],
+            task_type="classification",
+        )
+        db.session.add(dataset)
+        db.session.flush()
+        model = Model(
+            owner_id=TEST_USER_ID, dataset_id=dataset.id, name="M", model_type="naive_bayes",
+            status="completed",
+        )
+        db.session.add(model)
+        db.session.commit()
+        trainer = MLModelTrainer(redis_client=fake_redis)
+        df = pd.DataFrame(
+            {
+                "text": ["the court ruled for the plaintiff", "the defendant was liable"] * 4,
+                "label": ["civil", "criminal"] * 4,
+            }
+        )
+        texts, labels, _ = trainer.preprocess_data(df, "classification", {})
+        trainer.train_classification_model(texts, labels, "naive_bayes", {"model_id": model.id})
+        trainer.save_model(get_model_path(app.config["MODEL_FOLDER"], model.id))
+        return model.id
+
+
+def _queue_batch(client, auth_headers, model_id, texts):
+    response = client.post(
+        "/api/training/batch-predict",
+        json={"model_id": model_id, "texts": texts},
+        headers=auth_headers,
+    )
+    assert response.status_code == 200
+    return response.get_json()["batch_id"]
+
+
+def _serve_batches(app, fake_redis):
+    _batch_prediction_loop(
+        fake_redis,
+        app.config["MODEL_FOLDER"],
+        app,
+        stop=_until_drained(fake_redis, "batch_prediction_queue"),
+        sleep=lambda s: None,
+    )
+
+
+def test_a_queued_batch_prediction_is_served_to_its_owner(
+    client, auth_headers, app, fake_redis, completed_model
+):
+    batch_id = _queue_batch(client, auth_headers, completed_model, ["the plaintiff", "the defendant"])
+
+    _serve_batches(app, fake_redis)
+
+    response = client.get(f"/api/training/batch-prediction/{batch_id}", headers=auth_headers)
+    assert response.status_code == 200
+    batch = response.get_json()["batch_prediction"]
+    assert batch["status"] == "completed"
+    assert [p["text"] for p in batch["predictions"]] == ["the plaintiff", "the defendant"]
+    assert {p["prediction"] for p in batch["predictions"]} <= {"civil", "criminal"}
+
+
+def test_a_batch_that_cannot_run_reports_failure_and_the_loop_keeps_serving(
+    client, auth_headers, app, fake_redis, completed_model
+):
+    broken = _queue_batch(client, auth_headers, completed_model, ["the plaintiff"])
+    task = fake_redis.lpop("batch_prediction_queue")
+    fake_redis.lpush("batch_prediction_queue", task.replace(completed_model, "gone"))
+    served_after = _queue_batch(client, auth_headers, completed_model, ["the plaintiff"])
+    fake_redis.rpush("batch_prediction_queue", "not json at all")  # served first
+
+    _serve_batches(app, fake_redis)
+
+    failed = client.get(f"/api/training/batch-prediction/{broken}", headers=auth_headers)
+    served = client.get(f"/api/training/batch-prediction/{served_after}", headers=auth_headers)
+    assert failed.get_json()["batch_prediction"]["status"] == "failed"
+    assert "gone" not in failed.get_data(as_text=True)
+    assert served.get_json()["batch_prediction"]["status"] == "completed"
+
+
 class _FlakyRedis:
     """BRPOP fails `down_for` times with a connection error, then works
     (empty queue). Counts calls so `stop` can end the loop after recovery."""
@@ -79,7 +166,12 @@ class _FlakyRedis:
 
 @pytest.mark.parametrize(
     "loop, name",
-    [(_training_loop, "training"), (_prediction_loop, "prediction"), (_explanation_loop, "explanation")],
+    [
+        (_training_loop, "training"),
+        (_prediction_loop, "prediction"),
+        (_explanation_loop, "explanation"),
+        (_batch_prediction_loop, "batch prediction"),
+    ],
 )
 def test_unreachable_redis_backs_off_1s_to_30s_and_logs_once_per_change(app, caplog, loop, name):
     caplog.set_level(logging.INFO, logger="legal_ml_core")
@@ -119,15 +211,15 @@ def test_two_rapid_starts_make_one_job(client, auth_headers, app, fake_redis, qu
     second = client.post("/api/training/start", json={"model_id": model_id}, headers=auth_headers)
 
     assert first.status_code == 200
-    assert second.status_code == 409
-    assert second.get_json()["error"] == "This model is already training"
+    assert second.status_code == 200
+    assert second.get_json()["job_id"] == first.get_json()["job_id"]
     assert fake_redis.llen("training_queue") == 1
     with app.app_context():
         assert TrainingJob.query.filter_by(model_id=model_id).count() == 1
 
 
-@pytest.mark.parametrize("status, expected", [("running", 409), ("completed", 200), ("failed", 200), ("cancelled", 200)])
-def test_start_is_refused_only_while_a_job_is_active(client, auth_headers, app, queued_job, status, expected):
+@pytest.mark.parametrize("status", ["completed", "failed", "cancelled"])
+def test_a_finished_job_does_not_stop_a_new_start(client, auth_headers, app, queued_job, status):
     with app.app_context():
         job = db.session.get(TrainingJob, queued_job["job_id"])
         job.status = status
@@ -137,7 +229,8 @@ def test_start_is_refused_only_while_a_job_is_active(client, auth_headers, app, 
     resp = client.post(
         "/api/training/start", json={"model_id": queued_job["model_id"]}, headers=auth_headers
     )
-    assert resp.status_code == expected
+    assert resp.status_code == 200
+    assert resp.get_json()["job_id"] != queued_job["job_id"]
 
 
 def test_redis_down_during_training_fails_the_job_with_a_plain_message(
@@ -190,7 +283,7 @@ def test_unreadable_cancel_flag_falls_back_to_the_db_and_training_continues(
 def test_start_locks_the_model_row_before_checking_for_an_active_job(
     client, auth_headers, app, queued_job
 ):
-    """S1: the 409 guard must serialise concurrent starts. SQLite has no row
+    """S1: the one-active-job guard must serialise concurrent starts. SQLite has no row
     locks, so assert the statements as Postgres would run them: the model row
     is read FOR UPDATE, and the active-job check comes after, inside the
     same transaction, so a second start waits for the first to commit and
@@ -220,3 +313,28 @@ def test_start_locks_the_model_row_before_checking_for_an_active_job(
     model_lock = next(i for i, s in enumerate(statements) if "FROM models" in s and "FOR UPDATE" in s)
     job_check = next(i for i, s in enumerate(statements) if "FROM training_jobs" in s)
     assert model_lock < job_check
+
+
+def test_a_batch_reads_as_pending_from_the_moment_it_is_queued(client, auth_headers, completed_model):
+    batch_id = _queue_batch(client, auth_headers, completed_model, ["the plaintiff"])
+
+    response = client.get(f"/api/training/batch-prediction/{batch_id}", headers=auth_headers)
+
+    assert response.status_code == 200
+    assert response.get_json() == {"batch_prediction": {"status": "pending", "batch_id": batch_id}}
+
+
+def test_a_pending_batch_stays_private_to_its_owner(client, auth_headers, completed_model):
+    batch_id = _queue_batch(client, auth_headers, completed_model, ["the plaintiff"])
+    other = {"Authorization": "Bearer test-token::" + json.dumps({"sub": "22222222-2222-2222-2222-222222222222"})}
+
+    response = client.get(f"/api/training/batch-prediction/{batch_id}", headers=other)
+
+    assert response.status_code == 403
+    assert "plaintiff" not in response.get_data(as_text=True)
+
+
+def test_an_unknown_batch_is_still_not_found(client, auth_headers):
+    response = client.get("/api/training/batch-prediction/never-queued", headers=auth_headers)
+
+    assert response.status_code == 404

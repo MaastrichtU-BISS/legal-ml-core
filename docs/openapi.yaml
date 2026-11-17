@@ -1,0 +1,2117 @@
+openapi: 3.1.0
+info:
+  title: legal-ml-core HTTP API
+  version: 0.10.0
+  summary: Routes registered on a host Flask app by legal_ml_core.init_ml_feature.
+  description: |
+    Every route below is registered by `init_ml_feature(app, ...)`. Paths are
+    shown with the default prefixes (`/api/datasets`, `/api/models`,
+    `/api/training`, `/api/visualization`, `/api` for EDA,
+    `/api/annotation` and `/api/llm`). `tests/test_openapi.py` fails if a registered route or
+    method is missing from this file, or if this file describes one that does
+    not exist.
+
+    Authentication is a bearer token on every route except
+    `GET /api/datasets/task-types`. What the token must be depends on
+    `AUTH_MODE` (see README): a Keycloak access token (`keycloak`, default),
+    a host-signed short-lived HS256 token (`platform`), or none at all
+    (`none`, only with `LEGAL_ML_ALLOW_NO_AUTH`). Missing or invalid tokens get
+    401; a missing platform secret gets 503. Every resource is scoped to the
+    token's owner: another owner's resource answers 404 (or 403 where noted).
+
+    Training, queued prediction and explanation are asynchronous: the API
+    pushes a task onto a Redis queue consumed by `run_ml_worker`, and the
+    client polls the matching status route.
+
+    Error bodies are `{"error": "<message>"}`; annotation routes also return
+    `"success": false`. Unexpected failures return 500 with the same shape.
+    A 400 refusing a Model's parameters, on creating or editing it or starting
+    its training, adds `"field"` when one parameter is at fault.
+  license:
+    name: MIT
+    identifier: MIT
+servers:
+  - url: /
+    description: Host application (paths include the default /api prefixes)
+security:
+  - bearerAuth: []
+tags:
+  - name: datasets
+  - name: eda
+  - name: models
+  - name: training
+  - name: visualization
+  - name: annotation
+  - name: llm
+  - name: active-learning
+  - name: summarization
+
+paths:
+  # ---------------------------------------------------------------- datasets
+  /api/datasets/:
+    get:
+      tags: [datasets]
+      summary: List the caller's datasets (newest first)
+      operationId: listDatasets
+      responses:
+        "200":
+          description: Datasets
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  datasets:
+                    type: array
+                    items: { $ref: "#/components/schemas/Dataset" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+  /api/datasets/upload:
+    post:
+      tags: [datasets]
+      summary: Upload and validate a dataset file
+      description: >-
+        Accepts CSV, XLSX or JSON, at most 1000 rows unless the host sets LEGAL_ML_MAX_ROWS. Required columns depend
+        on `task_type`; see docs/data-formats.md. Training reads the stored
+        file as CSV, so upload CSV for anything you intend to train on.
+      operationId: uploadDataset
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file, name, task_type]
+              properties:
+                file: { type: string, format: binary }
+                name: { type: string }
+                description: { type: string }
+                task_type: { $ref: "#/components/schemas/TaskTypeValue" }
+                annotation_mode:
+                  type: string
+                  enum: ["true", "false"]
+                  default: "false"
+                  description: When "true", label columns are optional (dataset to be annotated).
+                labels:
+                  type: string
+                  description: Comma-separated labels or a JSON array string.
+      responses:
+        "201":
+          description: Dataset created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message: { type: string }
+                  dataset: { $ref: "#/components/schemas/Dataset" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "413":
+          description: Larger than the host's MAX_CONTENT_LENGTH
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+  /api/datasets/import/legal-annotation-kit:
+    post:
+      tags: [datasets]
+      summary: Import a vue-legal-annotation-kit task file as a Dataset
+      description: >-
+        One item per document. Document-level tasks become classification (one
+        tag per document; several tags are refused, as there are no multi-label
+        Datasets), span tasks become NER. Where a document has several
+        assignments, the finished one with most annotations is kept and the rest
+        are counted in `set_aside`. Kept assignments are saved on their tasks as
+        human labels, Assignment and all. The row cap applies.
+      operationId: importKitTask
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file, name]
+              properties:
+                file: { type: string, format: binary, description: Kit TaskData JSON }
+                name: { type: string }
+                description: { type: string }
+      responses:
+        "201":
+          description: Dataset created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  dataset: { $ref: "#/components/schemas/Dataset" }
+                  labelled: { type: integer, description: Items saved with a label }
+                  set_aside: { type: integer, description: Other assignments with work that were not kept }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "413":
+          description: Larger than the host's MAX_CONTENT_LENGTH
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+  /api/datasets/task-types:
+    get:
+      tags: [datasets]
+      summary: Upload task-type catalogue (public)
+      operationId: listTaskTypes
+      security: []
+      responses:
+        "200":
+          description: Task types
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  task_types:
+                    type: array
+                    items: { $ref: "#/components/schemas/TaskType" }
+  /api/datasets/{dataset_id}:
+    parameters:
+      - $ref: "#/components/parameters/DatasetId"
+    get:
+      tags: [datasets]
+      summary: Get one dataset
+      operationId: getDataset
+      responses:
+        "200":
+          description: Dataset
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  dataset: { $ref: "#/components/schemas/Dataset" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    delete:
+      tags: [datasets]
+      summary: Delete a dataset and its stored file
+      operationId: deleteDataset
+      responses:
+        "200": { $ref: "#/components/responses/Message" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /api/datasets/{dataset_id}/annotations/export:
+    parameters:
+      - $ref: "#/components/parameters/DatasetId"
+    get:
+      tags: [datasets]
+      summary: Export the Dataset's annotation tasks as vue-legal-annotation-kit TaskData
+      description: >-
+        One document per task, in item order, with one assignment for each
+        labelled task (as saved, or built from its label). Served as a download.
+      operationId: exportAnnotations
+      parameters:
+        - name: format
+          in: query
+          schema: { type: string, enum: [legal-annotation-kit], default: legal-annotation-kit }
+      responses:
+        "200":
+          description: Kit TaskData
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  name: { type: string }
+                  labelset: { type: object }
+                  annotation_level: { type: [string, "null"] }
+                  documents:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        name: { type: string }
+                        full_text: { type: string }
+                        assignments: { type: array, items: { $ref: "#/components/schemas/KitAssignment" } }
+                  counts: { type: object }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /api/datasets/{dataset_id}/preview:
+    parameters:
+      - $ref: "#/components/parameters/DatasetId"
+    get:
+      tags: [datasets]
+      summary: First 10 rows
+      operationId: previewDataset
+      responses:
+        "200":
+          description: Preview
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  preview: { type: array, items: { type: object } }
+                  total_rows: { type: integer }
+                  columns: { type: array, items: { type: string } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /api/datasets/{dataset_id}/rows:
+    parameters:
+      - $ref: "#/components/parameters/DatasetId"
+    get:
+      tags: [datasets]
+      summary: Paginated rows
+      operationId: datasetRows
+      parameters:
+        - { name: offset, in: query, schema: { type: integer, minimum: 0, default: 0 } }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 200, default: 50 } }
+        - name: term
+          in: query
+          description: Only rows whose text contains this word, matched as a whole word in any case, the way EDA counts `in_class`. 400 when the Dataset has no text column.
+          schema: { type: string }
+        - name: label
+          in: query
+          description: Only rows in this class. 400 when the Dataset has no label column.
+          schema: { type: string }
+      responses:
+        "200":
+          description: A window of rows. With `term` or `label`, `total_rows` and `has_more` count the filtered rows.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  rows: { type: array, items: { type: object } }
+                  columns: { type: array, items: { type: string } }
+                  total_rows: { type: integer }
+                  offset: { type: integer }
+                  limit: { type: integer }
+                  has_more: { type: boolean }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /api/datasets/{dataset_id}/preprocessing-options:
+    parameters:
+      - $ref: "#/components/parameters/DatasetId"
+    get:
+      tags: [datasets]
+      summary: Preprocessing options suited to this dataset
+      operationId: preprocessingOptions
+      responses:
+        "200":
+          description: Options
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  preprocessing_options: { type: object }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  # --------------------------------------------------------------------- eda
+  /api/datasets/{dataset_id}/eda:
+    parameters:
+      - $ref: "#/components/parameters/DatasetId"
+    get:
+      tags: [eda]
+      summary: Exploratory data analysis
+      description: >-
+        Overview, per-column analysis, data quality, statistics, task-specific analysis and insights.
+        For Text Classification, `task_specific_analysis.keywords_by_class` lists each class's distinctive
+        terms and `keyword_stats` gives the same terms as `{term, in_class, overall, lift}`, where
+        `in_class` and `overall` count texts.
+      operationId: getEda
+      responses:
+        "200": { $ref: "#/components/responses/AnyObject" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /api/datasets/{dataset_id}/eda/visualizations:
+    parameters:
+      - $ref: "#/components/parameters/DatasetId"
+    get:
+      tags: [eda]
+      summary: EDA charts (Plotly figure JSON strings keyed by chart name)
+      operationId: getEdaVisualizations
+      responses:
+        "200": { $ref: "#/components/responses/AnyObject" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  # ------------------------------------------------------------------ models
+  /api/models/available:
+    get:
+      tags: [models]
+      summary: Model catalogue, optionally filtered by task type, or fitted to a Dataset
+      operationId: availableModels
+      parameters:
+        - name: task_type
+          in: query
+          schema: { $ref: "#/components/schemas/TaskTypeValue" }
+        - name: dataset_id
+          in: query
+          description: >-
+            One of the caller's Datasets. The answer is then `{"models": {model_type:
+            {...catalogue entry, "category", "usable", "reason"}}, "advice"}`: every
+            model, whether it can train this Dataset and, when not, why (the task
+            type, or labels that are not categories: fewer than 2 labelled rows per
+            label on average). `advice` says what would make the Dataset trainable
+            when no model can. Creating or training such a pair answers 400 with the
+            same reason.
+          schema: { type: string }
+      responses:
+        "200":
+          description: >-
+            Catalogue (object keyed by task type, or a list when filtered). Each
+            model lists its parameters with their `label`, the name refusals use,
+            and their options or min and max, and
+            optional rules: when `when` holds, `parameter` is limited to
+            `options`, and `reason` says why. `multiclass` in `when` means a
+            Dataset of more than two labels. `supports_learning_curve` says whether a
+            run of the model type can record a learning curve
+            (`monitoring.learning_curve`).
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  models: {}
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { description: "No such Dataset of the caller's" }
+  /api/models/:
+    get:
+      tags: [models]
+      summary: List the caller's models
+      operationId: listModels
+      parameters:
+        - { name: dataset_id, in: query, schema: { type: string } }
+      responses:
+        "200":
+          description: Models
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  models:
+                    type: array
+                    items: { $ref: "#/components/schemas/Model" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+    post:
+      tags: [models]
+      summary: Create (configure) a model
+      operationId: createModel
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, dataset_id, model_type, parameters]
+              properties:
+                name: { type: string }
+                dataset_id: { type: string }
+                model_type: { type: string, examples: [svm, random_forest, legalbert, kmeans, lda] }
+                parameters:
+                  type: object
+                  description: The model's settings, by catalogue name, plus an optional `monitoring`.
+                  properties:
+                    monitoring: { $ref: "#/components/schemas/Monitoring" }
+                project_id: { type: string }
+      responses:
+        "201":
+          description: Model created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message: { type: string }
+                  model: { $ref: "#/components/schemas/Model" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /api/models/explanations/{explanation_id}:
+    parameters:
+      - { name: explanation_id, in: path, required: true, schema: { type: string } }
+    get:
+      tags: [models]
+      summary: Poll an explanation result
+      operationId: getExplanation
+      responses:
+        "200":
+          description: Finished explanation (LIME or SHAP output)
+          content:
+            application/json:
+              schema: { type: object }
+        "202":
+          description: Still processing
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, const: processing }
+                  message: { type: string }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "500":
+          description: Explanation failed
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, const: failed }
+                  error: { type: string }
+  /api/models/{model_id}:
+    parameters:
+      - $ref: "#/components/parameters/ModelId"
+    get:
+      tags: [models]
+      summary: Get one model
+      operationId: getModel
+      responses:
+        "200":
+          description: Model
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  model: { $ref: "#/components/schemas/Model" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    put:
+      tags: [models]
+      summary: Rename a model or replace its parameters
+      operationId: updateModel
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name: { type: string }
+                parameters:
+                  type: object
+                  description: The model's settings, by catalogue name, plus an optional `monitoring`.
+                  properties:
+                    monitoring: { $ref: "#/components/schemas/Monitoring" }
+      responses:
+        "200":
+          description: Updated model
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message: { type: string }
+                  model: { $ref: "#/components/schemas/Model" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: "The Model is training, so its parameters cannot change; a rename still applies" }
+    delete:
+      tags: [models]
+      summary: Delete a model and its stored file
+      operationId: deleteModel
+      responses:
+        "200": { $ref: "#/components/responses/Message" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /api/models/{model_id}/labels:
+    parameters:
+      - $ref: "#/components/parameters/ModelId"
+    put:
+      tags: [models]
+      summary: Name unsupervised topics or clusters
+      description: Merged into `metrics.display_labels`; blank names are ignored.
+      operationId: updateModelLabels
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                topics: { type: object, additionalProperties: { type: string } }
+                clusters: { type: object, additionalProperties: { type: string } }
+      responses:
+        "200":
+          description: Updated model
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message: { type: string }
+                  model: { $ref: "#/components/schemas/Model" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /api/models/{model_id}/runs:
+    parameters:
+      - $ref: "#/components/parameters/ModelId"
+    get:
+      tags: [models]
+      summary: List a model's training runs
+      description: >-
+        Newest first, at most 50; `has_more` is true when older runs exist. Each run has
+        the settings it started with, the catalogue defaults filled in, and its headline
+        scores. `parameters` is null for runs from before settings were recorded.
+      operationId: listModelRuns
+      responses:
+        "200":
+          description: The model's runs
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  runs:
+                    type: array
+                    items: { $ref: "#/components/schemas/TrainingRun" }
+                  has_more: { type: boolean }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /api/models/{model_id}/download:
+    parameters:
+      - $ref: "#/components/parameters/ModelId"
+    get:
+      tags: [models]
+      summary: Get the download link for a completed model
+      operationId: downloadModel
+      responses:
+        "200":
+          description: Link to the model file
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  download_url: { type: string, examples: ["/api/models/<id>/file"] }
+                  filename: { type: string, examples: ["<name>_<model_type>.pkl"] }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /api/models/{model_id}/file:
+    parameters:
+      - $ref: "#/components/parameters/ModelId"
+    get:
+      tags: [models]
+      summary: Download the model file (joblib pickle; see docs/data-formats.md)
+      operationId: getModelFile
+      responses:
+        "200":
+          description: Model artifact as an attachment
+          content:
+            application/octet-stream:
+              schema: { type: string, format: binary }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /api/models/{model_id}/explain:
+    parameters:
+      - $ref: "#/components/parameters/ModelId"
+    post:
+      tags: [models]
+      summary: Queue a LIME or SHAP explanation for one text
+      operationId: explainModel
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [text]
+              properties:
+                text: { type: string }
+                method: { $ref: "#/components/schemas/ExplainMethod" }
+      responses:
+        "202":
+          description: Queued; poll /api/models/explanations/{explanation_id}
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  explanation_id: { type: string }
+                  status: { type: string, const: processing }
+                  message: { type: string }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /api/models/{model_id}/explain-batch:
+    parameters:
+      - $ref: "#/components/parameters/ModelId"
+    post:
+      tags: [models]
+      summary: Queue explanations for up to 10 texts
+      operationId: explainModelBatch
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [texts]
+              properties:
+                texts: { type: array, minItems: 1, maxItems: 10, items: { type: string } }
+                method: { $ref: "#/components/schemas/ExplainMethod" }
+      responses:
+        "202":
+          description: Queued
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  explanation_ids: { type: array, items: { type: string } }
+                  status: { type: string, const: processing }
+                  message: { type: string }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /api/models/{model_id}/predict:
+    parameters:
+      - $ref: "#/components/parameters/ModelId"
+    post:
+      tags: [models]
+      summary: Predict up to 50 texts and wait for the worker's answer
+      operationId: predictWithModel
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [texts]
+              properties:
+                texts: { type: array, minItems: 1, maxItems: 50, items: { type: string } }
+      responses:
+        "200":
+          description: Predictions from the worker
+          content:
+            application/json:
+              schema: { type: object }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "504":
+          description: The worker did not answer in time
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+  /api/models/{model_id}/train:
+    parameters:
+      - $ref: "#/components/parameters/ModelId"
+    post:
+      tags: [models]
+      summary: Start training this model (alias of POST /api/training/start)
+      operationId: trainModel
+      requestBody:
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/TrainingOptions" }
+      responses:
+        "200":
+          description: Training queued
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message: { type: string }
+                  job_id: { type: string }
+                  model_id: { type: string }
+                  model: { $ref: "#/components/schemas/Model" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  # ---------------------------------------------------------------- training
+  /api/training/start:
+    post:
+      tags: [training]
+      summary: Queue a training job for a model
+      operationId: startTraining
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              allOf:
+                - type: object
+                  required: [model_id]
+                  properties:
+                    model_id: { type: string }
+                - $ref: "#/components/schemas/TrainingOptions"
+      responses:
+        "200":
+          description: Training queued
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message: { type: string }
+                  job_id: { type: string }
+                  model_id: { type: string }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409":
+          description: The model already has a pending or running job
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error: { type: string }
+                  job_id: { type: string }
+  /api/training/status/{job_id}:
+    parameters:
+      - $ref: "#/components/parameters/JobId"
+    get:
+      tags: [training]
+      summary: Job status (DB-authoritative; Redis refines live progress)
+      operationId: trainingStatus
+      responses:
+        "200":
+          description: Job and its model
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  job: { $ref: "#/components/schemas/TrainingJob" }
+                  model:
+                    oneOf:
+                      - { $ref: "#/components/schemas/Model" }
+                      - { type: "null" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /api/training/{job_id}/metrics:
+    parameters:
+      - $ref: "#/components/parameters/JobId"
+    get:
+      tags: [training]
+      summary: Experiment-monitoring metric points for a run
+      operationId: trainingMetrics
+      parameters:
+        - name: since_step
+          in: query
+          description: Only points with a step greater than this.
+          schema: { type: integer, default: -1 }
+      responses:
+        "200":
+          description: Metric points
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  points:
+                    type: array
+                    items: { $ref: "#/components/schemas/TrainingMetricPoint" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /api/training/jobs:
+    get:
+      tags: [training]
+      summary: List the caller's training jobs
+      operationId: listTrainingJobs
+      parameters:
+        - { name: model_id, in: query, schema: { type: string } }
+      responses:
+        "200":
+          description: Jobs
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  jobs:
+                    type: array
+                    items: { $ref: "#/components/schemas/TrainingJob" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+  /api/training/stop/{job_id}:
+    parameters:
+      - $ref: "#/components/parameters/JobId"
+    post:
+      tags: [training]
+      summary: Stop (cancel) an active job
+      operationId: stopTraining
+      responses:
+        "200": { $ref: "#/components/responses/Message" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /api/training/predict:
+    post:
+      tags: [training]
+      summary: Queue a single-text prediction (poll /api/training/prediction/{prediction_id})
+      operationId: queuePrediction
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [model_id, text]
+              properties:
+                model_id: { type: string }
+                text: { type: string }
+      responses:
+        "200":
+          description: Queued (result kept for 5 minutes)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message: { type: string }
+                  prediction_id: { type: string }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /api/training/prediction/{prediction_id}:
+    parameters:
+      - { name: prediction_id, in: path, required: true, schema: { type: string } }
+    get:
+      tags: [training]
+      summary: Poll a queued prediction
+      operationId: getPrediction
+      responses:
+        "200":
+          description: Prediction record
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  prediction: { type: object }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /api/training/batch-predict:
+    post:
+      tags: [training]
+      summary: Queue a batch prediction (poll /api/training/batch-prediction/{batch_id})
+      operationId: queueBatchPrediction
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [model_id, texts]
+              properties:
+                model_id: { type: string }
+                texts: { type: array, minItems: 1, items: { type: string } }
+      responses:
+        "200":
+          description: Queued (result kept for 30 minutes)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message: { type: string }
+                  batch_id: { type: string }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /api/training/batch-prediction/{batch_id}:
+    parameters:
+      - { name: batch_id, in: path, required: true, schema: { type: string } }
+    get:
+      tags: [training]
+      summary: Poll a batch prediction
+      operationId: getBatchPrediction
+      responses:
+        "200":
+          description: Batch prediction record, `status` pending from the moment it is queued, then completed (with `predictions`) or failed (with `error`)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  batch_prediction: { type: object }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  # ----------------------------------------------------------- visualization
+  /api/visualization/model-performance/{model_id}:
+    parameters:
+      - $ref: "#/components/parameters/ModelId"
+    get:
+      tags: [visualization]
+      summary: Headline metrics and a bar chart
+      operationId: modelPerformance
+      responses:
+        "200":
+          description: Performance
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  performance_data: { type: object, additionalProperties: { type: number } }
+                  performance_chart: { $ref: "#/components/schemas/PlotlyFigureJson" }
+                  detailed_metrics: { type: object }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /api/visualization/confusion-matrix/{model_id}:
+    parameters:
+      - $ref: "#/components/parameters/ModelId"
+    get:
+      tags: [visualization]
+      summary: Confusion matrix
+      operationId: confusionMatrix
+      responses:
+        "200":
+          description: Matrix, labels and heatmap
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  confusion_matrix: { type: array, items: { type: array, items: { type: integer } } }
+                  labels: { type: array, items: { type: string } }
+                  confusion_matrix_chart: { $ref: "#/components/schemas/PlotlyFigureJson" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /api/visualization/feature-importance/{model_id}:
+    parameters:
+      - $ref: "#/components/parameters/ModelId"
+    get:
+      tags: [visualization]
+      summary: Feature importance
+      operationId: featureImportance
+      responses:
+        "200": { $ref: "#/components/responses/AnyObject" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /api/visualization/clustering-visualization/{model_id}:
+    parameters:
+      - $ref: "#/components/parameters/ModelId"
+    get:
+      tags: [visualization]
+      summary: Cluster scatter and summary
+      operationId: clusteringVisualization
+      responses:
+        "200": { $ref: "#/components/responses/AnyObject" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /api/visualization/topic-modeling/{model_id}:
+    parameters:
+      - $ref: "#/components/parameters/ModelId"
+    get:
+      tags: [visualization]
+      summary: Topics, top words and chart
+      operationId: topicModelingVisualization
+      responses:
+        "200": { $ref: "#/components/responses/AnyObject" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /api/visualization/model-comparison:
+    post:
+      tags: [visualization]
+      summary: Compare two or more completed models and save the comparison
+      operationId: createModelComparison
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, model_ids]
+              properties:
+                name: { type: string }
+                model_ids: { type: array, minItems: 2, items: { type: string } }
+      responses:
+        "201":
+          description: Comparison created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  message: { type: string }
+                  comparison: { $ref: "#/components/schemas/ModelComparison" }
+                  comparison_chart: { $ref: "#/components/schemas/PlotlyFigureJson" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /api/visualization/comparisons:
+    get:
+      tags: [visualization]
+      summary: List saved comparisons
+      operationId: listComparisons
+      responses:
+        "200":
+          description: Comparisons
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  comparisons:
+                    type: array
+                    items: { $ref: "#/components/schemas/ModelComparison" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+  /api/visualization/comparisons/{comparison_id}:
+    parameters:
+      - { name: comparison_id, in: path, required: true, schema: { type: string } }
+    get:
+      tags: [visualization]
+      summary: Get one saved comparison
+      operationId: getComparison
+      responses:
+        "200":
+          description: Comparison
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  comparison: { $ref: "#/components/schemas/ModelComparison" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /api/visualization/parameter-comparison:
+    get:
+      tags: [visualization]
+      summary: Hyperparameters vs. a final metric across completed runs of one model type
+      operationId: parameterComparison
+      parameters:
+        - { name: model_type, in: query, required: true, schema: { type: string } }
+        - { name: metric, in: query, schema: { type: string, default: accuracy } }
+      responses:
+        "200":
+          description: One point per completed run
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  model_type: { type: string }
+                  metric: { type: string }
+                  points:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        model_id: { type: string }
+                        training_job_id: { type: string }
+                        parameters: { type: object }
+                        metric_value: { type: number }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  # -------------------------------------------------------------- annotation
+  /api/active-learning/settings:
+    get:
+      tags: [active-learning]
+      summary: Host's allowed query strategies, default strategy and batch size.
+      responses:
+        "200": {description: Settings}
+  /api/active-learning/datasets/{dataset_id}:
+    parameters:
+      - {name: dataset_id, in: path, required: true, schema: {type: string}}
+    get:
+      tags: [active-learning]
+      summary: A dataset's loop state, or active false if it has not started.
+      responses:
+        "200": {description: Loop state}
+        "404": {description: Not found or not yours}
+  /api/active-learning/datasets/{dataset_id}/start:
+    parameters:
+      - {name: dataset_id, in: path, required: true, schema: {type: string}}
+    post:
+      tags: [active-learning]
+      summary: Start the loop. Draws the holdout and shuffles the seed batch.
+      description: >-
+        With `seed_source: llm`, the LLM labels a random sample of the pool
+        (three batches' worth, never the holdout) on the worker, and the first
+        batch is then picked so each suggested label is in it, rarest first.
+        Needs labels named on the Dataset, LLM access, the project's
+        acknowledgement and `confirm_estimate: true` after
+        `POST .../seed-estimate`. The state's `seed` reports the job.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                strategy: {type: string}
+                batch_size: {type: integer}
+                min_per_class: {type: integer}
+                holdout_percent: {type: integer, description: "0 turns the holdout off"}
+                seed_source: {type: string, enum: [random, llm], default: random}
+                confirm_estimate: {type: boolean, description: "Required, true, with seed_source llm"}
+      responses:
+        "201": {description: Started}
+        "400": {description: "Not text classification, nothing to label, no named labels, or the estimate not confirmed"}
+        "403": {description: "No LLM access: `code` no_llm_access, `byok_available` true"}
+        "409": {description: "Already started, or the project has not acknowledged the destination (`code` acknowledgement_required)"}
+        "429": {description: "The seed is larger than the remaining monthly limit (`code` budget_exhausted)"}
+  /api/active-learning/datasets/{dataset_id}/seed-estimate:
+    parameters:
+      - {name: dataset_id, in: path, required: true, schema: {type: string}}
+    post:
+      tags: [active-learning]
+      summary: What an LLM-suggested first batch would send and cost, before starting.
+      description: Sampled from the file; creates nothing.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                batch_size: {type: integer}
+                holdout_percent: {type: integer}
+      responses:
+        "200":
+          description: Estimate
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  tasks: {type: integer, description: Items the LLM would label}
+                  estimated_tokens: {type: integer}
+                  remaining_tokens: {type: [integer, "null"], description: "null with the user's own key"}
+                  within_budget: {type: boolean}
+                  destination: {type: string}
+        "400": {description: "Not single-label classification, or no named labels"}
+        "403": {description: No LLM access}
+  /api/active-learning/datasets/{dataset_id}/strategy:
+    parameters:
+      - {name: dataset_id, in: path, required: true, schema: {type: string}}
+    put:
+      tags: [active-learning]
+      summary: Change the query strategy for the next rescore.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                strategy: {type: string}
+      responses:
+        "200": {description: Changed}
+        "400": {description: Not an allowed strategy}
+  /api/active-learning/datasets/{dataset_id}/labels:
+    parameters:
+      - {name: dataset_id, in: path, required: true, schema: {type: string}}
+    put:
+      tags: [active-learning]
+      summary: Correct a typed label on every saved item that has it.
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [from, to]
+              properties:
+                from: {type: string}
+                to: {type: string}
+      responses:
+        "200": {description: Loop state}
+        "400": {description: Empty new label, or the dataset names its labels}
+        "404": {description: No saved label has that name}
+        "409": {description: The loop has not started}
+  /api/active-learning/datasets/{dataset_id}/retrain:
+    parameters:
+      - {name: dataset_id, in: path, required: true, schema: {type: string}}
+    post:
+      tags: [active-learning]
+      summary: Retrain on confirmed labels, then the worker rescores the pool.
+      responses:
+        "200": {description: Training already running}
+        "202": {description: Training started}
+        "409": {description: "No new labels, a class short of labels, or the Model already training"}
+        "503": {description: Could not be queued}
+  /api/active-learning/datasets/{dataset_id}/verify:
+    parameters:
+      - {name: dataset_id, in: path, required: true, schema: {type: string}}
+    post:
+      tags: [active-learning]
+      summary: Grade the saved model on the holdout, on the worker.
+      responses:
+        "202": {description: Check queued}
+        "409": {description: No model, no holdout, or too few holdout labels}
+        "503": {description: Could not be queued}
+  /api/annotation/projects/{project_id}/queue/next:
+    parameters:
+      - $ref: "#/components/parameters/ProjectId"
+    get:
+      tags: [annotation]
+      summary: Next pending annotation task
+      operationId: nextAnnotationTask
+      parameters:
+        - { name: dataset, in: query, description: Restrict to one owned dataset., schema: { type: string } }
+        - { name: holdout, in: query, description: "1 serves held-out items, to label them for grading. They are never served otherwise.", schema: { type: string } }
+      responses:
+        "200":
+          description: Next task (null when everything is annotated) and progress
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  task:
+                    oneOf:
+                      - { $ref: "#/components/schemas/AnnotationTask" }
+                      - { type: "null" }
+                  stats:
+                    type: object
+                    properties:
+                      total: { type: integer }
+                      annotated: { type: integer }
+                      percentage: { type: number }
+                  message: { type: string }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /api/annotation/projects/{project_id}/queue/stats:
+    parameters:
+      - $ref: "#/components/parameters/ProjectId"
+    get:
+      tags: [annotation]
+      summary: Annotation progress counts
+      operationId: annotationQueueStats
+      responses:
+        "200":
+          description: Counts
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  stats:
+                    type: object
+                    properties:
+                      total: { type: integer }
+                      pending: { type: integer }
+                      annotated: { type: integer }
+                      skipped: { type: integer }
+                      percentage_complete: { type: integer }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /api/annotation/projects/{project_id}/tasks:
+    parameters:
+      - $ref: "#/components/parameters/ProjectId"
+    get:
+      tags: [annotation]
+      summary: List annotation tasks
+      description: >-
+        In row order. Every row with text has a task; a row the uploaded file
+        labels is `annotated` with `label_source: file`. With `status=annotated`
+        and a `label`, a page at a time, this feeds a review of existing labels.
+      operationId: listAnnotationTasks
+      parameters:
+        - { name: status, in: query, schema: { type: string, enum: [pending, annotated, skipped] } }
+        - { name: dataset_id, in: query, schema: { type: string } }
+        - { name: label, in: query, description: Only tasks with this label, schema: { type: string } }
+        - { name: include_holdout, in: query, description: Include held-back items, schema: { type: string, enum: ["1", "true"] } }
+        - { name: limit, in: query, schema: { type: integer, minimum: 0 } }
+        - { name: offset, in: query, schema: { type: integer, minimum: 0, default: 0 } }
+      responses:
+        "200":
+          description: Tasks
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  tasks: { type: array, items: { $ref: "#/components/schemas/AnnotationTask" } }
+                  count: { type: integer, description: Tasks on this page }
+                  total: { type: integer, description: Tasks matching, across pages }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /api/annotation/projects/{project_id}/tasks/reset:
+    parameters:
+      - $ref: "#/components/parameters/ProjectId"
+    post:
+      tags: [annotation]
+      summary: Reset the project's tasks to pending
+      operationId: resetAnnotationTasks
+      responses:
+        "200":
+          description: Reset
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success: { type: boolean }
+                  message: { type: string }
+                  reset_count: { type: integer }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /api/annotation/tasks/{task_id}:
+    parameters:
+      - $ref: "#/components/parameters/TaskId"
+    get:
+      tags: [annotation]
+      summary: Get one annotation task
+      operationId: getAnnotationTask
+      responses:
+        "200": { $ref: "#/components/responses/AnnotationTaskResult" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /api/annotation/tasks/{task_id}/save:
+    parameters:
+      - $ref: "#/components/parameters/TaskId"
+    post:
+      tags: [annotation]
+      summary: Save a label for a task
+      operationId: saveAnnotation
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [annotation_label]
+              properties:
+                annotation_label:
+                  description: A string, or an object/array that is stored as JSON text.
+      responses:
+        "200": { $ref: "#/components/responses/AnnotationTaskResult" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /api/annotation/tasks/{task_id}/assignment:
+    parameters:
+      - $ref: "#/components/parameters/TaskId"
+    get:
+      tags: [annotation]
+      summary: Open a task as a vue-legal-annotation-kit Assignment
+      description: >
+        The item's text, its Assignment (as last saved, or built from its label
+        when it was saved before the kit), the labels it can be given and the
+        kit annotation level.
+      operationId: getAnnotationAssignment
+      responses:
+        "200":
+          description: The task as the kit opens it.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [success, document, assignment, labels, annotation_level]
+                properties:
+                  success: { type: boolean }
+                  label_source: { type: [string, "null"], enum: [file, human, llm_confirmed, llm_bulk, null] }
+                  file_label: { type: [string, "null"], description: "The file's own value: its label, or an NER file's entity types" }
+                  hint: { type: [string, "null"], description: "NER only: the entity types the file lists for this row" }
+                  document:
+                    type: object
+                    properties:
+                      name: { type: string }
+                      full_text: { type: string }
+                  assignment: { $ref: "#/components/schemas/KitAssignment" }
+                  labels:
+                    type: array
+                    items: { type: string }
+                    description: >
+                      The Dataset's labels, or for typed labels every label
+                      saved on it so far.
+                  annotation_level:
+                    type: [string, "null"]
+                    enum: [document, word, null]
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    put:
+      tags: [annotation]
+      summary: Save a task's Assignment and the label derived from it
+      description: >
+        Single-label Datasets need exactly one document tag from the Dataset's
+        labels; NER spans must sit inside the text and not overlap. The label
+        training reads is derived from the Assignment; a broken rule is a 400
+        whose error says which.
+      operationId: saveAnnotationAssignment
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/KitAssignment" }
+      responses:
+        "200": { $ref: "#/components/responses/AnnotationTaskResult" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /api/annotation/tasks/{task_id}/skip:
+    parameters:
+      - $ref: "#/components/parameters/TaskId"
+    post:
+      tags: [annotation]
+      summary: Skip a task
+      operationId: skipAnnotation
+      responses:
+        "200": { $ref: "#/components/responses/AnnotationTaskResult" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/llm/status:
+    get:
+      tags: [llm]
+      summary: Current LLM access, destination and remaining tokens
+      operationId: getLlmStatus
+      parameters:
+        - { name: dataset_id, in: query, schema: { type: string } }
+      responses:
+        "200": { description: OK }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "502": { description: The LLM service failed }
+  /api/llm/key:
+    put:
+      tags: [llm]
+      summary: Save the caller's own key (write-only, encrypted at rest)
+      operationId: saveLlmKey
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [api_key, base_url, model]
+              properties:
+                api_key: { type: string }
+                base_url: { type: string, description: Public https URL }
+                model: { type: string }
+      responses:
+        "200": { description: OK }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+    delete:
+      tags: [llm]
+      summary: Delete the caller's own key
+      operationId: deleteLlmKey
+      responses:
+        "200": { description: OK }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+  /api/llm/datasets/{dataset_id}/acknowledgement:
+    parameters:
+      - { name: dataset_id, in: path, required: true, schema: { type: string } }
+    post:
+      tags: [llm]
+      summary: Acknowledge that this project's text goes to the named destination
+      operationId: acknowledgeLlmDestination
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [destination]
+              properties:
+                destination: { type: string }
+      responses:
+        "200": { description: OK }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: Acknowledgement required or destination changed }
+  /api/llm/datasets/{dataset_id}/prompt:
+    parameters:
+      - { name: dataset_id, in: path, required: true, schema: { type: string } }
+    get:
+      tags: [llm]
+      summary: Current prompt (version 0 is the unedited default)
+      operationId: getLlmPrompt
+      responses:
+        "200": { description: OK }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    put:
+      tags: [llm]
+      summary: Check and save a new prompt version
+      operationId: updateLlmPrompt
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [template]
+              properties:
+                template: { type: string, description: 'Must contain the labels and text slots once each' }
+                definitions: { type: object, additionalProperties: { type: string } }
+      responses:
+        "200": { description: OK }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: Acknowledgement required or destination changed }
+        "429": { description: Monthly limit reached }
+        "502": { description: The LLM service failed }
+  /api/llm/datasets/{dataset_id}/suggestions:
+    parameters:
+      - { name: dataset_id, in: path, required: true, schema: { type: string } }
+    get:
+      tags: [llm]
+      summary: List suggestions
+      operationId: listLlmSuggestions
+      parameters:
+        - { name: status, in: query, schema: { type: string } }
+      responses:
+        "200": { description: OK }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    post:
+      tags: [llm]
+      summary: Generate suggestions for a current batch
+      operationId: createLlmSuggestions
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [task_ids]
+              properties:
+                task_ids: { type: array, items: { type: string } }
+      responses:
+        "200": { description: OK }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: Acknowledgement required or destination changed }
+        "429": { description: Monthly limit reached }
+        "502": { description: The LLM service failed }
+  /api/llm/suggestions/{suggestion_id}/confirm:
+    parameters:
+      - { name: suggestion_id, in: path, required: true, schema: { type: string } }
+    post:
+      tags: [llm]
+      summary: Accept a suggestion, or correct it by sending a label
+      operationId: confirmLlmSuggestion
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                label: { type: string }
+      responses:
+        "200": { description: OK }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /api/llm/suggestions/{suggestion_id}/reject:
+    parameters:
+      - { name: suggestion_id, in: path, required: true, schema: { type: string } }
+    post:
+      tags: [llm]
+      summary: Reject a suggestion
+      operationId: rejectLlmSuggestion
+      responses:
+        "200": { description: OK }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /api/llm/datasets/{dataset_id}/agreement:
+    parameters:
+      - { name: dataset_id, in: path, required: true, schema: { type: string } }
+    get:
+      tags: [llm]
+      summary: Agreement of the latest model and prompt with human decisions
+      operationId: getLlmAgreement
+      responses:
+        "200": { description: OK }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /api/llm/datasets/{dataset_id}/bulk-accept:
+    parameters:
+      - { name: dataset_id, in: path, required: true, schema: { type: string } }
+    post:
+      tags: [llm]
+      summary: Accept pending suggestions once the agreement check passes
+      operationId: bulkAcceptLlmSuggestions
+      responses:
+        "200": { description: OK }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /api/llm/datasets/{dataset_id}/annotate/estimate:
+    parameters:
+      - { name: dataset_id, in: path, required: true, schema: { type: string } }
+    post:
+      tags: [llm]
+      summary: Estimate tokens for a standalone annotation job
+      operationId: estimateLlmAnnotation
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                task_ids: { type: array, items: { type: string } }
+      responses:
+        "200": { description: OK }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "502": { description: The LLM service failed }
+  /api/llm/datasets/{dataset_id}/annotate:
+    parameters:
+      - { name: dataset_id, in: path, required: true, schema: { type: string } }
+    post:
+      tags: [llm]
+      summary: Start a standalone annotation job on the worker
+      operationId: startLlmAnnotation
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [confirm_estimate]
+              properties:
+                task_ids: { type: array, items: { type: string } }
+                confirm_estimate: { type: boolean }
+      responses:
+        "202": { description: Job queued }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { description: Acknowledgement required or destination changed }
+        "429": { description: Monthly limit reached }
+        "502": { description: The LLM service failed }
+  /api/llm/jobs/{job_id}:
+    parameters:
+      - { name: job_id, in: path, required: true, schema: { type: string } }
+    get:
+      tags: [llm]
+      summary: Status of a standalone annotation job
+      operationId: getLlmJob
+      responses:
+        "200": { description: OK }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  # ----------------------------------------------------------- summarization
+  /api/summarize:
+    post:
+      tags: [summarization]
+      summary: Queue a summary of a text
+      description: >-
+        Extractive (sumy) or abstractive (an `hf:` model the deployment offers).
+        The worker runs it from `summarization_queue`; poll
+        `GET /api/summarize/{request_id}` for the result.
+      operationId: submitSummary
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [input_text]
+              properties:
+                input_text:
+                  type: string
+                  description: At most LEGAL_ML_SUMMARIZATION_MAX_INPUT_CHARS characters (default 500000).
+                summary_length:
+                  description: short, medium, long, or a target word count.
+                  oneOf:
+                    - { type: string, enum: [short, medium, long] }
+                    - { type: integer, minimum: 1, maximum: 5000 }
+                  default: medium
+                priority:
+                  type: object
+                  properties:
+                    relevance: { type: number, minimum: 0, maximum: 1, default: 0.5 }
+                    readability: { type: number, minimum: 0, maximum: 1, default: 0.5 }
+                model:
+                  type: string
+                  default: lex_rank
+                  description: An id from `GET /api/summarize/models`.
+                request_id:
+                  type: string
+                  pattern: "^[A-Za-z0-9_.:-]{1,128}$"
+                  description: Optional; generated when absent. `models` is not allowed.
+      responses:
+        "202":
+          description: Queued
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SummaryStatus" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "409":
+          description: The request_id is already in use
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+  /api/summarize/models:
+    get:
+      tags: [summarization]
+      summary: The models a summary may use
+      operationId: listSummaryModels
+      responses:
+        "200":
+          description: Catalogue
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  default: { type: string }
+                  abstractive_available: { type: boolean }
+                  extractive: { type: array, items: { type: string } }
+                  abstractive: { type: array, items: { type: string } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+  /api/summarize/{request_id}:
+    parameters:
+      - { name: request_id, in: path, required: true, schema: { type: string } }
+    get:
+      tags: [summarization]
+      summary: Status and result of a summary
+      description: Only the caller who queued it sees it; anyone else gets 404.
+      operationId: getSummary
+      responses:
+        "200":
+          description: Status
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SummaryStatus" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: >-
+        Keycloak access token (AUTH_MODE=keycloak) or host-signed HS256 token
+        with sub/iat/exp and a lifetime of at most 60 s (AUTH_MODE=platform).
+  parameters:
+    DatasetId: { name: dataset_id, in: path, required: true, schema: { type: string } }
+    ModelId: { name: model_id, in: path, required: true, schema: { type: string } }
+    JobId: { name: job_id, in: path, required: true, schema: { type: string } }
+    ProjectId:
+      name: project_id
+      in: path
+      required: true
+      description: Opaque project reference; validated according to PROJECT_SCOPE.
+      schema: { type: string }
+    TaskId: { name: task_id, in: path, required: true, schema: { type: string } }
+  responses:
+    Message:
+      description: Success message
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              message: { type: string }
+    AnyObject:
+      description: JSON object (structure depends on task and model type)
+      content:
+        application/json:
+          schema: { type: object }
+    AnnotationTaskResult:
+      description: The task
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              success: { type: boolean }
+              message: { type: string }
+              task: { $ref: "#/components/schemas/AnnotationTask" }
+    BadRequest:
+      description: Invalid input or a state that does not allow the action
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    Unauthorized:
+      description: Missing, invalid or expired bearer token
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    Forbidden:
+      description: Resource belongs to another owner
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    NotFound:
+      description: Not found, or not owned by the caller
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+  schemas:
+    SummaryStatus:
+      type: object
+      properties:
+        request_id: { type: string }
+        status: { type: string, enum: [queued, processing, complete, error] }
+        progress: { type: integer, minimum: 0, maximum: 100 }
+        summarized_text: { type: [string, "null"] }
+        error: { type: [string, "null"] }
+        status_message:
+          type: string
+          description: Set on a queued summary when no worker is running.
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error: { type: string }
+        field:
+          type: string
+          description: >-
+            The key of the parameter to change, on a refusal tied to one. For a
+            rule across two parameters, the one the rule limits, such as `solver`
+            when a penalty needs another solver. Absent otherwise.
+        success: { type: boolean, const: false }
+    PlotlyFigureJson:
+      type: string
+      description: A Plotly figure serialised with PlotlyJSONEncoder (parse, then pass to Plotly).
+    TaskTypeValue:
+      type: string
+      enum:
+        - classification
+        - document_classification
+        - ner
+        - named_entity_recognition
+        - summarization
+        - topic_modeling
+        - clustering
+        - judgment_prediction
+    TaskType:
+      type: object
+      properties:
+        value: { $ref: "#/components/schemas/TaskTypeValue" }
+        label: { type: string }
+        summary: { type: string }
+        when_to_use: { type: string }
+        label_meaning: { type: string }
+        required_columns: { type: array, items: { type: string } }
+        example: { type: string }
+    ExplainMethod:
+      type: string
+      enum: [lime, shap]
+      default: lime
+    TrainingOptions:
+      type: object
+      properties:
+        preprocessing_options: { type: object, default: {} }
+        test_size: { type: number, exclusiveMinimum: 0, exclusiveMaximum: 1, default: 0.2, description: Share of rows held out for testing. Outside this range the start is refused with 400. }
+        random_state: { type: integer, default: 42 }
+    Dataset:
+      type: object
+      properties:
+        id: { type: string }
+        owner_id: { type: string }
+        name: { type: string }
+        description: { type: [string, "null"] }
+        file_path: { type: string }
+        row_count: { type: integer }
+        columns:
+          type: array
+          items:
+            type: object
+            properties:
+              name: { type: string }
+              type: { type: string }
+              null_count: { type: integer }
+              unique_count: { type: integer }
+        task_type: { $ref: "#/components/schemas/TaskTypeValue" }
+        project_id: { type: [string, "null"] }
+        dataset_type: { type: [string, "null"] }
+        annotation_progress: { type: integer }
+        annotated_count: { type: integer }
+        total_count: { type: integer }
+        text_column: { type: [string, "null"] }
+        label_column: { type: [string, "null"] }
+        labels: { type: [array, "null"], items: { type: string } }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+    Model:
+      type: object
+      properties:
+        id: { type: string }
+        owner_id: { type: string }
+        dataset_id: { type: string }
+        project_id: { type: [string, "null"] }
+        name: { type: string }
+        model_type: { type: string }
+        parameters: { type: object }
+        status: { type: string, enum: [pending, training, completed, failed] }
+        file_path: { type: [string, "null"] }
+        metrics: { type: [object, "null"] }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+    TrainingJob:
+      type: object
+      properties:
+        id: { type: string }
+        owner_id: { type: string }
+        model_id: { type: string }
+        status: { type: string, enum: [pending, running, completed, failed, cancelled] }
+        progress: { type: [number, "null"] }
+        parameters:
+          type: [object, "null"]
+          description: >-
+            The model's parameters when the run started, catalogue defaults filled in; null
+            for older runs. Runs from this release on add `monitoring`, the monitoring the
+            run used, with the host's and the package's defaults filled in.
+        metrics: { type: [object, "null"] }
+        error_message: { type: [string, "null"] }
+        status_message:
+          type: [string, "null"]
+          description: Liveness message (e.g. worker not running); set by /training/jobs and /training/status.
+        started_at: { type: [string, "null"], format: date-time }
+        completed_at: { type: [string, "null"], format: date-time }
+        created_at: { type: string, format: date-time }
+    TrainingRun:
+      type: object
+      properties:
+        id: { type: string }
+        status: { type: string, enum: [pending, running, completed, failed, cancelled] }
+        parameters:
+          type: [object, "null"]
+          description: >-
+            The model's parameters when the run started, catalogue defaults filled in; null
+            for older runs. Runs from this release on add `monitoring`, the monitoring the
+            run used, with the host's and the package's defaults filled in.
+        scores:
+          type: object
+          description: >-
+            The headline scores the run produced, where present: accuracy, precision,
+            recall, f1_score, silhouette_score, n_clusters, n_topics, perplexity.
+          additionalProperties: { type: number }
+        error_message: { type: [string, "null"] }
+        created_at: { type: string, format: date-time }
+        started_at: { type: [string, "null"], format: date-time }
+        completed_at: { type: [string, "null"], format: date-time }
+    Monitoring:
+      type: object
+      additionalProperties: false
+      description: >-
+        How a run is monitored. Each setting left out takes the host's default
+        (`LEGAL_ML_MONITORING`), else the package's. A bad value is refused with a 400
+        whose `field` is `monitoring.<setting>`.
+      properties:
+        log_every_n_steps: { type: integer, minimum: 1, default: 10, description: How often fine-tuning logs, in steps. }
+        eval_strategy: { type: string, enum: [epoch, steps], default: epoch, description: When fine-tuning evaluates. }
+        eval_steps: { type: integer, minimum: 1, default: 100, description: How often fine-tuning evaluates, in steps, when eval_strategy is steps. }
+        include:
+          type: array
+          items: { type: string }
+          default: ["*"]
+          description: Name globs; a point is stored when it matches one and no exclude. Stage markers are always stored.
+        exclude: { type: array, items: { type: string }, default: [], description: Name globs of points not to store. }
+        learning_curve: { type: boolean, default: false, description: "Classical Text Classification algorithms also store learning_curve_* points against training-set size, and logistic regression its loss by iteration. Makes training slower." }
+        system_metrics: { type: boolean, default: false, description: "Record system points: memory_mb, gpu_memory_mb and gpu_use_percent when there is a GPU, samples_per_second and seconds_remaining. Every log_every_n_steps when fine-tuning, at each stage otherwise." }
+        flush_every_points: { type: integer, minimum: 1, default: 50, description: The worker writes waiting metric points once this many are waiting. }
+        flush_every_seconds: { type: number, exclusiveMinimum: 0, default: 2.0, description: The worker writes waiting metric points once the oldest has waited this many seconds. }
+    TrainingMetricPoint:
+      type: object
+      properties:
+        id: { type: string }
+        training_job_id: { type: string }
+        step:
+          type: integer
+          description: Write counter and polling cursor, not the trainer's step.
+        epoch: { type: [number, "null"] }
+        training_step:
+          type: [integer, "null"]
+          description: The trainer's own step for fine-tuning, the iteration for loss by iteration, and the training-set size for `learning_curve_*` points.
+        metric_name: { type: string }
+        group:
+          type: string
+          enum: [train, eval, system, stage]
+          description: >-
+            Which chart the point belongs on. Older points without one
+            get one from their name: `eval_*` is eval, the run's milestones
+            are stage, and the rest are train.
+        x_kind:
+          type: string
+          enum: [step, iteration, training_examples]
+          description: >-
+            What `training_step` counts, for the x-axis title: the trainer's
+            steps, logistic regression's iterations (loss by iteration), or
+            training examples (`learning_curve_*` points). Worked out from the
+            stored point, so older points have one too.
+        unit:
+          type: [string, "null"]
+          description: >-
+            A system point's unit, from the end of its name: `MB` (`*_mb`), `%`
+            (`*_percent`), `samples/s` (`samples_per_second`) or `s`
+            (`seconds_remaining`). Null for every other point.
+        value: { type: number }
+        created_at: { type: string, format: date-time }
+    ModelComparison:
+      type: object
+      properties:
+        id: { type: string }
+        owner_id: { type: string }
+        name: { type: string }
+        model_ids: { type: array, items: { type: string } }
+        comparison_metrics:
+          type: object
+          properties:
+            metrics: { type: object }
+            chart: { $ref: "#/components/schemas/PlotlyFigureJson" }
+        created_at: { type: string, format: date-time }
+    KitAssignment:
+      type: object
+      description: >
+        vue-legal-annotation-kit's Assignment. Stored as sent; only the fields
+        below are read.
+      required: [annotations, document_annotations]
+      properties:
+        id: {}
+        status: { type: string, enum: [pending, done] }
+        confidence: { type: integer, minimum: 0, maximum: 5 }
+        document_annotations:
+          type: array
+          items:
+            type: object
+            required: [label]
+            properties:
+              id: { type: integer }
+              label: { type: string }
+              confidence: { type: integer }
+              metadata: { type: [string, "null"] }
+        annotations:
+          type: array
+          items:
+            type: object
+            required: [start, end, label]
+            properties:
+              id: { type: integer }
+              start: { type: integer }
+              end: { type: integer }
+              label: { type: string }
+              text: { type: string }
+        document_relations: { type: array, items: { type: object } }
+    AnnotationTask:
+      type: object
+      properties:
+        id: { type: string }
+        dataset_id: { type: string }
+        item_index: { type: integer }
+        text: { type: string }
+        annotation_label: { type: [string, "null"] }
+        status: { type: string, enum: [pending, annotated, skipped] }
+        label_source: { type: [string, "null"], enum: [file, human, llm_confirmed, llm_bulk, null] }
+        file_label: { type: [string, "null"] }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }

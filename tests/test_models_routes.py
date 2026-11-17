@@ -27,6 +27,14 @@ def test_get_available_models_catalog(client, auth_headers):
     assert "svm" in body["models"]["classification"]
 
 
+def test_catalog_offers_class_weight_only_where_the_estimator_supports_it(client, auth_headers):
+    classifiers = client.get("/api/models/available", headers=auth_headers).get_json()["models"]["classification"]
+
+    for model_type in ("svm", "decision_tree", "random_forest", "logistic_regression"):
+        assert classifiers[model_type]["parameters"]["class_weight"]["options"] == ["none", "balanced"]
+    assert "class_weight" not in classifiers["naive_bayes"]["parameters"]
+
+
 def test_get_available_models_filtered_by_task_type(client, auth_headers):
     resp = client.get("/api/models/available?task_type=clustering", headers=auth_headers)
     assert resp.status_code == 200
@@ -183,3 +191,38 @@ def test_update_model_labels_persists_display_names(client, auth_headers, app):
     display = resp.get_json()["model"]["metrics"]["display_labels"]
     assert display["topics"]["0"] == "Contracts"
     assert "1" not in display["topics"]
+
+
+def _create_in_project(client, auth_headers, dataset_id, project_id):
+    resp = client.post(
+        "/api/models/",
+        json={"name": "m", "dataset_id": dataset_id, "model_type": "svm", "parameters": {}, "project_id": project_id},
+        headers=auth_headers,
+    )
+    assert resp.status_code == 201, resp.get_json()
+
+
+def test_a_model_made_in_a_project_brings_its_unfiled_dataset_into_the_project(client, auth_headers, app):
+    # A Dataset imported or uploaded outside any Project, then trained in one,
+    # shows on that Project's page with its Model.
+    app.config.setdefault("_known_projects", set()).add(("project-1", TEST_USER_ID))
+    dataset_id = _make_dataset(app)
+
+    _create_in_project(client, auth_headers, dataset_id, "project-1")
+
+    with app.app_context():
+        assert db.session.get(Dataset, dataset_id).project_id == "project-1"
+
+
+def test_a_dataset_already_in_another_project_stays_there(client, auth_headers, app):
+    known = app.config.setdefault("_known_projects", set())
+    known |= {("project-1", TEST_USER_ID), ("project-2", TEST_USER_ID)}
+    dataset_id = _make_dataset(app)
+    with app.app_context():
+        db.session.get(Dataset, dataset_id).project_id = "project-1"
+        db.session.commit()
+
+    _create_in_project(client, auth_headers, dataset_id, "project-2")
+
+    with app.app_context():
+        assert db.session.get(Dataset, dataset_id).project_id == "project-1"

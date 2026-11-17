@@ -2,6 +2,7 @@ import uuid
 from datetime import datetime
 
 from .db import MLBase, db
+from .metric_groups import metric_group_for, unit_for, x_kind_for
 
 
 class MLProject(MLBase):
@@ -59,6 +60,16 @@ class Dataset(MLBase):
     )
     annotation_tasks = db.relationship(
         "AnnotationTask", backref="dataset", lazy=True, cascade="all, delete-orphan"
+    )
+    al_config = db.relationship(
+        "ALConfig", backref="dataset", uselist=False, cascade="all, delete-orphan"
+    )
+    al_rounds = db.relationship(
+        "ALRound",
+        backref="dataset",
+        lazy=True,
+        cascade="all, delete-orphan",
+        order_by="ALRound.number",
     )
 
     def to_dict(self):
@@ -149,6 +160,8 @@ class TrainingJob(MLBase):
         db.String(50), default="pending"
     )  # pending, running, completed, failed, cancelled
     progress = db.Column(db.Integer, default=0)
+    # The Model's settings when the run started; null for older runs.
+    parameters = db.Column(db.JSON)
     metrics = db.Column(db.JSON)
     error_message = db.Column(db.Text)
     started_at = db.Column(db.DateTime)
@@ -171,6 +184,7 @@ class TrainingJob(MLBase):
             "model_id": self.model_id,
             "status": self.status,
             "progress": self.progress,
+            "parameters": self.parameters,
             "metrics": self.metrics,
             "error_message": self.error_message,
             "started_at": self.started_at.isoformat() if self.started_at else None,
@@ -209,13 +223,28 @@ class AnnotationTask(MLBase):
     dataset_id = db.Column(db.String(36), db.ForeignKey("datasets.id"), nullable=False)
     item_index = db.Column(db.Integer, nullable=False)
     text = db.Column(db.Text, nullable=False)
-    annotation_label = db.Column(db.String(1000))  # JSON string for multi-label/NER
+    # The label training reads: a class name, or an NER entity list as JSON.
+    # Derived from annotation_payload on each save (annotation_format.py).
+    annotation_label = db.Column(db.Text)
+    # The kit's Assignment as last saved; None for a task saved before the kit,
+    # which is then built from annotation_label when opened.
+    annotation_payload = db.Column(db.JSON)
     status = db.Column(
         db.String(50), default="pending"
     )  # 'pending', 'annotated', 'skipped'
+    label_source = db.Column(db.String(20))  # 'file', 'human', 'llm_confirmed', 'llm_bulk'
+    # The file's own value for the row: its label, kept after a person changes
+    # it, or an NER file's entity types (not spans, so the row stays pending).
+    file_label = db.Column(db.Text)
+    score = db.Column(db.Float)  # how much labelling this helps; higher is served first
+    is_holdout = db.Column(db.Boolean, default=False, nullable=False)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     updated_at = db.Column(
         db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow
+    )
+
+    suggestions = db.relationship(
+        "LLMSuggestion", backref="task", lazy=True, cascade="all, delete-orphan"
     )
 
     # Unique constraint on dataset_id and item_index
@@ -231,9 +260,218 @@ class AnnotationTask(MLBase):
             "text": self.text,
             "annotation_label": self.annotation_label,
             "status": self.status,
+            "label_source": self.label_source,
+            "file_label": self.file_label,
+            "score": self.score,
+            "is_holdout": self.is_holdout,
             "created_at": self.created_at.isoformat(),
             "updated_at": self.updated_at.isoformat(),
         }
+
+
+class ALConfig(MLBase):
+    """A dataset's active learning setup, one row once the loop is started.
+
+    ``holdout_indices`` are row positions in the dataset file, drawn once. Rows
+    labelled in the file have no annotation task, so a task flag cannot hold them.
+    """
+
+    __tablename__ = "al_configs"
+
+    id = db.Column(db.String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    dataset_id = db.Column(
+        db.String(36),
+        db.ForeignKey("datasets.id", ondelete="CASCADE"),
+        nullable=False,
+        unique=True,
+    )
+    model_id = db.Column(db.String(36), db.ForeignKey("models.id", ondelete="SET NULL"))
+    model_type = db.Column(db.String(100), default="logistic_regression", nullable=False)
+    strategy = db.Column(db.String(50), nullable=False)
+    seed_source = db.Column(db.String(20), default="random", nullable=False)  # 'random', 'llm'
+    random_seed = db.Column(db.Integer, default=42, nullable=False)
+    batch_size = db.Column(db.Integer, default=20, nullable=False)
+    min_per_class = db.Column(db.Integer, default=5, nullable=False)
+    holdout_percent = db.Column(db.Integer, default=20, nullable=False)  # 0 turns it off
+    holdout_indices = db.Column(db.JSON)
+    file_label_counts = db.Column(db.JSON)  # per class, labels the file gave the pool
+    holdout_file_counts = db.Column(db.JSON)  # per class, labels the file gave the holdout
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    updated_at = db.Column(
+        db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow
+    )
+
+
+class ALRound(MLBase):
+    """One cycle of label a batch, retrain, rescore the pool."""
+
+    __tablename__ = "al_rounds"
+
+    id = db.Column(db.String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    dataset_id = db.Column(
+        db.String(36), db.ForeignKey("datasets.id", ondelete="CASCADE"), nullable=False
+    )
+    number = db.Column(db.Integer, nullable=False)  # 0 is the seed batch
+    status = db.Column(
+        db.String(20), default="labelling", nullable=False
+    )  # 'labelling', 'training', 'scoring', 'completed'
+    strategy = db.Column(db.String(50), nullable=False)
+    model_id = db.Column(db.String(36), db.ForeignKey("models.id", ondelete="SET NULL"))
+    job_id = db.Column(db.String(36), db.ForeignKey("training_jobs.id", ondelete="SET NULL"))
+    labels_used = db.Column(db.Integer)  # confirmed labels this round trained on
+    metrics = db.Column(db.JSON)
+    error = db.Column(db.Text)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    updated_at = db.Column(
+        db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow
+    )
+    completed_at = db.Column(db.DateTime)
+
+    __table_args__ = (
+        db.UniqueConstraint("dataset_id", "number", name="uq_al_round_number"),
+    )
+
+    def to_dict(self):
+        return {
+            "number": self.number,
+            "status": self.status,
+            "strategy": self.strategy,
+            "model_id": self.model_id,
+            "job_id": self.job_id,
+            "labels_used": self.labels_used,
+            "metrics": self.metrics,
+            "error": self.error,
+            "created_at": self.created_at.isoformat(),
+            "completed_at": self.completed_at.isoformat() if self.completed_at else None,
+        }
+
+
+class LLMCredential(MLBase):
+    """A user's own LLM key (BYOK). ``encrypted_key`` is Fernet ciphertext."""
+
+    __tablename__ = "llm_credentials"
+
+    id = db.Column(db.String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    owner_id = db.Column(db.String(255), nullable=False, unique=True)
+    encrypted_key = db.Column(db.Text, nullable=False)
+    base_url = db.Column(db.String(500), nullable=False)
+    model = db.Column(db.String(255), nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    updated_at = db.Column(
+        db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow
+    )
+
+
+class LLMAcknowledgement(MLBase):
+    """Records that an owner accepted sending a scope's text to a destination.
+
+    ``scope_id`` is the dataset's project, or the dataset itself when it has none.
+    """
+
+    __tablename__ = "llm_acknowledgements"
+
+    id = db.Column(db.String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    owner_id = db.Column(db.String(255), nullable=False)
+    scope_id = db.Column(db.String(255), nullable=False)
+    destination = db.Column(db.String(255), nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+    __table_args__ = (
+        db.UniqueConstraint(
+            "owner_id", "scope_id", "destination", name="uq_llm_acknowledgement"
+        ),
+    )
+
+    def to_dict(self):
+        return {
+            "destination": self.destination,
+            "created_at": self.created_at.isoformat(),
+        }
+
+
+class LLMPrompt(MLBase):
+    """One version of a dataset's labelling prompt. Versions are never edited."""
+
+    __tablename__ = "llm_prompts"
+
+    id = db.Column(db.String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    dataset_id = db.Column(
+        db.String(36), db.ForeignKey("datasets.id", ondelete="CASCADE"), nullable=False
+    )
+    version = db.Column(db.Integer, nullable=False)
+    template = db.Column(db.Text, nullable=False)
+    definitions = db.Column(db.JSON)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+
+    __table_args__ = (
+        db.UniqueConstraint("dataset_id", "version", name="uq_llm_prompt_version"),
+    )
+
+    def to_dict(self):
+        return {
+            "version": self.version,
+            "template": self.template,
+            "definitions": self.definitions or {},
+            "created_at": self.created_at.isoformat(),
+        }
+
+
+class LLMSuggestion(MLBase):
+    """An LLM's proposed label. It is not a label until a human accepts it."""
+
+    __tablename__ = "llm_suggestions"
+
+    id = db.Column(db.String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    task_id = db.Column(
+        db.String(36),
+        db.ForeignKey("annotation_tasks.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    model = db.Column(db.String(255), nullable=False)
+    prompt_version = db.Column(db.Integer, nullable=False)
+    label = db.Column(db.String(1000), nullable=False)
+    rationale = db.Column(db.Text)
+    status = db.Column(
+        db.String(20), default="pending", nullable=False
+    )  # 'pending', 'accepted', 'corrected', 'rejected', 'bulk_accepted'
+    bulk_agreement = db.Column(db.JSON)  # the agreement check that unlocked bulk accept
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    updated_at = db.Column(
+        db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow
+    )
+
+    __table_args__ = (
+        db.UniqueConstraint(
+            "task_id", "model", "prompt_version", name="uq_llm_suggestion"
+        ),
+    )
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "task_id": self.task_id,
+            "model": self.model,
+            "prompt_version": self.prompt_version,
+            "label": self.label,
+            "rationale": self.rationale,
+            "status": self.status,
+            "created_at": self.created_at.isoformat(),
+        }
+
+
+class LLMUsage(MLBase):
+    """Shared-key tokens per owner per month, for the default usage meter."""
+
+    __tablename__ = "llm_usage"
+
+    id = db.Column(db.String(36), primary_key=True, default=lambda: str(uuid.uuid4()))
+    owner_id = db.Column(db.String(255), nullable=False)
+    period = db.Column(db.String(7), nullable=False)  # 'YYYY-MM'
+    tokens = db.Column(db.Integer, default=0, nullable=False)
+
+    __table_args__ = (
+        db.UniqueConstraint("owner_id", "period", name="uq_llm_usage_period"),
+    )
 
 
 class TrainingMetricPoint(MLBase):
@@ -254,7 +492,13 @@ class TrainingMetricPoint(MLBase):
     )
     step = db.Column(db.Integer, nullable=False)
     epoch = db.Column(db.Float, nullable=True)
+    # The trainer's own step (HF `global_step`), or a classical learning curve's
+    # iteration, or for `learning_curve_*` points its training-set size.
+    training_step = db.Column(db.Integer, nullable=True)
     metric_name = db.Column(db.String(100), nullable=False)
+    # One of metric_groups.METRIC_GROUPS. None on rows stored before groups
+    # existed; to_dict derives theirs from the name.
+    metric_group = db.Column(db.String(20), nullable=True)
     value = db.Column(db.Float, nullable=False)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
 
@@ -268,12 +512,17 @@ class TrainingMetricPoint(MLBase):
     )
 
     def to_dict(self):
+        group = self.metric_group or metric_group_for(self.metric_name)
         return {
             "id": self.id,
             "training_job_id": self.training_job_id,
             "step": self.step,
             "epoch": self.epoch,
+            "training_step": self.training_step,
             "metric_name": self.metric_name,
+            "group": group,
+            "x_kind": x_kind_for(self.metric_name, self.epoch, self.training_step),
+            "unit": unit_for(self.metric_name, group),
             "value": self.value,
             "created_at": self.created_at.isoformat(),
         }
