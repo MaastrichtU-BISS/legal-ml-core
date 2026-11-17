@@ -8,6 +8,16 @@ While the version is 0.x, minor releases may contain breaking changes.
 
 ## [Unreleased]
 
+## [0.14.1] - 2026-11-17
+
+### Added
+
+- `GET /api/llm/status` returns `shared_key_configured`: whether this deployment
+  offers a shared key at all, for any account. Nothing about the key itself is
+  returned. `shared_key_allowed` keeps its meaning, so a client can now tell "no
+  shared key here" from "this account may not use it" (reducing_digital_divide
+  #155).
+
 ## [0.14.0] - 2026-11-17
 
 ### Added
@@ -516,7 +526,8 @@ version was not tagged; it corresponds to commit `02c5b61`.
 - Worker foreign-key resolution and the missing `psycopg2` dependency.
 - Model/task compatibility checks, live progress and failure reasons.
 
-[Unreleased]: https://github.com/shashankmc/legal-ml-core/compare/v0.14.0...HEAD
+[Unreleased]: https://github.com/shashankmc/legal-ml-core/compare/v0.14.1...HEAD
+[0.14.1]: https://github.com/shashankmc/legal-ml-core/compare/v0.14.0...v0.14.1
 [0.14.0]: https://github.com/shashankmc/legal-ml-core/compare/v0.13.0...v0.14.0
 [0.13.0]: https://github.com/shashankmc/legal-ml-core/compare/v0.12.1...v0.13.0
 [0.12.1]: https://github.com/shashankmc/legal-ml-core/compare/v0.12.0...v0.12.1

@@ -164,7 +164,10 @@ def status():
     owner_id = _owner()
     claims = get_jwt()
     key = LLMCredential.query.filter_by(owner_id=owner_id).first()
-    shared_allowed = shared_key_allowed(claims) and shared_endpoint() is not None
+    # Whether this deployment offers a shared key at all, apart from whether
+    # this account may use it. Nothing about the key itself is returned.
+    shared_configured = shared_endpoint() is not None
+    shared_allowed = shared_key_allowed(claims) and shared_configured
 
     credential = None
     try:
@@ -177,6 +180,7 @@ def status():
         "destination": credential.destination if credential else None,
         "model": credential.model if credential else None,
         "shared_key_allowed": shared_allowed,
+        "shared_key_configured": shared_configured,
         "key": {"base_url": key.base_url, "model": key.model} if key else None,
         "remaining_tokens": None,
         # The most items one POST .../suggestions may ask for.
