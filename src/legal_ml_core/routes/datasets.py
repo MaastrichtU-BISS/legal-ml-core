@@ -479,6 +479,13 @@ def get_task_types():
     return jsonify({"task_types": TASK_TYPES}), 200
 
 
+@datasets_bp.route("/limits", methods=["GET"])
+def get_limits():
+    """The limits an upload meets, read on each call so an admin's change shows
+    at once. Unauthenticated, like the task types: upload copy shows it."""
+    return jsonify({"max_rows": max_rows()}), 200
+
+
 @datasets_bp.route("/<dataset_id>/preview", methods=["GET"])
 @jwt_required()
 def preview_dataset(dataset_id):

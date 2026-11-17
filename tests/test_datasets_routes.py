@@ -332,3 +332,11 @@ def test_an_unexpected_failure_reaches_the_host_and_keeps_no_file(app, client, a
     with pytest.raises(RuntimeError, match="database went away"):
         _upload_rows(client, auth_headers, 2)
     assert os.listdir(app.config["UPLOAD_FOLDER"]) == []
+
+
+def test_limits_say_the_row_cap_an_upload_meets_without_signing_in(app, client):
+    assert client.get("/api/datasets/limits").get_json() == {"max_rows": 1000}
+
+    app.config["LEGAL_ML_MAX_ROWS"] = lambda: 250
+
+    assert client.get("/api/datasets/limits").get_json() == {"max_rows": 250}
