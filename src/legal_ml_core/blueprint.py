@@ -1,5 +1,5 @@
 def init_ml_feature(app, redis_client, model_storage_path, db=None):
-    """Registers the ML feature's eight blueprints onto a host Flask app.
+    """Registers the ML feature's nine blueprints onto a host Flask app.
 
     ``db`` is the host's Flask-SQLAlchemy handle. It must have been built on
     ``legal_ml_core.db.MLBase`` (``SQLAlchemy(model_class=MLBase)``) so host and
@@ -55,6 +55,7 @@ def init_ml_feature(app, redis_client, model_storage_path, db=None):
     from .routes.eda import eda_bp
     from .routes.llm import llm_bp
     from .routes.models import models_bp
+    from .routes.summarization import summarization_bp
     from .routes.training import training_bp
     from .routes.visualization import visualization_bp
 
@@ -66,3 +67,4 @@ def init_ml_feature(app, redis_client, model_storage_path, db=None):
     app.register_blueprint(annotation_bp, url_prefix="/api/annotation")
     app.register_blueprint(llm_bp, url_prefix="/api/llm")
     app.register_blueprint(active_learning_bp, url_prefix="/api/active-learning")
+    app.register_blueprint(summarization_bp, url_prefix="/api/summarize")

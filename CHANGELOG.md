@@ -8,6 +8,24 @@ While the version is 0.x, minor releases may contain breaking changes.
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-11-17
+
+### Added
+
+- Summarization, folded in from `legal-summarizer-service`: `POST /api/summarize`
+  queues a summary on `summarization_queue`, `GET /api/summarize/<request_id>`
+  returns its status and result to its owner only, and `GET /api/summarize/models`
+  lists the models. Extractive (sumy: LexRank, LSA, TextRank, Luhn, Edmundson)
+  and abstractive (Hugging Face, limited to `LEGAL_ML_SUMMARIZATION_HF_MODELS`).
+  Clients poll; there is no SSE stream. A 400 names the `field` to fix.
+- `sumy` in the `compute` extra; the worker downloads NLTK punkt on start.
+
+### Changed from legal-summarizer-service
+
+- An unknown model is refused with 400 instead of falling back to LexRank.
+- Edmundson works: it is given legal cue words (it always failed before).
+- Input is capped at `LEGAL_ML_SUMMARIZATION_MAX_INPUT_CHARS` (500 000).
+
 ## [0.13.0] - 2026-11-13
 
 ### Changed
@@ -498,7 +516,8 @@ version was not tagged; it corresponds to commit `02c5b61`.
 - Worker foreign-key resolution and the missing `psycopg2` dependency.
 - Model/task compatibility checks, live progress and failure reasons.
 
-[Unreleased]: https://github.com/shashankmc/legal-ml-core/compare/v0.13.0...HEAD
+[Unreleased]: https://github.com/shashankmc/legal-ml-core/compare/v0.14.0...HEAD
+[0.14.0]: https://github.com/shashankmc/legal-ml-core/compare/v0.13.0...v0.14.0
 [0.13.0]: https://github.com/shashankmc/legal-ml-core/compare/v0.12.1...v0.13.0
 [0.12.1]: https://github.com/shashankmc/legal-ml-core/compare/v0.12.0...v0.12.1
 [0.12.0]: https://github.com/shashankmc/legal-ml-core/compare/v0.11.2...v0.12.0

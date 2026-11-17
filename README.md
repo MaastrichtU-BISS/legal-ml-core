@@ -21,6 +21,8 @@ representations of the same database schema).
 - Annotation task queue
 - Active learning: holdout, seed batch, five query strategies, user-triggered
   retrain and pool scoring on the worker
+- Summarization: extractive (sumy) and abstractive (HuggingFace) text
+  summaries as a queued operation, folded in from `legal-summarizer-service`
 - Experiment monitoring: per-training-job metric time series (dense for the
   HuggingFace Trainer path, coarse phase markers for classical sklearn
   algorithms) and cross-run hyperparameter-vs-performance comparison
@@ -333,7 +335,8 @@ run_ml_worker(
 )
 ```
 
-This starts the training/prediction/explanation queue-consumer threads. It
+This starts the training/prediction/explanation/summarization queue-consumer
+threads, and downloads NLTK's `punkt` data on start if it is missing. It
 does **not** include the learning-platform's code-execution/package-install
 queues — a host app composing its own worker process should run those
 alongside this, in the same process, using its own code.
@@ -391,6 +394,34 @@ them every `log_every_n_steps`; a classical run takes them at each stage, and it
 speed over the fit of the model it keeps, in training rows a second. Preparing the
 text, scoring and a learning curve's extra fits are not counted. Memory comes from psutil when it is installed, else from
 the standard library; GPU use needs pynvml.
+
+## Summarization
+
+Folded in from `legal-summarizer-service` (and its `vue-legal-summarizer`
+frontend, now part of `vue-legal-ml-builder`). Same algorithms, run by this
+package's worker on `summarization_queue`; job state is a Redis key
+(`summary_status_{request_id}`, 1 h TTL), not a database row.
+
+| Route | |
+|---|---|
+| `POST /api/summarize` | Queue a summary. Body: `input_text` (required), `summary_length` (`short`/`medium`/`long` or a target word count, 1-5000), `priority` (`relevance`, `readability`, each 0-1), `model`, optional `request_id`. Answers 202 with the job's status. |
+| `GET /api/summarize/<request_id>` | Status: `queued` → `processing` → `complete` (with `summarized_text`) or `error`. Only the job's owner sees it; anyone else gets 404. A queued job carries `status_message` when no worker is running. |
+| `GET /api/summarize/models` | The catalogue: extractive `lex_rank` (default), `lsa`, `text_rank`, `luhn`, `edmundson`; abstractive `hf:` models; whether abstractive is available. |
+
+Clients poll; there is no SSE stream. A 400 carries `error` and `field` (the body field to fix). `models` is not a
+valid `request_id`. Unknown models are rejected with 400
+(the old service silently fell back to LexRank), and a request can only name
+an `hf:` model the deployment offers, so no caller can make the worker
+download an arbitrary hub model.
+
+```python
+app.config["LEGAL_ML_SUMMARIZATION_HF_MODELS"] = ["sshleifer/distilbart-cnn-12-6"]  # default: the three in compute/summarization.py; [] turns abstractive off
+app.config["LEGAL_ML_SUMMARIZATION_MAX_INPUT_CHARS"] = 500_000                    # default
+```
+
+Abstractive models are downloaded into the Hugging Face cache on first use and
+kept in memory by the worker. Training a summarization model is a separate
+matter and is still refused (`UNSUPPORTED_TASK_TYPES`).
 
 ## Experiment monitoring limitation
 

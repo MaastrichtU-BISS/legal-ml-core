@@ -6,11 +6,14 @@ make the previously-implicit dict shapes explicit, not to add a new
 validation layer that could reject payloads the working code already handles.
 
 Queue names (Redis lists, `LPUSH`/`BRPOP`):
-  training_queue, prediction_queue, explanation_queue, llm_queue, scoring_queue
+  training_queue, prediction_queue, explanation_queue, llm_queue, scoring_queue,
+  summarization_queue
 
 Result keys (Redis strings/lists, `SETEX`/`LPUSH` + `GET`/`BLPOP`):
   job_status_{job_id}, prediction_result_{prediction_id}, explanation_{explanation_id},
-  llm_job_status_{job_id}
+  llm_job_status_{job_id},
+  summary_status_{request_id} -- written by the API when a summary is queued and by
+  the worker as it runs; carries the owner_id, which the API strips on read.
 
 Control keys (Redis strings, `SETEX` by the API, `EXISTS` by the worker):
   job_cancel_{job_id} -- set by POST /training/stop/<job_id>; the worker checks
@@ -82,6 +85,14 @@ def model_export_result_key(export_id):
 
 def llm_job_status_key(job_id):
     return f"llm_job_status_{job_id}"
+
+
+SUMMARIZATION_QUEUE = "summarization_queue"
+SUMMARY_STATUS_TTL_SECONDS = 3600
+
+
+def summary_status_key(request_id):
+    return f"summary_status_{request_id}"
 
 
 def is_cancel_requested(redis_client, job_id):
@@ -178,3 +189,21 @@ class LLMJobStatus(TypedDict, total=False):
     created: int
     invalid: int
     error: str
+
+
+class SummarizationTaskPayload(TypedDict):
+    request_id: str
+    owner_id: str
+    input_text: str
+    summary_length: Any  # "short" | "medium" | "long" | int (target words)
+    priority: dict  # {"relevance": float, "readability": float}
+    model: str  # "lex_rank" | ... | "hf:<hub id>"
+
+
+class SummaryStatus(TypedDict, total=False):
+    request_id: str
+    owner_id: str
+    status: str  # "queued" | "processing" | "complete" | "error"
+    progress: int  # 0-100
+    summarized_text: Optional[str]
+    error: Optional[str]

@@ -44,6 +44,7 @@ tags:
   - name: annotation
   - name: llm
   - name: active-learning
+  - name: summarization
 
 paths:
   # ---------------------------------------------------------------- datasets
@@ -1703,6 +1704,93 @@ paths:
         "200": { description: OK }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "404": { $ref: "#/components/responses/NotFound" }
+  # ----------------------------------------------------------- summarization
+  /api/summarize:
+    post:
+      tags: [summarization]
+      summary: Queue a summary of a text
+      description: >-
+        Extractive (sumy) or abstractive (an `hf:` model the deployment offers).
+        The worker runs it from `summarization_queue`; poll
+        `GET /api/summarize/{request_id}` for the result.
+      operationId: submitSummary
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [input_text]
+              properties:
+                input_text:
+                  type: string
+                  description: At most LEGAL_ML_SUMMARIZATION_MAX_INPUT_CHARS characters (default 500000).
+                summary_length:
+                  description: short, medium, long, or a target word count.
+                  oneOf:
+                    - { type: string, enum: [short, medium, long] }
+                    - { type: integer, minimum: 1, maximum: 5000 }
+                  default: medium
+                priority:
+                  type: object
+                  properties:
+                    relevance: { type: number, minimum: 0, maximum: 1, default: 0.5 }
+                    readability: { type: number, minimum: 0, maximum: 1, default: 0.5 }
+                model:
+                  type: string
+                  default: lex_rank
+                  description: An id from `GET /api/summarize/models`.
+                request_id:
+                  type: string
+                  pattern: "^[A-Za-z0-9_.:-]{1,128}$"
+                  description: Optional; generated when absent. `models` is not allowed.
+      responses:
+        "202":
+          description: Queued
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SummaryStatus" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "409":
+          description: The request_id is already in use
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
+  /api/summarize/models:
+    get:
+      tags: [summarization]
+      summary: The models a summary may use
+      operationId: listSummaryModels
+      responses:
+        "200":
+          description: Catalogue
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  default: { type: string }
+                  abstractive_available: { type: boolean }
+                  extractive: { type: array, items: { type: string } }
+                  abstractive: { type: array, items: { type: string } }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+  /api/summarize/{request_id}:
+    parameters:
+      - { name: request_id, in: path, required: true, schema: { type: string } }
+    get:
+      tags: [summarization]
+      summary: Status and result of a summary
+      description: Only the caller who queued it sees it; anyone else gets 404.
+      operationId: getSummary
+      responses:
+        "200":
+          description: Status
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/SummaryStatus" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
 components:
   securitySchemes:
     bearerAuth:
@@ -1768,6 +1856,17 @@ components:
         application/json:
           schema: { $ref: "#/components/schemas/Error" }
   schemas:
+    SummaryStatus:
+      type: object
+      properties:
+        request_id: { type: string }
+        status: { type: string, enum: [queued, processing, complete, error] }
+        progress: { type: integer, minimum: 0, maximum: 100 }
+        summarized_text: { type: [string, "null"] }
+        error: { type: [string, "null"] }
+        status_message:
+          type: string
+          description: Set on a queued summary when no worker is running.
     Error:
       type: object
       required: [error]
