@@ -890,15 +890,6 @@ class MLModelTrainer:
             **evaluation,
         )
 
-        def sequences(logits, gold):
-            predicted = logits.argmax(-1)
-            true_labels = [[label_list[int(label)] for label in row if label != -100] for row in gold]
-            predicted_labels = [
-                [label_list[int(prediction)] for prediction, label in zip(row, truth) if label != -100]
-                for row, truth in zip(predicted, gold)
-            ]
-            return true_labels, predicted_labels
-
         def row_sequences(model, eval_rows):
             """Gold and predicted BIO labels per word, one sequence per row: each
             word labelled by the first window that saw it (as prediction does),
@@ -950,17 +941,42 @@ class MLModelTrainer:
             """No entity in any sequence: seqeval cannot score two empty sides."""
             return not any(label != "O" for row in labels for label in row)
 
-        def compute_metrics(eval_pred):
-            true_labels, predicted_labels = sequences(*eval_pred)
+        def row_scores(model):
+            """Entity F1, precision and recall over whole eval rows."""
+            true_labels, predicted_labels = row_sequences(model, eval_rows)
             if no_entities(true_labels) and no_entities(predicted_labels):
                 return {"f1_score": 0.0, "precision": 0.0, "recall": 0.0}
             return {
-                "f1_score": entity_f1(true_labels, predicted_labels, average="micro", zero_division=0),
-                "precision": entity_precision(true_labels, predicted_labels, average="micro", zero_division=0),
-                "recall": entity_recall(true_labels, predicted_labels, average="micro", zero_division=0),
+                "f1_score": float(entity_f1(true_labels, predicted_labels, average="micro", zero_division=0)),
+                "precision": float(entity_precision(true_labels, predicted_labels, average="micro", zero_division=0)),
+                "recall": float(entity_recall(true_labels, predicted_labels, average="micro", zero_division=0)),
             }
 
-        callbacks = [TrainingMetricCallback(self.metric_logger)] if self.metric_logger else []
+        metric_logger = self.metric_logger
+
+        class RowScoreCallback(TrainerCallback):
+            """After each evaluation, logs the entity scores per whole row, as
+            the final scores are: the Trainer's own metrics would score each
+            overlapping window apart, counting repeated words twice. The
+            evaluation itself still logs its loss."""
+
+            def on_evaluate(self, args, state, control, model=None, **kwargs):
+                if model is None:
+                    return
+                was_training = model.training
+                for name, value in row_scores(model).items():
+                    metric_logger.log(
+                        metric_name=f"eval_{name}",
+                        value=value,
+                        epoch=state.epoch,
+                        training_step=state.global_step,
+                    )
+                if was_training:
+                    model.train()
+
+        callbacks = (
+            [TrainingMetricCallback(self.metric_logger), RowScoreCallback()] if self.metric_logger else []
+        )
         if self.metric_logger and monitoring.get("system_metrics"):
             callbacks.append(SystemMetricsCallback(self.metric_logger))
         cancel_callback = None
@@ -974,7 +990,6 @@ class MLModelTrainer:
             train_dataset=TokenDataset(train_rows),
             eval_dataset=TokenDataset(eval_rows),
             data_collator=DataCollatorForTokenClassification(tokenizer),
-            compute_metrics=compute_metrics,
             callbacks=callbacks,
         )
 

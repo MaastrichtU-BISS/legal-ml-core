@@ -604,3 +604,16 @@ def test_a_one_row_dataset_says_it_was_scored_on_its_training_row(
 
     assert job.status == "completed", job.error_message
     assert job.metrics["evaluated_on_training"] is True
+
+
+def test_each_evaluation_logs_entity_scores_per_row(client, auth_headers, app, fake_redis, tmp_path):
+    from legal_ml_core import TrainingMetricPoint
+
+    dataset_id = _ner_dataset(app, tmp_path)
+
+    _, job = _train(client, auth_headers, app, fake_redis, dataset_id, tmp_path)
+
+    assert job.status == "completed", job.error_message
+    names = {p.metric_name for p in TrainingMetricPoint.query.filter_by(training_job_id=job.id).all()}
+    # The per-row scores, beside the evaluation's own loss.
+    assert {"eval_f1_score", "eval_precision", "eval_recall", "eval_loss"} <= names
