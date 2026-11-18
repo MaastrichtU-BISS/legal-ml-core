@@ -159,10 +159,24 @@ def _split(X, labels, test_size):
 PREDICTION_WINDOW_BATCH = 8
 
 class _UnicodeWords:
-    """A rouge-score tokenizer that keeps words in any alphabet, lowercased."""
+    """A rouge-score tokenizer for words in any alphabet: runs of letters,
+    digits and combining marks (Hindi vowel signs, a separate dot over an i),
+    after NFKC normalisation and case-folding (so ß and ss match). Scripts
+    written without spaces (Chinese, Japanese) come out as one token a run."""
 
     def tokenize(self, text):
-        return re.findall(r"\w+", (text or "").lower())
+        import unicodedata
+
+        tokens, word = [], []
+        for character in unicodedata.normalize("NFKC", text or "").casefold():
+            if unicodedata.category(character)[0] in "LNM":
+                word.append(character)
+            elif word:
+                tokens.append("".join(word))
+                word = []
+        if word:
+            tokens.append("".join(word))
+        return tokens
 
 
 # How many evaluation rows a summarization run scores with ROUGE at most: each

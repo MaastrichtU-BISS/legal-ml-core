@@ -273,3 +273,30 @@ def test_rouge_counts_words_in_any_alphabet():
     scorer = rouge_scorer.RougeScorer(["rouge1"], use_stemmer=False, tokenizer=_UnicodeWords())
     assert scorer.score("Το δικαστήριο αποφάσισε", "Το δικαστήριο αποφάσισε")["rouge1"].fmeasure == 1.0
     assert scorer.score("Überprüfung des Vertrags", "überprüfung des vertrags")["rouge1"].fmeasure == 1.0
+
+
+def test_rouge_keeps_combining_marks_and_case_folds():
+    from legal_ml_core.compute.trainer import _UnicodeWords
+
+    words = _UnicodeWords()
+    # Hindi vowel signs are combining marks: these are two different words.
+    assert words.tokenize("कम") != words.tokenize("काम")
+    assert words.tokenize("i\u0307stanbul") == ["i\u0307stanbul"]
+    assert words.tokenize("Straße") == words.tokenize("STRASSE")
+    assert words.tokenize("l'arrêt d'appel") == ["l", "arrêt", "d", "appel"]
+
+
+def test_rouge_is_scored_on_at_most_the_capped_number_of_rows(app, tmp_path, monkeypatch):
+    from legal_ml_core.compute import trainer as trainer_module
+
+    monkeypatch.setattr(trainer_module, "ROUGE_MAX_ROWS", 2)
+    trainer = trainer_module.MLModelTrainer(redis_client=None)
+    model_dir = tmp_path / "tiny-seq2seq"
+    model_dir.mkdir()
+    rows = [(f"The court decided case {n}.", f"Case {n}.") for n in range(30)]
+    parameters = {**PARAMETERS, "model_name": _tiny_seq2seq(model_dir), "model_id": "cap",
+                  "output_dir": str(tmp_path / "out")}
+
+    metrics = trainer.train_seq2seq(rows, "t5_small", parameters)
+
+    assert metrics["rouge_rows"] == 2

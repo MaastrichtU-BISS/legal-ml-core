@@ -17,8 +17,8 @@ While the version is 0.x, minor releases may contain breaking changes.
   and `summarization` now lists it. It trains on the Dataset's `text` and
   `summary` columns, found by name and read exactly as written (never cleaned
   or lowercased); rows with a blank text or summary are skipped. Runs report
-  `rouge1`, `rouge2` and `rougeL` (0–1, `rouge-score`, words in any alphabet,
-  no stemming) on greedy summaries written for up to 200 evaluation rows
+  `rouge1`, `rouge2` and `rougeL` (0–1, `rouge-score`, words in any alphabet with
+  their combining marks, no stemming) on greedy summaries written for up to 200 evaluation rows
   (`rouge_rows`); a Stop during that generation ends
   it at the next batch, and a one-row Dataset's metrics say
   `evaluated_on_training`.

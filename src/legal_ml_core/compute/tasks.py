@@ -695,7 +695,7 @@ def process_prediction_task(task_info, model_storage_path):
         written = [index for index, text in enumerate(texts) if str(text or "").strip()]
         for first in range(0, len(written), PREDICTION_WINDOW_BATCH):
             indexes = written[first : first + PREDICTION_WINDOW_BATCH]
-            batch = [texts[index] for index in indexes]
+            batch = [str(texts[index]) for index in indexes]
             inputs = tokenizer(
                 [prefix + text for text in batch],
                 return_tensors="pt",
