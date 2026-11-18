@@ -139,7 +139,7 @@ def test_available_models_for_ner_lists_the_entity_models(client, auth_headers):
     assert set(resp.get_json()["models"]) == {"legalbert_ner", "distilbert_ner"}
 
 
-def test_explanations_are_refused_for_entity_models(client, auth_headers, app):
+def _entity_model(app):
     dataset_id = _make_dataset(app)
     with app.app_context():
         model = Model(
@@ -152,10 +152,27 @@ def test_explanations_are_refused_for_entity_models(client, auth_headers, app):
         )
         db.session.add(model)
         db.session.commit()
-        model_id = model.id
+        return model.id
+
+
+def test_explanations_are_refused_for_entity_models(client, auth_headers, app):
+    model_id = _entity_model(app)
 
     resp = client.post(
         f"/api/models/{model_id}/explain", json={"text": "Acme sued John Smith"}, headers=auth_headers
+    )
+
+    assert resp.status_code == 400
+    assert "entity models" in resp.get_json()["error"]
+
+
+def test_batch_explanations_are_refused_for_entity_models(client, auth_headers, app):
+    model_id = _entity_model(app)
+
+    resp = client.post(
+        f"/api/models/{model_id}/explain-batch",
+        json={"texts": ["Acme sued John Smith"]},
+        headers=auth_headers,
     )
 
     assert resp.status_code == 400

@@ -139,7 +139,6 @@ LEARNING_CURVE_FRACTIONS = (0.1, 0.25, 0.5, 0.75, 1.0)
 LOSS_POINTS = 12
 
 
-
 def _split(X, labels, test_size):
     """Train/test split that keeps each label's share when it can.
 
@@ -151,6 +150,30 @@ def _split(X, labels, test_size):
         return train_test_split(X, labels, test_size=test_size, random_state=42, stratify=labels)
     except ValueError:
         return train_test_split(X, labels, test_size=test_size, random_state=42)
+
+
+def word_labels(word_offsets, spans):
+    """One BIO label per word: ``B-`` when the word enters a different span than
+    the previous word was in (counted by span, so two adjacent spans of one type
+    each begin their own), ``I-`` while the word stays in that span, ``O``
+    outside every span. A word overlapping a span counts as in it, even when the
+    span starts on a leading space or in the middle of the word."""
+    labels = []
+    previous = None
+    for start, end in word_offsets:
+        index = None
+        for position, span in enumerate(spans):
+            if start < span["end"] and end > span["start"]:
+                index = position
+                break
+        if index is None:
+            labels.append("O")
+        elif index == previous:
+            labels.append(f"I-{spans[index]['type']}")
+        else:
+            labels.append(f"B-{spans[index]['type']}")
+        previous = index
+    return labels
 
 class MLModelTrainer:
     def __init__(self, redis_client, metric_logger=None, cancel_check=None):
@@ -727,8 +750,8 @@ class MLModelTrainer:
     def train_token_classification(self, examples, model_type, parameters):
         """Fine-tune a token classifier on ``[(text, spans)]``; spans are the
         stored NER entities, with character offsets into the raw text."""
-        if not examples:
-            raise ValueError("This Dataset has no annotated entities to train on.")
+        if not any(spans for _, spans in examples):
+            raise ValueError("This Dataset has no labelled entities to learn from.")
 
         import torch
         from seqeval.metrics import (
@@ -765,36 +788,61 @@ class MLModelTrainer:
 
         tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
 
-        def token_label(start, spans):
-            """The label of the token starting at ``start``: B- on a span's first
-            token, I- on the words after it, O outside every span."""
-            for span in spans:
-                if span["start"] <= start < span["end"]:
-                    prefix = "B" if start == span["start"] else "I"
-                    return f"{prefix}-{span['type']}"
-            return "O"
-
         def encode(text, spans):
+            """The features for ``text``: one token-classifier example per window
+            the tokenizer cuts an over-long text into, with the stride keeping
+            the windows overlapping so nothing past a window edge is lost. The
+            offsets stay in the whole text, so every window is labelled from the
+            same spans."""
             encoding = tokenizer(
-                text, truncation=True, max_length=max_length, return_offsets_mapping=True
+                text,
+                truncation=True,
+                max_length=max_length,
+                stride=max(1, max_length // 4),
+                return_overflowing_tokens=True,
+                return_offsets_mapping=True,
             )
-            labels = []
-            previous_word = None
-            for word_id, (start, end) in zip(encoding.word_ids(), encoding["offset_mapping"]):
-                # Special tokens, unknown tokens without a place, and the
-                # sub-tokens after a word's first carry no label.
-                if word_id is None or start == end or word_id == previous_word:
-                    labels.append(-100)
-                else:
-                    labels.append(label_ids[token_label(start, spans)])
-                previous_word = word_id
-            feature = {key: value for key, value in encoding.items() if key != "offset_mapping"}
-            feature["labels"] = labels
-            return feature
+            features = []
+            for window in range(len(encoding["input_ids"])):
+                word_ids = encoding.word_ids(batch_index=window)
+                offsets = encoding["offset_mapping"][window]
+                # One entry per word the window holds, as far into it as the
+                # window reaches.
+                words = {}
+                for word_id, (start, end) in zip(word_ids, offsets):
+                    if word_id is None or start == end:
+                        continue
+                    if word_id in words:
+                        words[word_id][1] = end
+                    else:
+                        words[word_id] = [start, end]
+                labels_by_word = dict(zip(words, word_labels(words.values(), spans)))
+                token_labels = []
+                previous_word = None
+                for word_id, (start, end) in zip(word_ids, offsets):
+                    # Special tokens, unknown tokens without a place, and the
+                    # sub-tokens after a word's first carry no label.
+                    if word_id is None or start == end or word_id == previous_word:
+                        token_labels.append(-100)
+                    else:
+                        token_labels.append(label_ids[labels_by_word[word_id]])
+                    previous_word = word_id
+                features.append(
+                    {
+                        **{
+                            key: encoding[key][window]
+                            for key in encoding
+                            if key not in ("offset_mapping", "overflow_to_sample_mapping")
+                        },
+                        "labels": token_labels,
+                    }
+                )
+            return features
 
         class TokenDataset(TorchDataset):
             def __init__(self, rows):
-                self.features = [encode(text, spans) for text, spans in rows]
+                # Every window of a row is its own example.
+                self.features = [feature for text, spans in rows for feature in encode(text, spans)]
 
             def __getitem__(self, index):
                 return {key: torch.tensor(value) for key, value in self.features[index].items()}
@@ -803,14 +851,19 @@ class MLModelTrainer:
                 return len(self.features)
 
         rows = list(examples)
+        evaluated_on_training = False
         if len(rows) >= 2:
             n_eval = min(max(1, round(len(rows) * test_size)), len(rows) - 1)
             train_rows, eval_rows = train_test_split(rows, test_size=n_eval, random_state=42)
         else:
+            # One example: it is scored on its own training row, and says so.
             train_rows = eval_rows = rows
+            evaluated_on_training = True
 
+        # A checkpoint that already has a token head for other labels gets a
+        # fresh head sized to this Dataset's labels.
         hf_model = AutoModelForTokenClassification.from_pretrained(
-            model_name, num_labels=len(label_list)
+            model_name, num_labels=len(label_list), ignore_mismatched_sizes=True
         )
 
         output_dir = parameters.get(
@@ -841,12 +894,18 @@ class MLModelTrainer:
             ]
             return true_labels, predicted_labels
 
+        def no_entities(labels):
+            """No entity in any sequence: seqeval cannot score two empty sides."""
+            return not any(label != "O" for row in labels for label in row)
+
         def compute_metrics(eval_pred):
             true_labels, predicted_labels = sequences(*eval_pred)
+            if no_entities(true_labels) and no_entities(predicted_labels):
+                return {"f1_score": 0.0, "precision": 0.0, "recall": 0.0}
             return {
-                "f1_score": entity_f1(true_labels, predicted_labels, average="micro"),
-                "precision": entity_precision(true_labels, predicted_labels, average="micro"),
-                "recall": entity_recall(true_labels, predicted_labels, average="micro"),
+                "f1_score": entity_f1(true_labels, predicted_labels, average="micro", zero_division=0),
+                "precision": entity_precision(true_labels, predicted_labels, average="micro", zero_division=0),
+                "recall": entity_recall(true_labels, predicted_labels, average="micro", zero_division=0),
             }
 
         callbacks = [TrainingMetricCallback(self.metric_logger)] if self.metric_logger else []
@@ -877,12 +936,18 @@ class MLModelTrainer:
         predictions = hf_trainer.predict(hf_trainer.eval_dataset)
         true_labels, predicted_labels = sequences(predictions.predictions, predictions.label_ids)
         metrics = {
-            "f1_score": float(entity_f1(true_labels, predicted_labels, average="micro")),
-            "precision": float(entity_precision(true_labels, predicted_labels, average="micro")),
-            "recall": float(entity_recall(true_labels, predicted_labels, average="micro")),
-            "classification_report": entity_report(true_labels, predicted_labels),
+            "f1_score": float(entity_f1(true_labels, predicted_labels, average="micro", zero_division=0)),
+            "precision": float(entity_precision(true_labels, predicted_labels, average="micro", zero_division=0)),
+            "recall": float(entity_recall(true_labels, predicted_labels, average="micro", zero_division=0)),
+            "classification_report": (
+                ""
+                if no_entities(true_labels) and no_entities(predicted_labels)
+                else entity_report(true_labels, predicted_labels, zero_division=0)
+            ),
             "entity_types": entity_types,
         }
+        if evaluated_on_training:
+            metrics["evaluated_on_training"] = True
 
         self.model = hf_model
         self.tokenizer = tokenizer

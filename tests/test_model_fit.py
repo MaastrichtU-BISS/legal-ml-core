@@ -1,10 +1,15 @@
 """Which models can train a Dataset, and why not (BAIGLE: model choice by data).
 
 Decided from the task type and the label counts stored with every Dataset, so
-no file is read. Labels that are nearly all different (a question/answer set
-uploaded as classification) are not categories: no classifier can learn them.
+no file is read — except an NER Dataset's, only while its rows are not all
+queued yet, to see an import's spans. Labels that are nearly all different (a
+question/answer set uploaded as classification) are not categories: no
+classifier can learn them.
 """
+import pandas as pd
+
 from legal_ml_core import AnnotationTask, Dataset, db
+from legal_ml_core.annotation_queue import create_annotation_tasks
 from tests.conftest import TEST_USER_ID
 
 QA = [
@@ -82,6 +87,33 @@ def test_an_ner_dataset_without_annotated_rows_says_to_annotate(client, auth_hea
     assert not any(m["usable"] for m in body["models"].values())
     assert body["advice"] == NO_ENTITIES_ADVICE
     assert {body["models"][model_type]["reason"] for model_type in ENTITY_MODELS} == {NO_ENTITIES_ADVICE}
+
+
+def test_a_dataset_whose_annotated_rows_hold_no_entities_is_refused(client, auth_headers, app, tmp_path):
+    # Every row is annotated, but [] is a row with no entities: nothing to learn.
+    path = tmp_path / "empty.csv"
+    pd.DataFrame({"text": ["Smith sued Acme.", "Acme paid."], "entities": ["[]", "[]"]}).to_csv(
+        path, index=False
+    )
+    with app.app_context():
+        dataset = Dataset(
+            owner_id=TEST_USER_ID,
+            name="NER",
+            file_path=str(path),
+            row_count=2,
+            columns=[],
+            task_type="ner",
+        )
+        db.session.add(dataset)
+        db.session.commit()
+        create_annotation_tasks(dataset)
+        db.session.commit()
+        dataset_id = dataset.id
+
+    body = _fit(client, auth_headers, dataset_id)
+
+    assert body["models"]["distilbert_ner"]["usable"] is False
+    assert body["models"]["distilbert_ner"]["reason"] == NO_ENTITIES_ADVICE
 
 
 def test_an_annotated_ner_dataset_fits_both_entity_models(client, auth_headers, app):

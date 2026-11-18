@@ -54,6 +54,15 @@ valid row with no entities. Such rows start labelled in the annotation queue and
 train `legalbert_ner` or `distilbert_ner`. A cell naming types instead (e.g.
 `PERSON, ORG`) is kept as an annotation hint and the row waits for its spans.
 
+An NER file is read exactly as written (no type guessing): `NA`, `null`,
+`00123` or `1.50` stay text, so the spans' offsets still point into it. A row
+whose cell looks like spans but does not fit its text stays pending, and the
+worker logs the dataset and row. Training needs at least one annotated,
+non-holdout row with an entity (rows annotated `[]` alone teach nothing). Texts
+longer than the model's `max_length` are trained and predicted in overlapping
+windows, so entities past the first window are kept; prediction labels whole
+words, taking each word's label from its first sub-token.
+
 Example (`classification`):
 
 ```csv

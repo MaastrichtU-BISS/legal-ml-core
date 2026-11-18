@@ -2,7 +2,7 @@ from flask import Blueprint, request, jsonify, current_app
 from ..auth import jwt_required, get_jwt_identity
 from ..db import db
 from ..active_learning.loop import training_refusal
-from ..annotation_queue import apply_saved_annotations, has_ner_examples
+from ..annotation_queue import apply_saved_annotations, ensure_dataset_tasks, has_ner_examples
 from ..annotation_format import SPAN_TYPES
 from ..models import ALRound, Model, Dataset, TrainingJob
 from ..db_utils import project_belongs_to_owner
@@ -1043,6 +1043,12 @@ def create_model():
         if refusal:
             return jsonify(refusal), 400
 
+        # An imported NER Dataset's spans become tasks on this write path, so
+        # the run finds them: the fit check above only reads. This commits,
+        # before any write of the request's own, so a later refusal cannot
+        # half-commit them.
+        ensure_dataset_tasks(dataset)
+
         # Resolve project_id: explicit payload value takes precedence over dataset's project.
         # `Project` belongs to the host app, not this package, so existence is checked via
         # a direct query against the `projects` table rather than importing its ORM class.
@@ -1576,6 +1582,13 @@ def start_training_job(owner_id, model_id, data, al_round_id=None):
     and did not see the round's labels, so the round is refused instead."""
     if "test_size" in data and not _is_share(data["test_size"]):
         return {"error": TEST_SIZE_MESSAGE}, 400
+
+    # Creating an imported Dataset's tasks commits, which must happen before
+    # the model row is locked: a commit inside the locked section would
+    # release the lock, and a double-clicked Train could then start two jobs.
+    unlocked = Model.query.filter_by(id=model_id, owner_id=owner_id).first()
+    if unlocked is not None and unlocked.dataset_id:
+        ensure_dataset_tasks(db.session.get(Dataset, unlocked.dataset_id))
 
     model, active = _lock_model_and_find_active_job(model_id, owner_id)
     if not model:

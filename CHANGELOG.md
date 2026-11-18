@@ -24,16 +24,27 @@ While the version is 0.x, minor releases may contain breaking changes.
 - An imported NER row whose `entities` cell holds a valid JSON span list starts
   annotated (`label_source: file`), so imported spans train without re-labelling;
   `[]` is a valid row with no entities. Cells naming types (`PERSON, ORG`) keep
-  their annotation hint and stay pending. Asking which models an NER Dataset can train
-  creates its missing tasks first, so an import trains straight away, without
-  its rows being opened in a project's queue.
+  their annotation hint and stay pending. An import trains straight away,
+  without its rows being opened in a project's queue: creating a Model,
+  starting a run and the worker create its missing tasks, while asking which
+  models a Dataset can train only reads (its file, when its rows are not
+  queued yet). A rejected cell that looks like spans is logged with the
+  dataset and row.
+- NER files are read exactly as written (`NA`, `null`, `00123` stay text), so
+  span offsets keep pointing into the text.
+- Texts longer than `max_length` are trained and predicted in overlapping
+  windows instead of being cut; prediction labels whole words from each
+  word's first sub-token, so a word is never split into two entities.
 - `seqeval` in the `compute` extra.
 
 ### Changed
 
-- An NER Dataset with no annotated, non-holdout tasks is refused with "Annotate
-  some rows first: this Dataset has no labelled entities to learn from." NER
-  text is never cleaned for training, so span offsets stay inside it.
+- An NER Dataset with no annotated, non-holdout row holding an entity (rows
+  annotated `[]` alone do not count) is refused with "Annotate some rows first:
+  this Dataset has no labelled entities to learn from." NER text is never
+  cleaned for training, so span offsets stay inside it. An evaluation split
+  with no entities on either side scores 0 with an empty report instead of
+  failing, and a one-row Dataset's metrics say `evaluated_on_training`.
 - Explanations are refused with a plain 400 for entity models, and publishing
   still refuses them.
 

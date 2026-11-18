@@ -69,6 +69,18 @@ def read_rows(file_path):
     return pd.read_csv(file_path)
 
 
+def read_rows_exact(file_path):
+    """``read_rows`` with pandas' type guesses switched off, for NER files: the
+    spans' offsets point into the text exactly as written, so ``NA`` and
+    ``null`` stay text instead of becoming NaN, ``00123`` stays ``00123``, and a
+    blank cell stays blank."""
+    if file_path.endswith(".xlsx"):
+        return pd.read_excel(file_path, dtype=str, keep_default_na=False)
+    if file_path.endswith(".json"):
+        return pd.read_json(file_path, dtype=False)
+    return pd.read_csv(file_path, dtype=str, keep_default_na=False)
+
+
 def _rows_needing_label(df, dataset):
     """Which rows need a label: those with text and a blank label.
 
@@ -199,6 +211,20 @@ def _file_spans(value, text):
     return checked
 
 
+def _checked_spans(value, text, dataset, position):
+    """The spans one ``entities`` cell holds (``_file_spans``), with a warning
+    when a cell that looks like spans does not fit the row's text. The warning
+    names the dataset and the row, never the text."""
+    spans = _file_spans(value, text)
+    if spans is None and str(value).strip().startswith("["):
+        logger.warning(
+            "dataset %s row %s: entities cell looks like spans but does not fit the text",
+            dataset.id,
+            position,
+        )
+    return spans
+
+
 def ner_examples(dataset):
     """``[(text, spans)]`` for an NER Dataset's annotated, non-holdout tasks.
 
@@ -213,12 +239,15 @@ def ner_examples(dataset):
 
 
 def ensure_dataset_tasks(dataset):
-    """Create ``dataset``'s missing tasks, as reading the queue would.
+    """Create ``dataset``'s missing tasks, as reading the queue would. Write
+    paths only — making a Model, starting a run, the worker: this commits, and
+    on a read path (or inside the locked part of a start) that commit would
+    write where nothing should, and release the lock a double-clicked Train
+    serialises on.
 
     An imported NER Dataset's spans live in its file until its rows become
-    tasks, and a Dataset need not be in a project for the queue to read it; so
-    asking what it can train creates them first, or it would always be told to
-    annotate rows it already has labelled."""
+    tasks; ``has_ner_examples`` reads the file instead of creating them, so
+    asking what a Dataset can train writes nothing."""
     if dataset.task_type not in QUEUED_TASK_TYPES or _all_rows_queued(dataset):
         return
     create_annotation_tasks(dataset)
@@ -230,15 +259,44 @@ def ensure_dataset_tasks(dataset):
 
 
 def has_ner_examples(dataset):
-    """Whether an NER Dataset has an annotated, non-holdout task to learn from,
-    its file's spans included."""
-    ensure_dataset_tasks(dataset)
-    return (
-        db.session.query(AnnotationTask.id)
-        .filter_by(dataset_id=dataset.id, status="annotated", is_holdout=False)
-        .first()
-        is not None
+    """Whether an NER Dataset has an entity to learn from: an annotated,
+    non-holdout task whose spans are not empty (rows annotated ``[]`` teach
+    nothing), or — while its rows are not all queued yet — a row of its file
+    that holds spans. Read-only: the fit check runs on read paths and inside a
+    start's locked section, where creating tasks would commit."""
+    annotated = (
+        AnnotationTask.query.filter_by(dataset_id=dataset.id, status="annotated", is_holdout=False)
+        .order_by(AnnotationTask.item_index)
+        .all()
     )
+    if any(_stored_entities(task.annotation_label) for task in annotated):
+        return True
+    if _all_rows_queued(dataset):
+        return False
+    return _file_has_spans(dataset)
+
+
+def _file_has_spans(dataset):
+    """Whether any non-holdout row of ``dataset``'s file holds spans: an
+    imported Dataset's rows may not have become tasks yet."""
+    try:
+        df = read_rows_exact(dataset.file_path)
+    except Exception as e:
+        logger.warning("dataset %s: cannot read rows to look for spans: %s", dataset.id, e)
+        return False
+    text_column = _find_column(df, dataset.text_column or "text")
+    label_name = dataset.label_column or LABEL_COLUMNS.get(dataset.task_type)
+    label_column = _find_column(df, label_name) if label_name else None
+    if text_column is None or label_column is None:
+        return False
+    held_out = set(_holdout_of(dataset))
+    for position in rows_with_text(df, dataset):
+        if position in held_out:
+            continue
+        text = str(df[text_column].iloc[position])
+        if _checked_spans(df[label_column].iloc[position], text, dataset, position):
+            return True
+    return False
 
 
 def create_annotation_tasks(dataset):
@@ -256,7 +314,13 @@ def create_annotation_tasks(dataset):
         return
 
     try:
-        df = read_rows(dataset.file_path)
+        # An NER file is read verbatim (see read_rows_exact): its spans point
+        # into the text as written, which pandas' type guessing would change.
+        df = (
+            read_rows_exact(dataset.file_path)
+            if dataset.task_type in SPAN_TYPES
+            else read_rows(dataset.file_path)
+        )
     except Exception as e:
         logger.warning("dataset %s: cannot read rows to annotate: %s", dataset.id, e)
         return
@@ -280,7 +344,7 @@ def create_annotation_tasks(dataset):
             continue
         text = str(df[text_column].iloc[position])
         file_label = _label_text(df[label_column].iloc[position]) if label_column is not None else None
-        spans = _file_spans(file_label, text) if spans_rows else None
+        spans = _checked_spans(file_label, text, dataset, position) if spans_rows else None
         label = json.dumps(spans) if spans is not None else (file_label if labels_rows else None)
         labelled = label is not None
         added_labelled = added_labelled or labelled

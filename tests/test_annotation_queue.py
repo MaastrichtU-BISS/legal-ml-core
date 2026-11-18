@@ -2,11 +2,13 @@
 to label, and rows the file labels as labelled tasks a person can change (#147)."""
 import io
 import json
+import logging
 
 import pandas as pd
 import pytest
 
 from legal_ml_core import AnnotationTask, Dataset, Model, TrainingJob, db
+from legal_ml_core.annotation_queue import create_annotation_tasks, has_ner_examples, ner_examples
 from legal_ml_core.compute.tasks import process_training_task
 from tests.conftest import TEST_USER_ID
 
@@ -484,6 +486,93 @@ def test_ner_rows_with_json_spans_start_annotated(client, auth_headers, app, tmp
         ("annotated", "file", SPANS),
         ("annotated", "file", []),
     ]
+
+
+def test_ner_rows_keep_the_file_text_exactly(client, auth_headers, app, tmp_path):
+    # "NA", "null" and numbers are what the annotator wrote: pandas must not
+    # turn them into NaN or shrink them, or the spans point into other text.
+    path = tmp_path / "verbatim.csv"
+    path.write_text(
+        "text,entities\n"
+        'NA,"[{""start"": 0, ""end"": 2, ""type"": ""PERSON""}]"\n'
+        'null,"[{""start"": 0, ""end"": 4, ""type"": ""ORG""}]"\n'
+        '00123,"[{""start"": 0, ""end"": 5, ""type"": ""PERSON""}]"\n'
+        '1.50,"[{""start"": 0, ""end"": 4, ""type"": ""ORG""}]"\n'
+    )
+    app.config.setdefault("_known_projects", set()).add((PROJECT_ID, TEST_USER_ID))
+    dataset = Dataset(
+        owner_id=TEST_USER_ID,
+        name="verbatim.csv",
+        file_path=str(path),
+        row_count=4,
+        columns=[{"name": "text"}, {"name": "entities"}],
+        task_type="ner",
+        project_id=PROJECT_ID,
+    )
+    db.session.add(dataset)
+    db.session.commit()
+    dataset_id = dataset.id
+
+    # The read path sees the file's spans and creates no tasks.
+    fit = client.get(f"/api/models/available?dataset_id={dataset_id}", headers=auth_headers).get_json()
+    assert fit["models"]["distilbert_ner"]["usable"] is True
+    assert AnnotationTask.query.count() == 0
+
+    _next(client, auth_headers)
+
+    tasks = _tasks(client, auth_headers)
+    assert [(t["text"], t["status"]) for t in tasks] == [
+        ("NA", "annotated"),
+        ("null", "annotated"),
+        ("00123", "annotated"),
+        ("1.50", "annotated"),
+    ]
+    assert [json.loads(t["annotation_label"])[0]["text"] for t in tasks] == [
+        "NA",
+        "null",
+        "00123",
+        "1.50",
+    ]
+
+
+def test_holdout_tasks_are_not_ner_examples(app, tmp_path):
+    dataset_id = _link_dataset(
+        app,
+        tmp_path,
+        # Both rows' spans fit their text, so both start annotated.
+        {"text": ["Smith sued Acme.", "Smith sued Acme."], "entities": [json.dumps(SPANS), json.dumps(SPANS)]},
+        task_type="ner",
+    )
+    dataset = db.session.get(Dataset, dataset_id)
+    create_annotation_tasks(dataset)
+    db.session.commit()
+    AnnotationTask.query.filter_by(dataset_id=dataset_id, item_index=0).update({"is_holdout": True})
+    db.session.commit()
+
+    examples = ner_examples(db.session.get(Dataset, dataset_id))
+    assert [spans for _, spans in examples] == [SPANS]
+
+    # With every annotated task held out, there is nothing to learn from.
+    AnnotationTask.query.filter_by(dataset_id=dataset_id).update({"is_holdout": True})
+    db.session.commit()
+    assert has_ner_examples(db.session.get(Dataset, dataset_id)) is False
+
+
+def test_a_rejected_span_looking_cell_is_warned_about(client, auth_headers, app, tmp_path, caplog):
+    # The cell is JSON but its offsets do not fit the row's text.
+    _link_dataset(
+        app,
+        tmp_path,
+        {"text": ["Smith sued Acme."], "entities": ['[{"start": 0, "end": 99, "type": "PERSON"}]']},
+        task_type="ner",
+    )
+
+    with caplog.at_level(logging.WARNING, logger="legal_ml_core.annotation_queue"):
+        _next(client, auth_headers)
+
+    warning = next(record for record in caplog.records if "looks like spans" in record.message)
+    assert "row 0" in warning.getMessage()
+    assert "Smith" not in warning.getMessage()
 
 
 @pytest.mark.parametrize(
