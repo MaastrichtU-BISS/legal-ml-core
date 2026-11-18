@@ -617,3 +617,39 @@ def test_each_evaluation_logs_entity_scores_per_row(client, auth_headers, app, f
     names = {p.metric_name for p in TrainingMetricPoint.query.filter_by(training_job_id=job.id).all()}
     # The per-row scores, beside the evaluation's own loss.
     assert {"eval_f1_score", "eval_precision", "eval_recall", "eval_loss"} <= names
+
+
+def test_a_stop_during_the_per_row_scoring_ends_the_run_as_cancelled(app, tmp_path, monkeypatch):
+    """The scoring pass after each evaluation checks for a Stop between batches,
+    so a stopped run does not wait for it to finish."""
+    import pytest
+
+    from legal_ml_core.compute import trainer as trainer_module
+
+    # Only the scoring pass can notice the Stop here.
+    monkeypatch.setattr(trainer_module.TrainingCancelCallback, "on_step_end", lambda self, *a, **k: None)
+
+    class Recorder:
+        def __init__(self):
+            self.names = []
+
+        def log(self, metric_name, value, epoch=None, training_step=None, group=None):
+            self.names.append(metric_name)
+
+    recorder = Recorder()
+    trainer = trainer_module.MLModelTrainer(
+        redis_client=_NullRedis(), metric_logger=recorder, cancel_check=lambda: True
+    )
+    examples = [(text, _spans(text)) for text in TEXTS]
+    parameters = {
+        "model_name": _tiny_bert(tmp_path),
+        "epochs": 1,
+        "batch_size": 4,
+        "max_length": 128,
+        "model_id": "stop-test",
+        "output_dir": str(tmp_path / "out"),
+    }
+
+    with pytest.raises(trainer_module.TrainingCancelled):
+        trainer.train_token_classification(examples, "distilbert_ner", parameters)
+    assert "eval_f1_score" not in recorder.names

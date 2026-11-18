@@ -890,7 +890,7 @@ class MLModelTrainer:
             **evaluation,
         )
 
-        def row_sequences(model, eval_rows):
+        def row_sequences(model, eval_rows, stop=None):
             """Gold and predicted BIO labels per word, one sequence per row: each
             word labelled by the first window that saw it (as prediction does),
             the gold from the same spans over the whole row."""
@@ -913,6 +913,9 @@ class MLModelTrainer:
                 word_span, word_label = {}, {}
                 windows = encoding["input_ids"].shape[0]
                 for first in range(0, windows, PREDICTION_WINDOW_BATCH):
+                    # A Stop asked for mid-pass ends it at the next batch.
+                    if stop is not None and stop():
+                        return None
                     batch = {
                         key: value[first:first + PREDICTION_WINDOW_BATCH].to(device)
                         for key, value in encoding.items()
@@ -941,9 +944,13 @@ class MLModelTrainer:
             """No entity in any sequence: seqeval cannot score two empty sides."""
             return not any(label != "O" for row in labels for label in row)
 
-        def row_scores(model):
-            """Entity F1, precision and recall over whole eval rows."""
-            true_labels, predicted_labels = row_sequences(model, eval_rows)
+        def row_scores(model, stop=None):
+            """Entity F1, precision and recall over whole eval rows, or None
+            when a Stop arrived while scoring."""
+            sequences = row_sequences(model, eval_rows, stop)
+            if sequences is None:
+                return None
+            true_labels, predicted_labels = sequences
             if no_entities(true_labels) and no_entities(predicted_labels):
                 return {"f1_score": 0.0, "precision": 0.0, "recall": 0.0}
             return {
@@ -953,6 +960,7 @@ class MLModelTrainer:
             }
 
         metric_logger = self.metric_logger
+        cancel_check = self.cancel_check
 
         class RowScoreCallback(TrainerCallback):
             """After each evaluation, logs the entity scores per whole row, as
@@ -964,15 +972,24 @@ class MLModelTrainer:
                 if model is None:
                     return
                 was_training = model.training
-                for name, value in row_scores(model).items():
-                    metric_logger.log(
-                        metric_name=f"eval_{name}",
-                        value=value,
-                        epoch=state.epoch,
-                        training_step=state.global_step,
-                    )
-                if was_training:
-                    model.train()
+                try:
+                    # The scoring pass checks for a Stop between batches, so a
+                    # stopped run does not wait for a whole extra pass; the
+                    # check after train() then settles it as cancelled.
+                    scores = row_scores(model, stop=cancel_check)
+                    if scores is None:
+                        control.should_training_stop = True
+                        return control
+                    for name, value in scores.items():
+                        metric_logger.log(
+                            metric_name=f"eval_{name}",
+                            value=value,
+                            epoch=state.epoch,
+                            training_step=state.global_step,
+                        )
+                finally:
+                    if was_training:
+                        model.train()
 
         callbacks = (
             [TrainingMetricCallback(self.metric_logger), RowScoreCallback()] if self.metric_logger else []

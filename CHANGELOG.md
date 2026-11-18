@@ -40,7 +40,8 @@ While the version is 0.x, minor releases may contain breaking changes.
   never split into two entities. A run's final scores are per row, each word
   labelled as prediction would, so overlapping windows are not counted twice;
   the entity scores logged after each evaluation (`eval_f1_score`,
-  `eval_precision`, `eval_recall`) are per row the same way.
+  `eval_precision`, `eval_recall`) are per row the same way, and a Stop asked
+  for during that scoring pass ends it at the next batch of windows.
 - `seqeval` in the `compute` extra.
 
 ### Changed
