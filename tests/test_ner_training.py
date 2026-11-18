@@ -653,3 +653,53 @@ def test_a_stop_during_the_per_row_scoring_ends_the_run_as_cancelled(app, tmp_pa
     with pytest.raises(trainer_module.TrainingCancelled):
         trainer.train_token_classification(examples, "distilbert_ner", parameters)
     assert "eval_f1_score" not in recorder.names
+
+
+
+def test_the_per_row_scoring_checks_for_a_stop_between_batches(tmp_path, monkeypatch):
+    """A Stop arriving after the first batch of windows ends the pass at the
+    next batch, not only when it starts: scoring stops part way, logs nothing,
+    and the run ends cancelled."""
+    import pytest
+
+    from legal_ml_core.compute import trainer as trainer_module
+
+    # Only the scoring pass can notice the Stop here.
+    monkeypatch.setattr(trainer_module.TrainingCancelCallback, "on_step_end", lambda self, *a, **k: None)
+    import inspect
+
+    polls = []
+
+    def stop():
+        # Only the scoring pass's own checks count: clear at its first batch,
+        # set from its second on. Every other caller sees no Stop until the
+        # pass has stopped, then sees it too so the run settles cancelled.
+        if inspect.stack()[1].function == "row_sequences":
+            polls.append(1)
+            return len(polls) > 1
+        return len(polls) > 1
+
+    logged = []
+    metric_logger = type("Recorder", (), {"log": lambda self, metric_name, **k: logged.append(metric_name)})()
+    trainer = trainer_module.MLModelTrainer(
+        redis_client=_NullRedis(), metric_logger=metric_logger, cancel_check=stop
+    )
+    # Three rows, so the evaluation split is exactly one, and every row long
+    # enough for several batches of 16-token windows: only a check between
+    # batches, not one per row, can stop that row part way.
+    long_texts = [" ".join([text] * 40) for text in TEXTS[:3]]
+    examples = [(text, _spans(text)) for text in long_texts]
+    parameters = {
+        "model_name": _tiny_bert(tmp_path),
+        "epochs": 1,
+        "batch_size": 4,
+        "max_length": 16,
+        "model_id": "stop-between",
+        "output_dir": str(tmp_path / "out"),
+    }
+
+    with pytest.raises(trainer_module.TrainingCancelled):
+        trainer.train_token_classification(examples, "distilbert_ner", parameters)
+    # A check made only when the pass starts would have let it finish and log.
+    assert "eval_f1_score" not in logged
+    assert len(polls) >= 2

@@ -61,7 +61,10 @@ worker logs the dataset and row. Training needs at least one annotated,
 non-holdout row with an entity (rows annotated `[]` alone teach nothing). Texts
 longer than the model's `max_length` are trained and predicted in overlapping
 windows, so entities past the first window are kept; prediction labels whole
-words, taking each word's label from its first sub-token.
+words, taking each word's label from its first sub-token. Entity scores are
+counted per whole row, during training and at the end; each evaluation
+therefore runs the model over the evaluation rows twice (once for the loss,
+once for the scores), so a large evaluation split evaluates more slowly.
 
 Example (`classification`):
 
