@@ -51,7 +51,9 @@ def _write_ner_csv(tmp_path, spans=True):
     return str(path)
 
 
-def _ner_dataset(app, tmp_path, with_tasks=True):
+def _ner_dataset(app, tmp_path, with_tasks=True, queued=True):
+    """An NER Dataset whose file holds spans (``with_tasks``), its rows already
+    turned into tasks when ``queued``; an import arrives with ``queued=False``."""
     path = _write_ner_csv(tmp_path, spans=with_tasks)
     with app.app_context():
         dataset = Dataset(
@@ -64,7 +66,7 @@ def _ner_dataset(app, tmp_path, with_tasks=True):
         )
         db.session.add(dataset)
         db.session.commit()
-        if with_tasks:
+        if with_tasks and queued:
             create_annotation_tasks(dataset)
             db.session.commit()
         return dataset.id
@@ -114,7 +116,9 @@ def _train(client, auth_headers, app, fake_redis, dataset_id, tmp_path, paramete
 def test_an_ner_dataset_with_imported_spans_trains_end_to_end(
     client, auth_headers, app, fake_redis, tmp_path
 ):
-    dataset_id = _ner_dataset(app, tmp_path)
+    # Straight from an import: the spans are in the file and no queue has
+    # been read, so no task exists yet.
+    dataset_id = _ner_dataset(app, tmp_path, queued=False)
 
     model_id, job = _train(client, auth_headers, app, fake_redis, dataset_id, tmp_path)
 

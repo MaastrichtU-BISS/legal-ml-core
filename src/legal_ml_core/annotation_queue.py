@@ -212,8 +212,27 @@ def ner_examples(dataset):
     return [(task.text, _stored_entities(task.annotation_label)) for task in tasks]
 
 
+def ensure_dataset_tasks(dataset):
+    """Create ``dataset``'s missing tasks, as reading the queue would.
+
+    An imported NER Dataset's spans live in its file until its rows become
+    tasks, and a Dataset need not be in a project for the queue to read it; so
+    asking what it can train creates them first, or it would always be told to
+    annotate rows it already has labelled."""
+    if dataset.task_type not in QUEUED_TASK_TYPES or _all_rows_queued(dataset):
+        return
+    create_annotation_tasks(dataset)
+    try:
+        db.session.commit()
+    except IntegrityError:
+        # A concurrent read created them first (uq_dataset_item).
+        db.session.rollback()
+
+
 def has_ner_examples(dataset):
-    """Whether an NER Dataset has an annotated, non-holdout task to learn from."""
+    """Whether an NER Dataset has an annotated, non-holdout task to learn from,
+    its file's spans included."""
+    ensure_dataset_tasks(dataset)
     return (
         db.session.query(AnnotationTask.id)
         .filter_by(dataset_id=dataset.id, status="annotated", is_holdout=False)

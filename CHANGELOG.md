@@ -24,7 +24,9 @@ While the version is 0.x, minor releases may contain breaking changes.
 - An imported NER row whose `entities` cell holds a valid JSON span list starts
   annotated (`label_source: file`), so imported spans train without re-labelling;
   `[]` is a valid row with no entities. Cells naming types (`PERSON, ORG`) keep
-  their annotation hint and stay pending.
+  their annotation hint and stay pending. Asking which models an NER Dataset can train
+  creates its missing tasks first, so an import trains straight away, without
+  its rows being opened in a project's queue.
 - `seqeval` in the `compute` extra.
 
 ### Changed
