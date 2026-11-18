@@ -36,10 +36,14 @@ The catalogue is served by `GET /api/datasets/task-types` (source:
 | `clustering` | `text` | nothing (unsupervised) | yes |
 | `ner` | `text`, `entities` | entity spans as JSON, or the entity types (e.g. `PERSON, ORG`) | yes |
 | `named_entity_recognition` | `text`, `entities` | same as `ner` (alias) | yes |
-| `summarization` | `text`, `summary` | the target summary | not yet |
+| `summarization` | `text`, `summary` | the target summary | yes |
 
-"Not yet" task types can be uploaded, previewed, explored (EDA) and annotated,
-but training them returns 400.
+A summarization Dataset trains `t5_small` on its `text` and `summary` columns,
+found by name and read exactly as written (never cleaned or lowercased); rows
+with a blank text or summary are skipped, and a Dataset with none left is
+refused. Runs report ROUGE-1, ROUGE-2 and ROUGE-L (0–1) on summaries written
+for up to 200 evaluation rows (`rouge_rows`), and prediction returns the
+written summary as `prediction`.
 
 An NER `entities` cell may hold the annotated spans as a JSON list, with
 character offsets into that row's `text` (`end` exclusive):

@@ -309,6 +309,35 @@ def _file_has_spans(dataset):
     return False
 
 
+def summarization_examples(file_path, dataset=None):
+    """``[(text, summary)]`` of the rows of the file that have both, read
+    verbatim (see ``read_rows_exact``): a summary is text, so ``NA``, ``null``
+    and ``00123`` stay as written, and nothing is cleaned (cleaning would
+    lowercase it). Columns are found by name, never by position; a row missing
+    one of them is not an example, so it trains on nothing."""
+    df = read_rows_exact(file_path)
+    text_name = (dataset.text_column if dataset else None) or "text"
+    summary_name = (dataset.label_column if dataset else None) or LABEL_COLUMNS["summarization"]
+    text_column = _find_column(df, text_name)
+    summary_column = _find_column(df, summary_name)
+    if text_column is None or summary_column is None:
+        raise ValueError("A summarization Dataset needs a text column and a summary column.")
+    keep = ~_is_blank(df[text_column]) & ~_is_blank(df[summary_column])
+    return list(zip(df.loc[keep, text_column], df.loc[keep, summary_column]))
+
+
+def has_summarization_examples(dataset):
+    """Whether a summarization Dataset has a row with both a text and a summary:
+    the fewest examples its trainer can start from. Read-only (the fit check
+    runs on read paths and inside a start's locked section), and it reads the
+    file exactly as the trainer will, so the two can never disagree."""
+    try:
+        return bool(summarization_examples(dataset.file_path, dataset))
+    except Exception as e:
+        logger.warning("dataset %s: cannot read rows to look for summaries: %s", dataset.id, e)
+        return False
+
+
 def create_annotation_tasks(dataset):
     """Add a task for every row of ``dataset`` with text that has none; caller commits.
 

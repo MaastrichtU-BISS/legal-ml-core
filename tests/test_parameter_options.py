@@ -83,12 +83,33 @@ def _ner_dataset(app, tmp_path):
         return dataset.id
 
 
+def _summary_dataset(app, tmp_path):
+    path = tmp_path / "summaries.csv"
+    pd.DataFrame(
+        {"text": [f"The court decided case number {n}." for n in range(6)],
+         "summary": [f"Case {n} decided." for n in range(6)]}
+    ).to_csv(path, index=False)
+    with app.app_context():
+        dataset = Dataset(
+            owner_id=TEST_USER_ID,
+            name="Summaries",
+            file_path=str(path),
+            row_count=6,
+            columns=[],
+            task_type="summarization",
+        )
+        db.session.add(dataset)
+        db.session.commit()
+        return dataset.id
+
+
 @pytest.fixture
 def datasets(app, tmp_path):
     return {
         "classification": _dataset(app, tmp_path, "classification", TWO_LABELS),
         "transformer": _dataset(app, tmp_path, "classification", TWO_LABELS),
         "token_classification": _ner_dataset(app, tmp_path),
+        "seq2seq": _summary_dataset(app, tmp_path),
         "clustering": _dataset(app, tmp_path, "clustering", ["x"] * 30),
         "topic_modeling": _dataset(app, tmp_path, "topic_modeling", ["x"] * 30),
     }
@@ -203,15 +224,27 @@ def tiny_bert_ner(tmp_path):
     return str(path)
 
 
+@pytest.fixture
+def tiny_seq2seq(tmp_path):
+    """Stands in for a download for the summary model."""
+    from tests.test_summarization_training import _tiny_seq2seq
+
+    path = tmp_path / "seq2seq"
+    path.mkdir()
+    return _tiny_seq2seq(path)
+
+
 @pytest.mark.parametrize("case", SWEEP)
 def test_every_offered_value_trains_or_is_refused_at_creation(
-    client, auth_headers, app, fake_redis, datasets, tiny_bert, tiny_bert_ner, case
+    client, auth_headers, app, fake_redis, datasets, tiny_bert, tiny_bert_ner, tiny_seq2seq, case
 ):
     category, model_type, chosen = json.loads(case)
     if category == "transformer":
         download = tiny_bert
     elif category == "token_classification":
         download = tiny_bert_ner
+    elif category == "seq2seq":
+        download = tiny_seq2seq
     else:
         download = None
 
@@ -644,6 +677,12 @@ REFUSALS = [
     ("distilbert_ner", "learning_rate", "Learning Rate must be between 0.000001 and 0.01."),
     ("distilbert_ner", "batch_size", "Batch Size must be between 4 and 32."),
     ("distilbert_ner", "epochs", "Training Epochs must be between 1 and 10."),
+    ("t5_small", "model_name", "Variant must be one of: t5-small."),
+    ("t5_small", "max_source_length", "Maximum Document Length must be between 128 and 1024."),
+    ("t5_small", "max_target_length", "Maximum Summary Length must be between 32 and 256."),
+    ("t5_small", "learning_rate", "Learning Rate must be between 0.000001 and 0.01."),
+    ("t5_small", "batch_size", "Batch Size must be between 2 and 16."),
+    ("t5_small", "epochs", "Training Epochs must be between 1 and 10."),
 ]
 
 

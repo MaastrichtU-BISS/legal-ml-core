@@ -429,7 +429,7 @@ paths:
               properties:
                 name: { type: string }
                 dataset_id: { type: string }
-                model_type: { type: string, examples: [svm, random_forest, legalbert, legalbert_ner, distilbert_ner, kmeans, lda] }
+                model_type: { type: string, examples: [svm, random_forest, legalbert, legalbert_ner, distilbert_ner, t5_small, kmeans, lda] }
                 parameters:
                   type: object
                   description: The model's settings, by catalogue name, plus an optional `monitoring`.
@@ -712,7 +712,7 @@ paths:
             `distilbert_ner`) each prediction also has `entities`: `{start, end,
             type, text, score}` spans with character offsets into that text, and
             `prediction` is their distinct types, first seen first (empty when
-            none).
+            none). For `t5_small`, `prediction` is the written summary.
           content:
             application/json:
               schema: { type: object }

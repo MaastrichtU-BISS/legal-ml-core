@@ -8,6 +8,32 @@ While the version is 0.x, minor releases may contain breaking changes.
 
 ## [Unreleased]
 
+## [0.17.0] - 2026-11-18
+
+### Added
+
+- Summarization Datasets train end to end: `POST /api/models/` accepts
+  `t5_small` ("T5 small (summaries)") in a new `seq2seq` catalogue category,
+  and `summarization` now lists it. It trains on the Dataset's `text` and
+  `summary` columns, found by name and read exactly as written (never cleaned
+  or lowercased); rows with a blank text or summary are skipped. Runs report
+  `rouge1`, `rouge2` and `rougeL` (0–1, `rouge-score`) on summaries written for
+  up to 200 evaluation rows (`rouge_rows`); a Stop during that generation ends
+  it at the next batch, and a one-row Dataset's metrics say
+  `evaluated_on_training`.
+- Prediction for `t5_small` returns the written summary as `prediction`
+  (beam search, a few texts at a time); the predict route waits up to 300 s
+  for it.
+- `rouge-score` and `sentencepiece` in the `compute` extra.
+
+### Changed
+
+- A summarization Dataset with no row holding both a text and a summary is
+  refused with "Add some summaries first: this Dataset has no rows with both a
+  text and a summary to learn from." `UNSUPPORTED_TASK_TYPES` is now empty.
+- Explanations are refused with a plain 400 for `t5_small`, and publishing
+  refuses it.
+
 ## [0.16.0] - 2026-11-18
 
 ### Added
@@ -582,7 +608,8 @@ version was not tagged; it corresponds to commit `02c5b61`.
 - Worker foreign-key resolution and the missing `psycopg2` dependency.
 - Model/task compatibility checks, live progress and failure reasons.
 
-[Unreleased]: https://github.com/shashankmc/legal-ml-core/compare/v0.16.0...HEAD
+[Unreleased]: https://github.com/shashankmc/legal-ml-core/compare/v0.17.0...HEAD
+[0.17.0]: https://github.com/shashankmc/legal-ml-core/compare/v0.16.0...v0.17.0
 [0.16.0]: https://github.com/shashankmc/legal-ml-core/compare/v0.15.0...v0.16.0
 [0.15.0]: https://github.com/shashankmc/legal-ml-core/compare/v0.14.1...v0.15.0
 [0.14.1]: https://github.com/shashankmc/legal-ml-core/compare/v0.14.0...v0.14.1

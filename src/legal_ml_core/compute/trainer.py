@@ -1,4 +1,5 @@
 import json
+import random
 import time
 import warnings
 
@@ -156,6 +157,11 @@ def _split(X, labels, test_size):
 # can be dozens of windows, and one pass over all of them can exhaust memory.
 PREDICTION_WINDOW_BATCH = 8
 
+# How many evaluation rows a summarization run scores with ROUGE at most: each
+# row costs a generation (a forward pass per token), so a large evaluation
+# split is scored on a random 200 of itself.
+ROUGE_MAX_ROWS = 200
+
 
 def word_labels(word_offsets, spans):
     """One BIO label per word: ``B-`` when the word enters a different span than
@@ -194,6 +200,10 @@ class MLModelTrainer:
         self.task = None
         self.label_list = None
         self.max_length = None
+        # Set by train_seq2seq, for the saved bundle.
+        self.max_source_length = None
+        self.max_target_length = None
+        self.prefix = None
 
     def preprocess_data(self, df, task_type, preprocessing_options):
         self.preprocessor = TextPreprocessor(preprocessing_options)
@@ -1041,6 +1051,164 @@ class MLModelTrainer:
         self.max_length = max_length
         return metrics
 
+    def train_seq2seq(self, examples, model_type, parameters):
+        """Fine-tune a seq2seq (text-to-text) model on ``[(text, summary)]`` and
+        score the summaries it writes with ROUGE. The text and the summaries are
+        used as given: a summary is text, and cleaning would lowercase it, so a
+        run must never hand the model something else than what it is asked to
+        summarise at prediction time."""
+        if not any(text and summary for text, summary in examples):
+            raise ValueError("This Dataset has no summaries to learn from.")
+
+        import torch
+        from rouge_score import rouge_scorer
+        from torch.utils.data import Dataset as TorchDataset
+        from transformers import (
+            AutoModelForSeq2SeqLM,
+            AutoTokenizer,
+            DataCollatorForSeq2Seq,
+            Trainer,
+            TrainingArguments,
+        )
+
+        defaults = {"t5_small": "t5-small"}
+        model_name = parameters.get("model_name", defaults[model_type])
+        max_source_length = int(parameters.get("max_source_length", 512))
+        max_target_length = int(parameters.get("max_target_length", 128))
+        learning_rate = float(parameters.get("learning_rate", 3e-4))
+        batch_size = int(parameters.get("batch_size", 8))
+        epochs = int(parameters.get("epochs", 3))
+        test_size = float(parameters.get("test_size", 0.2))
+
+        tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
+        hf_model = AutoModelForSeq2SeqLM.from_pretrained(model_name)
+        # T5 was trained on task prompts, so its inputs say what is asked of it;
+        # BART-style checkpoints expect the bare text.
+        prefix = "summarize: " if hf_model.config.model_type == "t5" else ""
+
+        rows = list(examples)
+        evaluated_on_training = False
+        if len(rows) >= 2:
+            n_eval = min(max(1, round(len(rows) * test_size)), len(rows) - 1)
+            train_rows, eval_rows = train_test_split(rows, test_size=n_eval, random_state=42)
+        else:
+            # One example: it is scored on its own training row, and says so.
+            train_rows = eval_rows = rows
+            evaluated_on_training = True
+
+        class Seq2SeqDataset(TorchDataset):
+            def __init__(self, rows):
+                self.input_ids = tokenizer(
+                    [prefix + text for text, _ in rows],
+                    truncation=True,
+                    max_length=max_source_length,
+                )["input_ids"]
+                self.labels = tokenizer(
+                    text_target=[summary for _, summary in rows],
+                    truncation=True,
+                    max_length=max_target_length,
+                )["input_ids"]
+
+            def __getitem__(self, index):
+                return {"input_ids": self.input_ids[index], "labels": self.labels[index]}
+
+            def __len__(self):
+                return len(self.input_ids)
+
+        output_dir = parameters.get(
+            "output_dir", f"/tmp/transformer_{parameters['model_id']}"
+        )
+        monitoring = _monitoring(parameters)
+        evaluation = {"eval_strategy": monitoring["eval_strategy"]}
+        if monitoring["eval_strategy"] == "steps":
+            evaluation["eval_steps"] = monitoring["eval_steps"]
+        training_args = TrainingArguments(
+            output_dir=output_dir,
+            num_train_epochs=epochs,
+            per_device_train_batch_size=batch_size,
+            per_device_eval_batch_size=batch_size,
+            learning_rate=learning_rate,
+            save_strategy="no",
+            logging_steps=monitoring["log_every_n_steps"],
+            use_cpu=not torch.cuda.is_available(),
+            **evaluation,
+        )
+
+        callbacks = [TrainingMetricCallback(self.metric_logger)] if self.metric_logger else []
+        if self.metric_logger and monitoring.get("system_metrics"):
+            callbacks.append(SystemMetricsCallback(self.metric_logger))
+        cancel_callback = None
+        if self.cancel_check:
+            cancel_callback = TrainingCancelCallback(self.cancel_check)
+            callbacks.append(cancel_callback)
+
+        hf_trainer = Trainer(
+            model=hf_model,
+            args=training_args,
+            train_dataset=Seq2SeqDataset(train_rows),
+            eval_dataset=Seq2SeqDataset(eval_rows),
+            data_collator=DataCollatorForSeq2Seq(tokenizer),
+            callbacks=callbacks,
+        )
+
+        hf_trainer.train()
+        # Stopped: skip the scoring pass and keep no model (D4/OV-E4).
+        if (cancel_callback and cancel_callback.cancelled) or (
+            self.cancel_check and self.cancel_check()
+        ):
+            raise TrainingCancelled()
+
+        def generated_summaries(model, rows):
+            """The summary the model writes for each row, generated a few rows
+            at a time; a Stop asked for ends the pass at the next batch."""
+            model.eval()
+            device = next(model.parameters()).device
+            summaries = []
+            for first in range(0, len(rows), PREDICTION_WINDOW_BATCH):
+                if self.cancel_check and self.cancel_check():
+                    raise TrainingCancelled()
+                batch = rows[first : first + PREDICTION_WINDOW_BATCH]
+                inputs = tokenizer(
+                    [prefix + text for text, _ in batch],
+                    return_tensors="pt",
+                    truncation=True,
+                    padding=True,
+                    max_length=max_source_length,
+                ).to(device)
+                with torch.no_grad():
+                    outputs = model.generate(
+                        **inputs,
+                        max_new_tokens=max_target_length,
+                        num_beams=1,
+                    )
+                summaries.extend(tokenizer.batch_decode(outputs, skip_special_tokens=True))
+            return summaries
+
+        # Generation is a forward pass per token, so a large evaluation split is
+        # scored on a random part of itself.
+        scored_rows = eval_rows
+        if len(eval_rows) > ROUGE_MAX_ROWS:
+            scored_rows = random.Random(42).sample(eval_rows, ROUGE_MAX_ROWS)
+        generated = generated_summaries(hf_model, scored_rows)
+        scorer = rouge_scorer.RougeScorer(["rouge1", "rouge2", "rougeL"], use_stemmer=True)
+        totals = {"rouge1": 0.0, "rouge2": 0.0, "rougeL": 0.0}
+        for (_, reference), summary in zip(scored_rows, generated):
+            scores = scorer.score(reference, summary)
+            for name in totals:
+                totals[name] += scores[name].fmeasure
+        metrics = {name: float(total / len(scored_rows)) for name, total in totals.items()}
+        metrics["rouge_rows"] = len(scored_rows)
+        if evaluated_on_training:
+            metrics["evaluated_on_training"] = True
+
+        self.model = hf_model
+        self.tokenizer = tokenizer
+        self.task = "summarization"
+        self.max_source_length = max_source_length
+        self.max_target_length = max_target_length
+        self.prefix = prefix
+        return metrics
+
     def save_model(self, model_path):
         model_data = {
             "task": self.task,
@@ -1051,5 +1219,8 @@ class MLModelTrainer:
             "tokenizer": getattr(self, "tokenizer", None),
             "label_list": self.label_list,
             "max_length": self.max_length,
+            "max_source_length": self.max_source_length,
+            "max_target_length": self.max_target_length,
+            "prefix": self.prefix,
         }
         joblib.dump(model_data, model_path)

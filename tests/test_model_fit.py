@@ -74,11 +74,29 @@ def test_unlabelled_rows_do_not_count_against_the_labels(client, auth_headers, a
     assert body["models"]["svm"]["usable"] is True
 
 
-def test_a_task_with_no_trainable_models_says_so_for_every_model(client, auth_headers, app):
+def test_a_summarization_dataset_without_summaries_says_to_add_some(client, auth_headers, app):
+    # /tmp/d.csv does not exist: no rows with a text and a summary to read.
     body = _fit(client, auth_headers, _dataset(app, [], task_type="summarization"))
 
-    assert not any(m["usable"] for m in body["models"].values())
-    assert body["advice"] == "Training for Text Summarization Datasets is not available yet."
+    message = "Add some summaries first: this Dataset has no rows with both a text and a summary to learn from."
+    assert body["models"]["t5_small"]["usable"] is False
+    assert body["models"]["t5_small"]["reason"] == message
+    assert body["advice"] == message
+
+
+def test_a_summarization_dataset_with_summaries_fits_t5_small(client, auth_headers, app, tmp_path):
+    path = tmp_path / "sums.csv"
+    path.write_text("text,summary\nThe court held the clause void.,Clause void.\nNA,\n")
+    with app.app_context():
+        dataset = Dataset(owner_id=TEST_USER_ID, name="S", file_path=str(path), row_count=2,
+                          columns=[], task_type="summarization")
+        db.session.add(dataset)
+        db.session.commit()
+        dataset_id = dataset.id
+
+    body = _fit(client, auth_headers, dataset_id)
+
+    assert body["models"]["t5_small"]["usable"] is True
 
 
 def test_an_ner_dataset_without_annotated_rows_says_to_annotate(client, auth_headers, app):
