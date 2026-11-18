@@ -26,15 +26,19 @@ While the version is 0.x, minor releases may contain breaking changes.
   `[]` is a valid row with no entities. Cells naming types (`PERSON, ORG`) keep
   their annotation hint and stay pending. An import trains straight away,
   without its rows being opened in a project's queue: creating a Model,
-  starting a run and the worker create its missing tasks, while asking which
+  starting a run and the worker create an NER Dataset's missing tasks (other
+  task types are unchanged), while asking which
   models a Dataset can train only reads (its file, when its rows are not
   queued yet). A rejected cell that looks like spans is logged with the
   dataset and row.
 - NER files are read exactly as written (`NA`, `null`, `00123` stay text), so
-  span offsets keep pointing into the text.
+  span offsets keep pointing into the text; a JSON file's `entities` may be a
+  real JSON array as well as JSON text.
 - Texts longer than `max_length` are trained and predicted in overlapping
-  windows instead of being cut; prediction labels whole words from each
-  word's first sub-token, so a word is never split into two entities.
+  windows instead of being cut, and predicted a few windows at a time;
+  prediction labels whole words from each word's first sub-token, so a word is
+  never split into two entities. A run's final scores are per row, each word
+  labelled as prediction would, so overlapping windows are not counted twice.
 - `seqeval` in the `compute` extra.
 
 ### Changed
