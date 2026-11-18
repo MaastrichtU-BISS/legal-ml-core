@@ -2,7 +2,8 @@ from flask import Blueprint, request, jsonify, current_app
 from ..auth import jwt_required, get_jwt_identity
 from ..db import db
 from ..active_learning.loop import training_refusal
-from ..annotation_queue import apply_saved_annotations
+from ..annotation_queue import apply_saved_annotations, has_ner_examples
+from ..annotation_format import SPAN_TYPES
 from ..models import ALRound, Model, Dataset, TrainingJob
 from ..db_utils import project_belongs_to_owner
 from ..monitoring import monitoring_refusal, run_monitoring
@@ -32,6 +33,12 @@ CLASS_WEIGHT_PARAMETER = {
     "label": "Balance Labels",
     "description": "Give rare labels more weight in training",
 }
+
+# Token-classification models, whose predictions find spans rather than one label.
+TOKEN_CLASSIFICATION_MODELS = {"legalbert_ner", "distilbert_ner"}
+
+# Model types whose prediction loads a transformer, so it gets the longer wait.
+TRANSFORMER_PREDICTION_MODELS = {"legalbert", "roberta"} | TOKEN_CLASSIFICATION_MODELS
 
 # Available model types and their parameters: what the wizard offers and what
 # parameter_refusal accepts, read from the same table. A number stays within min
@@ -515,6 +522,98 @@ AVAILABLE_MODELS = {
             },
         },
     },
+    "token_classification": {
+        "legalbert_ner": {
+            "name": "LegalBERT (entities)",
+            "description": "LegalBERT fine-tuned to find named entities",
+            "parameters": {
+                "model_name": {
+                    "label": "Variant",
+                    "type": "select",
+                    "options": ["nlpaueb/legal-bert-base-uncased"],
+                    "default": "nlpaueb/legal-bert-base-uncased",
+                    "description": "LegalBERT variant",
+                },
+                "max_length": {
+                    "label": "Maximum Document Length",
+                    "type": "int",
+                    "min": 128,
+                    "max": 512,
+                    "default": 256,
+                    "description": "Maximum sequence length",
+                },
+                "learning_rate": {
+                    "label": "Learning Rate",
+                    "type": "float",
+                    "min": 1e-6,
+                    "max": 1e-2,
+                    "default": 5e-5,
+                    "description": "Learning rate",
+                },
+                "batch_size": {
+                    "label": "Batch Size",
+                    "type": "int",
+                    "min": 4,
+                    "max": 32,
+                    "default": 8,
+                    "description": "Training batch size",
+                },
+                "epochs": {
+                    "label": "Training Epochs",
+                    "type": "int",
+                    "min": 1,
+                    "max": 10,
+                    "default": 3,
+                    "description": "Number of training epochs",
+                },
+            },
+        },
+        "distilbert_ner": {
+            "name": "DistilBERT (entities)",
+            "description": "A small, fast BERT fine-tuned to find named entities",
+            "parameters": {
+                "model_name": {
+                    "label": "Variant",
+                    "type": "select",
+                    "options": ["distilbert-base-cased"],
+                    "default": "distilbert-base-cased",
+                    "description": "DistilBERT model",
+                },
+                "max_length": {
+                    "label": "Maximum Document Length",
+                    "type": "int",
+                    "min": 128,
+                    "max": 512,
+                    "default": 256,
+                    "description": "Maximum sequence length",
+                },
+                "learning_rate": {
+                    "label": "Learning Rate",
+                    "type": "float",
+                    "min": 1e-6,
+                    "max": 1e-2,
+                    "default": 5e-5,
+                    "description": "Learning rate",
+                },
+                "batch_size": {
+                    "label": "Batch Size",
+                    "type": "int",
+                    "min": 4,
+                    "max": 32,
+                    "default": 8,
+                    "description": "Training batch size",
+                },
+                "epochs": {
+                    "label": "Training Epochs",
+                    "type": "int",
+                    "min": 1,
+                    "max": 10,
+                    "default": 3,
+                    "description": "Number of training epochs",
+                },
+            },
+        },
+    },
 }
 
 
@@ -529,15 +628,17 @@ for _category, _models in AVAILABLE_MODELS.items():
 # Dataset task types whose training is not implemented in the worker yet. Kept
 # explicit so uploads/selection can explain the limitation instead of failing
 # silently at training time.
-UNSUPPORTED_TASK_TYPES = {"ner", "named_entity_recognition", "summarization"}
+UNSUPPORTED_TASK_TYPES = {"summarization"}
 
 # Which model categories each dataset task type may use. Transformer models
 # (LegalBERT/RoBERTa) are supervised text classifiers, so they are offered for
-# every supervised text task.
+# every supervised text task; NER needs span models instead.
 _TASK_CATEGORIES = {
     "classification": ["classification", "transformer"],
     "document_classification": ["classification", "transformer"],
     "judgment_prediction": ["classification", "transformer"],
+    "ner": ["token_classification"],
+    "named_entity_recognition": ["token_classification"],
     "topic_modeling": ["topic_modeling", "clustering"],
     "clustering": ["clustering", "topic_modeling"],
 }
@@ -563,6 +664,7 @@ def compatible_models_for_task(task_type):
 _CATEGORY_NEEDS = {
     "classification": "learns labels: it trains on Text Classification, Document Classification or Judgment Prediction Datasets.",
     "transformer": "learns labels: it trains on Text Classification, Document Classification or Judgment Prediction Datasets.",
+    "token_classification": "finds named entities: it trains on Named Entity Recognition Datasets.",
     "clustering": "groups texts without labels: it trains on Clustering or Topic modelling Datasets.",
     "topic_modeling": "finds topics in texts without labels: it trains on Topic modelling or Clustering Datasets.",
 }
@@ -601,6 +703,8 @@ def model_fit_refusal(model_type, dataset):
         return f"Training for {_task_label(task_type)} Datasets is not available yet."
     if category not in _TASK_CATEGORIES[task_type]:
         return f"{name} {_CATEGORY_NEEDS[category]}"
+    if category == "token_classification" and not has_ner_examples(dataset):
+        return NO_ENTITIES_ADVICE
     shape = labels_not_categories(dataset) if category in _LEARNS_LABELS else None
     if shape:
         labelled, different = shape
@@ -614,6 +718,10 @@ def model_fit_refusal(model_type, dataset):
 NOT_CATEGORIES_ADVICE = (
     "These labels look like answers or free text, not categories. Give the rows a few "
     "categories (annotate them, or re-label the file) to train a model on them."
+)
+
+NO_ENTITIES_ADVICE = (
+    "Annotate some rows first: this Dataset has no labelled entities to learn from."
 )
 
 
@@ -630,6 +738,8 @@ def model_fit(dataset):
         task_type = dataset.task_type
         if task_type in UNSUPPORTED_TASK_TYPES or task_type not in _TASK_CATEGORIES:
             advice = f"Training for {_task_label(task_type)} Datasets is not available yet."
+        elif task_type in SPAN_TYPES and not has_ner_examples(dataset):
+            advice = NO_ENTITIES_ADVICE
         elif labels_not_categories(dataset):
             advice = NOT_CATEGORIES_ADVICE
     return {"models": models, "advice": advice}
@@ -1197,6 +1307,9 @@ def explain_model(model_id):
         if model.status != "completed":
             return jsonify({"error": "Model is not trained yet"}), 400
 
+        if model.model_type in TOKEN_CLASSIFICATION_MODELS:
+            return jsonify({"error": "Explanations are not available for entity models."}), 400
+
         # Generate unique explanation ID
         import uuid
 
@@ -1310,6 +1423,9 @@ def explain_model_batch(model_id):
         if model.status != "completed":
             return jsonify({"error": "Model is not trained yet"}), 400
 
+        if model.model_type in TOKEN_CLASSIFICATION_MODELS:
+            return jsonify({"error": "Explanations are not available for entity models."}), 400
+
         # Queue explanation tasks for each text
         import uuid
 
@@ -1383,8 +1499,7 @@ def predict(model_id):
             "owner_id": str(owner_id),
         }
 
-        TRANSFORMER_MODELS = {"legalbert", "roberta"}
-        timeout = 120 if model.model_type in TRANSFORMER_MODELS else 30
+        timeout = 120 if model.model_type in TRANSFORMER_PREDICTION_MODELS else 30
 
         r = current_app.redis_client
         r.lpush(current_app.config.get("LEGAL_ML_PREDICTION_QUEUE", "prediction_queue"), json.dumps(task))

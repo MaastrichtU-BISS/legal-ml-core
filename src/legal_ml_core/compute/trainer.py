@@ -162,6 +162,10 @@ class MLModelTrainer:
         self.vectorizer = None
         self.model = None
         self.label_encoder = None
+        # Set by train_token_classification, for the saved bundle.
+        self.task = None
+        self.label_list = None
+        self.max_length = None
 
     def preprocess_data(self, df, task_type, preprocessing_options):
         self.preprocessor = TextPreprocessor(preprocessing_options)
@@ -720,12 +724,182 @@ class MLModelTrainer:
         self.tokenizer = tokenizer
         return metrics
 
+    def train_token_classification(self, examples, model_type, parameters):
+        """Fine-tune a token classifier on ``[(text, spans)]``; spans are the
+        stored NER entities, with character offsets into the raw text."""
+        if not examples:
+            raise ValueError("This Dataset has no annotated entities to train on.")
+
+        import torch
+        from seqeval.metrics import (
+            classification_report as entity_report,
+            f1_score as entity_f1,
+            precision_score as entity_precision,
+            recall_score as entity_recall,
+        )
+        from torch.utils.data import Dataset as TorchDataset
+        from transformers import (
+            AutoModelForTokenClassification,
+            AutoTokenizer,
+            DataCollatorForTokenClassification,
+            Trainer,
+            TrainingArguments,
+        )
+
+        defaults = {
+            "legalbert_ner": "nlpaueb/legal-bert-base-uncased",
+            "distilbert_ner": "distilbert-base-cased",
+        }
+        model_name = parameters.get("model_name", defaults[model_type])
+        max_length = int(parameters.get("max_length", 256))
+        learning_rate = float(parameters.get("learning_rate", 5e-5))
+        batch_size = int(parameters.get("batch_size", 8))
+        epochs = int(parameters.get("epochs", 3))
+        test_size = float(parameters.get("test_size", 0.2))
+
+        entity_types = sorted({span["type"] for _, spans in examples for span in spans})
+        label_list = ["O"] + sorted(
+            f"{prefix}-{kind}" for kind in entity_types for prefix in ("B", "I")
+        )
+        label_ids = {label: index for index, label in enumerate(label_list)}
+
+        tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
+
+        def token_label(start, spans):
+            """The label of the token starting at ``start``: B- on a span's first
+            token, I- on the words after it, O outside every span."""
+            for span in spans:
+                if span["start"] <= start < span["end"]:
+                    prefix = "B" if start == span["start"] else "I"
+                    return f"{prefix}-{span['type']}"
+            return "O"
+
+        def encode(text, spans):
+            encoding = tokenizer(
+                text, truncation=True, max_length=max_length, return_offsets_mapping=True
+            )
+            labels = []
+            previous_word = None
+            for word_id, (start, end) in zip(encoding.word_ids(), encoding["offset_mapping"]):
+                # Special tokens, unknown tokens without a place, and the
+                # sub-tokens after a word's first carry no label.
+                if word_id is None or start == end or word_id == previous_word:
+                    labels.append(-100)
+                else:
+                    labels.append(label_ids[token_label(start, spans)])
+                previous_word = word_id
+            feature = {key: value for key, value in encoding.items() if key != "offset_mapping"}
+            feature["labels"] = labels
+            return feature
+
+        class TokenDataset(TorchDataset):
+            def __init__(self, rows):
+                self.features = [encode(text, spans) for text, spans in rows]
+
+            def __getitem__(self, index):
+                return {key: torch.tensor(value) for key, value in self.features[index].items()}
+
+            def __len__(self):
+                return len(self.features)
+
+        rows = list(examples)
+        if len(rows) >= 2:
+            n_eval = min(max(1, round(len(rows) * test_size)), len(rows) - 1)
+            train_rows, eval_rows = train_test_split(rows, test_size=n_eval, random_state=42)
+        else:
+            train_rows = eval_rows = rows
+
+        hf_model = AutoModelForTokenClassification.from_pretrained(
+            model_name, num_labels=len(label_list)
+        )
+
+        output_dir = parameters.get(
+            "output_dir", f"/tmp/transformer_{parameters['model_id']}"
+        )
+        monitoring = _monitoring(parameters)
+        evaluation = {"eval_strategy": monitoring["eval_strategy"]}
+        if monitoring["eval_strategy"] == "steps":
+            evaluation["eval_steps"] = monitoring["eval_steps"]
+        training_args = TrainingArguments(
+            output_dir=output_dir,
+            num_train_epochs=epochs,
+            per_device_train_batch_size=batch_size,
+            per_device_eval_batch_size=batch_size,
+            learning_rate=learning_rate,
+            save_strategy="no",
+            logging_steps=monitoring["log_every_n_steps"],
+            use_cpu=not torch.cuda.is_available(),
+            **evaluation,
+        )
+
+        def sequences(logits, gold):
+            predicted = logits.argmax(-1)
+            true_labels = [[label_list[int(label)] for label in row if label != -100] for row in gold]
+            predicted_labels = [
+                [label_list[int(prediction)] for prediction, label in zip(row, truth) if label != -100]
+                for row, truth in zip(predicted, gold)
+            ]
+            return true_labels, predicted_labels
+
+        def compute_metrics(eval_pred):
+            true_labels, predicted_labels = sequences(*eval_pred)
+            return {
+                "f1_score": entity_f1(true_labels, predicted_labels, average="micro"),
+                "precision": entity_precision(true_labels, predicted_labels, average="micro"),
+                "recall": entity_recall(true_labels, predicted_labels, average="micro"),
+            }
+
+        callbacks = [TrainingMetricCallback(self.metric_logger)] if self.metric_logger else []
+        if self.metric_logger and monitoring.get("system_metrics"):
+            callbacks.append(SystemMetricsCallback(self.metric_logger))
+        cancel_callback = None
+        if self.cancel_check:
+            cancel_callback = TrainingCancelCallback(self.cancel_check)
+            callbacks.append(cancel_callback)
+
+        hf_trainer = Trainer(
+            model=hf_model,
+            args=training_args,
+            train_dataset=TokenDataset(train_rows),
+            eval_dataset=TokenDataset(eval_rows),
+            data_collator=DataCollatorForTokenClassification(tokenizer),
+            compute_metrics=compute_metrics,
+            callbacks=callbacks,
+        )
+
+        hf_trainer.train()
+        # Stopped: skip predict and keep no model (D4/OV-E4).
+        if (cancel_callback and cancel_callback.cancelled) or (
+            self.cancel_check and self.cancel_check()
+        ):
+            raise TrainingCancelled()
+
+        predictions = hf_trainer.predict(hf_trainer.eval_dataset)
+        true_labels, predicted_labels = sequences(predictions.predictions, predictions.label_ids)
+        metrics = {
+            "f1_score": float(entity_f1(true_labels, predicted_labels, average="micro")),
+            "precision": float(entity_precision(true_labels, predicted_labels, average="micro")),
+            "recall": float(entity_recall(true_labels, predicted_labels, average="micro")),
+            "classification_report": entity_report(true_labels, predicted_labels),
+            "entity_types": entity_types,
+        }
+
+        self.model = hf_model
+        self.tokenizer = tokenizer
+        self.task = "ner"
+        self.label_list = label_list
+        self.max_length = max_length
+        return metrics
+
     def save_model(self, model_path):
         model_data = {
+            "task": self.task,
             "preprocessor": self.preprocessor,
             "vectorizer": self.vectorizer,
             "model": self.model,
             "label_encoder": self.label_encoder,
             "tokenizer": getattr(self, "tokenizer", None),
+            "label_list": self.label_list,
+            "max_length": self.max_length,
         }
         joblib.dump(model_data, model_path)

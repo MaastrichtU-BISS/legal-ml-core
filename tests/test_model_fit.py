@@ -4,7 +4,7 @@ Decided from the task type and the label counts stored with every Dataset, so
 no file is read. Labels that are nearly all different (a question/answer set
 uploaded as classification) are not categories: no classifier can learn them.
 """
-from legal_ml_core import Dataset, db
+from legal_ml_core import AnnotationTask, Dataset, db
 from tests.conftest import TEST_USER_ID
 
 QA = [
@@ -16,6 +16,8 @@ DEONTIC = [
     {"name": "label", "type": "object", "null_count": 0, "unique_count": 5},
 ]
 CLASSIFIERS = {"svm", "decision_tree", "random_forest", "naive_bayes", "logistic_regression", "legalbert", "roberta"}
+ENTITY_MODELS = {"legalbert_ner", "distilbert_ner"}
+NO_ENTITIES_ADVICE = "Annotate some rows first: this Dataset has no labelled entities to learn from."
 
 
 def _dataset(app, columns, task_type="classification", rows=None):
@@ -68,10 +70,47 @@ def test_unlabelled_rows_do_not_count_against_the_labels(client, auth_headers, a
 
 
 def test_a_task_with_no_trainable_models_says_so_for_every_model(client, auth_headers, app):
-    body = _fit(client, auth_headers, _dataset(app, [], task_type="ner"))
+    body = _fit(client, auth_headers, _dataset(app, [], task_type="summarization"))
 
     assert not any(m["usable"] for m in body["models"].values())
-    assert body["advice"] == "Training for Named Entity Recognition Datasets is not available yet."
+    assert body["advice"] == "Training for Text Summarization Datasets is not available yet."
+
+
+def test_an_ner_dataset_without_annotated_rows_says_to_annotate(client, auth_headers, app):
+    body = _fit(client, auth_headers, _dataset(app, [], task_type="ner", rows=5))
+
+    assert not any(m["usable"] for m in body["models"].values())
+    assert body["advice"] == NO_ENTITIES_ADVICE
+    assert {body["models"][model_type]["reason"] for model_type in ENTITY_MODELS} == {NO_ENTITIES_ADVICE}
+
+
+def test_an_annotated_ner_dataset_fits_both_entity_models(client, auth_headers, app):
+    dataset_id = _dataset(app, [], task_type="ner", rows=5)
+    with app.app_context():
+        db.session.add(
+            AnnotationTask(
+                dataset_id=dataset_id,
+                item_index=0,
+                text="John Smith sued Acme Corp.",
+                status="annotated",
+                annotation_label='[{"text": "John Smith", "start": 0, "end": 10, "type": "PERSON"}]',
+            )
+        )
+        db.session.commit()
+
+    body = _fit(client, auth_headers, dataset_id)
+
+    assert {t for t, m in body["models"].items() if m["usable"]} == ENTITY_MODELS
+    assert body["advice"] is None
+
+
+def test_an_ner_model_refuses_a_classification_dataset_with_a_plain_reason(client, auth_headers, app):
+    body = _fit(client, auth_headers, _dataset(app, DEONTIC))
+
+    assert body["models"]["distilbert_ner"]["reason"] == (
+        "DistilBERT (entities) finds named entities: it trains on Named Entity Recognition Datasets."
+    )
+    assert body["models"]["distilbert_ner"]["usable"] is False
 
 
 def test_another_users_dataset_is_not_found(client, auth_headers, app):

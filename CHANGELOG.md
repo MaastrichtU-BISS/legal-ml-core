@@ -8,6 +8,33 @@ While the version is 0.x, minor releases may contain breaking changes.
 
 ## [Unreleased]
 
+## [0.16.0] - 2026-11-18
+
+### Added
+
+- NER Datasets train end to end: `POST /api/models/` accepts `legalbert_ner`
+  ("LegalBERT (entities)") and `distilbert_ner` ("DistilBERT (entities)") in a
+  new `token_classification` catalogue category, and `ner` /
+  `named_entity_recognition` now list them. Runs report `f1_score`,
+  `precision`, `recall`, `classification_report` and `entity_types`, scored on
+  spans with `seqeval`.
+- Prediction for entity models returns `entities`: `{start, end, type, text,
+  score}` spans with character offsets into the input text, and `prediction` as
+  the distinct entity types, first seen first (`""` when none).
+- An imported NER row whose `entities` cell holds a valid JSON span list starts
+  annotated (`label_source: file`), so imported spans train without re-labelling;
+  `[]` is a valid row with no entities. Cells naming types (`PERSON, ORG`) keep
+  their annotation hint and stay pending.
+- `seqeval` in the `compute` extra.
+
+### Changed
+
+- An NER Dataset with no annotated, non-holdout tasks is refused with "Annotate
+  some rows first: this Dataset has no labelled entities to learn from." NER
+  text is never cleaned for training, so span offsets stay inside it.
+- Explanations are refused with a plain 400 for entity models, and publishing
+  still refuses them.
+
 ## [0.15.0] - 2026-11-17
 
 ### Added
@@ -535,7 +562,8 @@ version was not tagged; it corresponds to commit `02c5b61`.
 - Worker foreign-key resolution and the missing `psycopg2` dependency.
 - Model/task compatibility checks, live progress and failure reasons.
 
-[Unreleased]: https://github.com/shashankmc/legal-ml-core/compare/v0.15.0...HEAD
+[Unreleased]: https://github.com/shashankmc/legal-ml-core/compare/v0.16.0...HEAD
+[0.16.0]: https://github.com/shashankmc/legal-ml-core/compare/v0.15.0...v0.16.0
 [0.15.0]: https://github.com/shashankmc/legal-ml-core/compare/v0.14.1...v0.15.0
 [0.14.1]: https://github.com/shashankmc/legal-ml-core/compare/v0.14.0...v0.14.1
 [0.14.0]: https://github.com/shashankmc/legal-ml-core/compare/v0.13.0...v0.14.0

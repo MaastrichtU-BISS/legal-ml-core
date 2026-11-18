@@ -132,11 +132,34 @@ def test_predict_returns_504_when_worker_never_responds(client, auth_headers, ap
     assert resp.status_code == 504
 
 
-def test_available_models_for_sparse_task_type(client, auth_headers):
-    """`ner` is a valid task with no trainable models yet — answer 200, not 400."""
+def test_available_models_for_ner_lists_the_entity_models(client, auth_headers):
     resp = client.get("/api/models/available?task_type=ner", headers=auth_headers)
+
     assert resp.status_code == 200
-    assert resp.get_json()["models"] == {}
+    assert set(resp.get_json()["models"]) == {"legalbert_ner", "distilbert_ner"}
+
+
+def test_explanations_are_refused_for_entity_models(client, auth_headers, app):
+    dataset_id = _make_dataset(app)
+    with app.app_context():
+        model = Model(
+            owner_id=TEST_USER_ID,
+            dataset_id=dataset_id,
+            name="Entity model",
+            model_type="distilbert_ner",
+            parameters={},
+            status="completed",
+        )
+        db.session.add(model)
+        db.session.commit()
+        model_id = model.id
+
+    resp = client.post(
+        f"/api/models/{model_id}/explain", json={"text": "Acme sued John Smith"}, headers=auth_headers
+    )
+
+    assert resp.status_code == 400
+    assert "entity models" in resp.get_json()["error"]
 
 
 def test_create_model_rejects_incompatible_model(client, auth_headers, app):

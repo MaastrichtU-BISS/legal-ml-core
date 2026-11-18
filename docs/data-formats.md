@@ -34,12 +34,25 @@ The catalogue is served by `GET /api/datasets/task-types` (source:
 | `judgment_prediction` | `text`, `judgment` | the case outcome (e.g. guilty / not_guilty) | yes |
 | `topic_modeling` | `text` | nothing (unsupervised) | yes |
 | `clustering` | `text` | nothing (unsupervised) | yes |
-| `ner` | `text`, `entities` | entity types per span (e.g. `PERSON, ORG`) | not yet |
-| `named_entity_recognition` | `text`, `entities` | same as `ner` (alias) | not yet |
+| `ner` | `text`, `entities` | entity spans as JSON, or the entity types (e.g. `PERSON, ORG`) | yes |
+| `named_entity_recognition` | `text`, `entities` | same as `ner` (alias) | yes |
 | `summarization` | `text`, `summary` | the target summary | not yet |
 
 "Not yet" task types can be uploaded, previewed, explored (EDA) and annotated,
 but training them returns 400.
+
+An NER `entities` cell may hold the annotated spans as a JSON list, with
+character offsets into that row's `text` (`end` exclusive):
+
+```csv
+text,entities
+"John Smith sued Acme Corp.","[{""text"": ""John Smith"", ""start"": 0, ""end"": 10, ""type"": ""PERSON""}, {""text"": ""Acme Corp."", ""start"": 16, ""end"": 26, ""type"": ""ORG""}]"
+```
+
+Every span must fit the row's text, be in order, and not overlap; `[]` is a
+valid row with no entities. Such rows start labelled in the annotation queue and
+train `legalbert_ner` or `distilbert_ner`. A cell naming types instead (e.g.
+`PERSON, ORG`) is kept as an annotation hint and the row waits for its spans.
 
 Example (`classification`):
 
@@ -58,8 +71,9 @@ position* and reads the file as CSV. For a dataset you want to train on:
 1. Upload it as **CSV** (XLSX and JSON pass upload and EDA, but training reads
    the stored file with `pandas.read_csv`).
 2. Put the **text in the first column**, and for supervised tasks the
-   **label (`label`, `judgment` or `summary`) in the second column**. Extra
-   columns after these are ignored.
+   **label (`label`, `judgment`, `summary` or `entities`) in the second column**.
+   Extra columns after these are ignored. NER training reads the saved spans on
+   the Dataset's annotation tasks, so its raw text keeps its offsets.
 
 ## Trained models
 
@@ -90,11 +104,14 @@ dict (`Trainer.save_model` in `src/legal_ml_core/compute/trainer.py`):
 
 | Key | Contents |
 |---|---|
-| `preprocessor` | the fitted `TextPreprocessor` (cleaning options used at training) |
+| `task` | `"ner"` for an entity model, else `None` |
+| `preprocessor` | the fitted `TextPreprocessor` (cleaning options used at training); `None` for entity models, which keep raw text |
 | `vectorizer` | fitted scikit-learn vectorizer, or `None` for transformers |
 | `model` | the scikit-learn estimator, or the fine-tuned HuggingFace model |
 | `label_encoder` | fitted `LabelEncoder` for supervised tasks, else `None` |
-| `tokenizer` | HuggingFace tokenizer for transformers, else `None` |
+| `tokenizer` | HuggingFace tokenizer for transformers and entity models, else `None` |
+| `label_list` | entity models only: the token labels, `O` first |
+| `max_length` | entity models only: the longest text the tokenizer reads |
 
 Loading it needs Python with this package and its pinned dependencies
 installed (the preprocessor class lives in `legal_ml_core.compute`):

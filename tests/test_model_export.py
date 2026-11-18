@@ -98,6 +98,16 @@ def test_a_transformer_exports_to_safetensors_with_its_tokenizer(client, auth_he
     assert script["predict"](result["directory"], CHECK_TEXTS) == _platform_labels(app, model_id, "legalbert", CHECK_TEXTS)
 
 
+def test_an_entity_model_is_refused_with_a_plain_reason(app):
+    from legal_ml_core.compute.export import process_export_task
+
+    with pytest.raises(ValueError, match="Only classification Models"):
+        process_export_task(
+            {"model_id": "entity-model", "model_type": "distilbert_ner", "texts": CHECK_TEXTS},
+            app.config["MODEL_FOLDER"],
+        )
+
+
 def test_waiting_gives_up_when_the_worker_does_not_answer(fake_redis):
     with pytest.raises(ExportError, match="training service"):
         wait_for_model_export(fake_redis, "nobody-answers", timeout=1)

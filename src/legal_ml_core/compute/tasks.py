@@ -10,7 +10,8 @@ import redis as redis_lib
 from flask import current_app
 
 from ..active_learning.scoring import queue_pool_scoring, verify_finished_model
-from ..annotation_queue import apply_saved_annotations
+from ..annotation_format import SPAN_TYPES
+from ..annotation_queue import apply_saved_annotations, ner_examples
 from ..db import db
 from ..job_state import ACTIVE_JOB_STATUSES, COULD_NOT_START_MESSAGE, transition
 from ..metric_groups import metric_group_for
@@ -27,6 +28,9 @@ logger = logging.getLogger(__name__)
 
 # Redis being unreachable (vs. a bad command): reported as a retryable failure.
 REDIS_DOWN_ERRORS = (redis_lib.ConnectionError, redis_lib.TimeoutError)
+
+# Model types that fine-tune a token classifier instead of a text classifier.
+TOKEN_CLASSIFICATION_TYPES = ("legalbert_ner", "distilbert_ner")
 
 
 class MetricLogger:
@@ -278,8 +282,9 @@ def process_training_task(
         reached("preprocessing_started")
 
         # Load dataset
+        dataset = db.session.get(Dataset, task_info["dataset_id"])
         df = pd.read_csv(task_info["dataset_path"])
-        df = apply_saved_annotations(df, db.session.get(Dataset, task_info["dataset_id"]))
+        df = apply_saved_annotations(df, dataset)
 
         # Initialize trainer
         trainer = trainer_factory(
@@ -288,10 +293,19 @@ def process_training_task(
             cancel_check=cancel_requested,
         )
 
-        # Preprocess data
-        texts, labels, label_names = trainer.preprocess_data(
-            df, task_info["task_type"], task_info.get("preprocessing_options", {})
+        # Preprocess data. NER text is never cleaned: cleaning would move every
+        # span's character offsets.
+        span_task = (
+            task_info["task_type"] in SPAN_TYPES
+            and task_info["model_type"] in TOKEN_CLASSIFICATION_TYPES
         )
+        if span_task:
+            examples = ner_examples(dataset)
+            texts, labels, label_names = None, None, None
+        else:
+            texts, labels, label_names = trainer.preprocess_data(
+                df, task_info["task_type"], task_info.get("preprocessing_options", {})
+            )
         checkpoint()
 
         set_live({"status": "running", "progress": 25})
@@ -300,7 +314,14 @@ def process_training_task(
 
         # Train model based on task type
         parameters = _chosen_parameters(task_info, monitoring)
-        if task_info["model_type"] in ["legalbert", "roberta"]:
+        if span_task:
+            parameters["output_dir"] = get_storage_backend().get_transformer_output_dir(
+                model_storage_path, model_id
+            )
+            metrics = trainer.train_token_classification(
+                examples, task_info["model_type"], parameters
+            )
+        elif task_info["model_type"] in ["legalbert", "roberta"]:
             parameters["output_dir"] = get_storage_backend().get_transformer_output_dir(
                 model_storage_path, model_id
             )
@@ -508,6 +529,75 @@ def process_prediction_task(task_info, model_storage_path):
                 "prediction": f"Topic {dominant}",
                 "dominant_topic": dominant,
                 "topic_weights": [round(float(w), 4) for w in weights],
+            })
+
+    elif model_type in TOKEN_CLASSIFICATION_TYPES:
+        import torch
+
+        tokenizer = model_data.get("tokenizer")
+        label_list = model_data.get("label_list")
+        if tokenizer is None or not label_list:
+            raise ValueError("Tokenizer or entity labels not found in saved model")
+        max_length = int(model_data.get("max_length") or 256)
+
+        clf.eval()
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        clf.to(device)
+
+        for text in texts:
+            inputs = tokenizer(
+                text,
+                return_tensors="pt",
+                truncation=True,
+                max_length=max_length,
+                return_offsets_mapping=True,
+            )
+            offsets = inputs.pop("offset_mapping")[0].tolist()
+            inputs = {k: v.to(device) for k, v in inputs.items()}
+            with torch.no_grad():
+                logits = clf(**inputs).logits[0].cpu()
+            scores = torch.softmax(logits, dim=-1).tolist()
+            predicted = logits.argmax(-1).tolist()
+
+            # Merge each B-/I- run into one span, in input-text offsets.
+            spans = []
+            current = None
+            for (start, end), index, token_scores in zip(offsets, predicted, scores):
+                if start == end:  # A special token ends any run.
+                    current = None
+                    continue
+                label = label_list[index]
+                if label == "O":
+                    current = None
+                    continue
+                prefix, _, kind = label.partition("-")
+                if prefix == "B" or current is None or current["type"] != kind:
+                    current = {
+                        "start": start,
+                        "end": end,
+                        "type": kind,
+                        "scores": [token_scores[index]],
+                    }
+                    spans.append(current)
+                else:
+                    current["end"] = end
+                    current["scores"].append(token_scores[index])
+
+            entities = [
+                {
+                    "start": span["start"],
+                    "end": span["end"],
+                    "type": span["type"],
+                    "text": text[span["start"]:span["end"]],
+                    "score": round(sum(span["scores"]) / len(span["scores"]), 4),
+                }
+                for span in spans
+            ]
+            types = list(dict.fromkeys(entity["type"] for entity in entities))
+            predictions.append({
+                "text": text,
+                "prediction": ", ".join(types),
+                "entities": entities,
             })
 
     elif model_type in ("legalbert", "roberta"):

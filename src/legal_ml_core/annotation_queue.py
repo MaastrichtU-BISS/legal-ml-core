@@ -1,9 +1,11 @@
 """Dataset rows becoming annotation work, and saved work becoming labels."""
+import json
 import logging
 
 import pandas as pd
 from sqlalchemy.exc import IntegrityError
 
+from .annotation_format import SPAN_TYPES, _stored_entities
 from .db import db
 from .models import AnnotationTask, Dataset
 
@@ -20,8 +22,9 @@ LABEL_COLUMNS = {
     "judgment_prediction": "judgment",
 }
 
-# Task types whose trainer learns from the label column. NER training ignores
-# its entities column, so saved NER spans have nothing to feed yet.
+# Task types whose trainer learns from the label column. NER trains from spans
+# held in ``annotation_label`` instead, through ``ner_examples`` below, and stays
+# out of this set so the classification paths and active learning do not see it.
 TRAINED_ON_LABELS = {"classification", "document_classification", "judgment_prediction"}
 
 # Task types offered on the annotation screen. Summarization is left out: no
@@ -155,14 +158,80 @@ def _label_text(value):
     return str(value)
 
 
+def _file_spans(value, text):
+    """The spans an NER file's ``entities`` cell holds, in the stored format, or
+    ``None`` when it is not a span list for ``text``.
+
+    A JSON list of span dicts (``text``, ``start``, ``end``, ``type``) with
+    offsets inside ``text`` is a labelled row; anything else, a type list such as
+    ``"PERSON, ORG"`` included, is not.
+    """
+    if value is None or not str(value).strip():
+        return None
+    try:
+        spans = json.loads(str(value))
+    except ValueError:
+        return None
+    if not isinstance(spans, list):
+        return None
+
+    checked = []
+    for span in spans:
+        if not isinstance(span, dict):
+            return None
+        start, end, kind = span.get("start"), span.get("end"), span.get("type")
+        if isinstance(start, bool) or isinstance(end, bool):
+            return None
+        if not isinstance(start, int) or not isinstance(end, int):
+            return None
+        if not 0 <= start < end <= len(text):
+            return None
+        if not isinstance(kind, str) or not kind.strip():
+            return None
+        if "text" in span and span["text"] != text[start:end]:
+            return None
+        checked.append({"text": text[start:end], "start": start, "end": end, "type": kind})
+
+    # In text order, and no two spans sharing a character.
+    for previous, current in zip(checked, checked[1:]):
+        if current["start"] < previous["end"]:
+            return None
+    return checked
+
+
+def ner_examples(dataset):
+    """``[(text, spans)]`` for an NER Dataset's annotated, non-holdout tasks.
+
+    The raw task text is kept: cleaning it would move every span's offsets.
+    """
+    tasks = (
+        AnnotationTask.query.filter_by(dataset_id=dataset.id, status="annotated", is_holdout=False)
+        .order_by(AnnotationTask.item_index)
+        .all()
+    )
+    return [(task.text, _stored_entities(task.annotation_label)) for task in tasks]
+
+
+def has_ner_examples(dataset):
+    """Whether an NER Dataset has an annotated, non-holdout task to learn from."""
+    return (
+        db.session.query(AnnotationTask.id)
+        .filter_by(dataset_id=dataset.id, status="annotated", is_holdout=False)
+        .first()
+        is not None
+    )
+
+
 def create_annotation_tasks(dataset):
     """Add a task for every row of ``dataset`` with text that has none; caller commits.
 
     A row the file labels starts labelled (``label_source = "file"``), so it trains
-    as before and a person can change it; a blank row is pending. NER files name
-    entity types, not spans, so every NER row is pending, the types kept as
-    ``file_label``. A Dataset with an active learning loop has its new tasks held
-    back as the loop drew them, and stops counting file labels on the side.
+    as before and a person can change it; a blank row is pending. An NER file's
+    ``entities`` cell may hold spans, in which case the row starts labelled too;
+    a cell naming entity types (``"PERSON, ORG"``) is not spans, so that row stays
+    pending with the types kept as ``file_label``. A Dataset with an active
+    learning loop has its new tasks held back as the loop drew them, and stops
+    counting file labels on the side.
     """
     if dataset.task_type not in QUEUED_TASK_TYPES:
         return
@@ -181,6 +250,7 @@ def create_annotation_tasks(dataset):
     label_name = dataset.label_column or LABEL_COLUMNS.get(dataset.task_type)
     label_column = _find_column(df, label_name) if label_name else None
     labels_rows = dataset.task_type in TRAINED_ON_LABELS
+    spans_rows = dataset.task_type in SPAN_TYPES
     existing = {task.item_index for task in dataset.annotation_tasks}
     config = dataset.al_config
     held_out = set(config.holdout_indices or []) if config else set()
@@ -189,16 +259,19 @@ def create_annotation_tasks(dataset):
     for position in rows_with_text(df, dataset):
         if position in existing:
             continue
+        text = str(df[text_column].iloc[position])
         file_label = _label_text(df[label_column].iloc[position]) if label_column is not None else None
-        labelled = labels_rows and file_label is not None
+        spans = _file_spans(file_label, text) if spans_rows else None
+        label = json.dumps(spans) if spans is not None else (file_label if labels_rows else None)
+        labelled = label is not None
         added_labelled = added_labelled or labelled
         db.session.add(
             AnnotationTask(
                 dataset_id=dataset.id,
                 item_index=int(position),
-                text=str(df[text_column].iloc[position]),
+                text=text,
                 status="annotated" if labelled else "pending",
-                annotation_label=file_label if labelled else None,
+                annotation_label=label if labelled else None,
                 label_source=FILE_LABEL_SOURCE if labelled else None,
                 file_label=file_label,
                 is_holdout=position in held_out,

@@ -1,8 +1,10 @@
 """A dataset on a project offers every row with text for annotation: blank rows
 to label, and rows the file labels as labelled tasks a person can change (#147)."""
 import io
+import json
 
 import pandas as pd
+import pytest
 
 from legal_ml_core import AnnotationTask, Dataset, Model, TrainingJob, db
 from legal_ml_core.compute.tasks import process_training_task
@@ -456,3 +458,52 @@ def test_an_ner_item_opens_with_the_files_types_as_a_hint(client, auth_headers, 
     assert opened["hint"] == "PERSON, ORG"
     assert opened["file_label"] == "PERSON, ORG"
     assert opened["label_source"] is None
+
+
+SPANS = [
+    {"text": "Smith", "start": 0, "end": 5, "type": "PERSON"},
+    {"text": "Acme", "start": 11, "end": 15, "type": "ORG"},
+]
+
+
+def test_ner_rows_with_json_spans_start_annotated(client, auth_headers, app, tmp_path):
+    # An imported NER row carries its spans in the entities cell: no work left.
+    _link_dataset(
+        app,
+        tmp_path,
+        {"text": ["Smith sued Acme.", "No entities here."], "entities": [json.dumps(SPANS), "[]"]},
+        task_type="ner",
+    )
+
+    body = _next(client, auth_headers)
+
+    assert body["task"] is None
+    assert body["stats"] == {"total": 2, "annotated": 2, "percentage": 100}
+    tasks = _tasks(client, auth_headers)
+    assert [(t["status"], t["label_source"], json.loads(t["annotation_label"])) for t in tasks] == [
+        ("annotated", "file", SPANS),
+        ("annotated", "file", []),
+    ]
+
+
+@pytest.mark.parametrize(
+    "entities",
+    [
+        "PERSON, ORG",
+        "not json",
+        '[{"start": 0, "end": 99, "type": "PERSON"}]',
+        '[{"start": 0, "end": 5, "type": "PERSON", "text": "Wrong"}]',
+        '[{"start": 0, "end": 5, "type": ""}]',
+        '[{"start": 0, "end": 5, "type": "PERSON"}, {"start": 3, "end": 8, "type": "ORG"}]',
+        '[{"start": 11, "end": 15, "type": "ORG"}, {"start": 0, "end": 5, "type": "PERSON"}]',
+        '[{"start": 0, "end": 5, "label": "PERSON"}]',
+    ],
+)
+def test_ner_entities_that_are_not_spans_stay_pending(client, auth_headers, app, tmp_path, entities):
+    _link_dataset(app, tmp_path, {"text": ["Smith sued Acme."], "entities": [entities]}, task_type="ner")
+
+    tasks = _tasks(client, auth_headers)
+
+    assert [(t["status"], t["annotation_label"], t["file_label"]) for t in tasks] == [
+        ("pending", None, entities)
+    ]
