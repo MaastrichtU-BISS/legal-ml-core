@@ -43,7 +43,11 @@ found by name and read exactly as written (never cleaned or lowercased); rows
 with a blank text or summary are skipped, and a Dataset with none left is
 refused. Runs report ROUGE-1, ROUGE-2 and ROUGE-L (0–1) on summaries written
 for up to 200 evaluation rows (`rouge_rows`), and prediction returns the
-written summary as `prediction`.
+written summary as `prediction`. ROUGE counts words in any alphabet (no
+stemming) and is scored on greedy summaries, while prediction uses beam
+search, so the summaries users get are usually a little better than the score
+suggests. Texts longer than `max_source_length` tokens are cut there for both
+training and prediction; a blank text gets an empty summary.
 
 An NER `entities` cell may hold the annotated spans as a JSON list, with
 character offsets into that row's `text` (`end` exclusive):

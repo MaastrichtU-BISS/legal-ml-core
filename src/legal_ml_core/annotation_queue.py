@@ -27,8 +27,9 @@ LABEL_COLUMNS = {
 # out of this set so the classification paths and active learning do not see it.
 TRAINED_ON_LABELS = {"classification", "document_classification", "judgment_prediction"}
 
-# Task types offered on the annotation screen. Summarization is left out: no
-# trainer reads the summary column, so a summary written there would go nowhere.
+# Task types offered on the annotation screen. Summarization is left out: its
+# trainer reads the summary column straight from the file, and the annotation
+# screen has no place to write a summary.
 QUEUED_TASK_TYPES = TRAINED_ON_LABELS | {"ner", "named_entity_recognition"}
 
 # Label sources an LLM had a hand in. Holdout metrics rest on human labels only.
@@ -323,7 +324,11 @@ def summarization_examples(file_path, dataset=None):
     if text_column is None or summary_column is None:
         raise ValueError("A summarization Dataset needs a text column and a summary column.")
     keep = ~_is_blank(df[text_column]) & ~_is_blank(df[summary_column])
-    return list(zip(df.loc[keep, text_column], df.loc[keep, summary_column]))
+    # A JSON file keeps numbers as numbers; the model reads text.
+    return [
+        (str(text), str(summary))
+        for text, summary in zip(df.loc[keep, text_column], df.loc[keep, summary_column])
+    ]
 
 
 def has_summarization_examples(dataset):

@@ -1,5 +1,6 @@
 import json
 import random
+import re
 import time
 import warnings
 
@@ -156,6 +157,13 @@ def _split(X, labels, test_size):
 # How many windows of one text go through the model at once: a long judgment
 # can be dozens of windows, and one pass over all of them can exhaust memory.
 PREDICTION_WINDOW_BATCH = 8
+
+class _UnicodeWords:
+    """A rouge-score tokenizer that keeps words in any alphabet, lowercased."""
+
+    def tokenize(self, text):
+        return re.findall(r"\w+", (text or "").lower())
+
 
 # How many evaluation rows a summarization run scores with ROUGE at most: each
 # row costs a generation (a forward pass per token), so a large evaluation
@@ -1190,7 +1198,12 @@ class MLModelTrainer:
         if len(eval_rows) > ROUGE_MAX_ROWS:
             scored_rows = random.Random(42).sample(eval_rows, ROUGE_MAX_ROWS)
         generated = generated_summaries(hf_model, scored_rows)
-        scorer = rouge_scorer.RougeScorer(["rouge1", "rouge2", "rougeL"], use_stemmer=True)
+        # rouge-score's own tokenizer keeps only ASCII letters and digits, so a
+        # Greek or Bulgarian Dataset would always score 0, and its stemmer is
+        # English: words are any Unicode word characters, unstemmed.
+        scorer = rouge_scorer.RougeScorer(
+            ["rouge1", "rouge2", "rougeL"], use_stemmer=False, tokenizer=_UnicodeWords()
+        )
         totals = {"rouge1": 0.0, "rouge2": 0.0, "rougeL": 0.0}
         for (_, reference), summary in zip(scored_rows, generated):
             scores = scorer.score(reference, summary)

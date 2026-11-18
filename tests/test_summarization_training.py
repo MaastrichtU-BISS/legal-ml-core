@@ -207,3 +207,69 @@ def test_explanations_and_export_refuse_summary_models(client, auth_headers, app
             {"model_id": model_id, "model_type": "t5_small", "texts": ["A text"]},
             app.config["MODEL_FOLDER"],
         )
+
+
+def _tiny_t5(path):
+    """A one-layer T5 sharing the char-level tokenizer, so the T5 path (and its
+    ``summarize: `` prefix) runs without a download."""
+    from transformers import AutoTokenizer, T5Config, T5ForConditionalGeneration
+
+    _tiny_seq2seq(path)  # writes the tokenizer (and a BART we replace)
+    tokenizer = AutoTokenizer.from_pretrained(str(path))
+    config = T5Config(
+        vocab_size=len(tokenizer),
+        d_model=16,
+        d_kv=8,
+        d_ff=32,
+        num_layers=1,
+        num_decoder_layers=1,
+        num_heads=2,
+        pad_token_id=tokenizer.pad_token_id,
+        eos_token_id=tokenizer.eos_token_id,
+        decoder_start_token_id=tokenizer.pad_token_id,
+    )
+    T5ForConditionalGeneration(config).save_pretrained(path)
+    return str(path)
+
+
+def test_a_t5_model_trains_and_predicts_with_its_prefix(client, auth_headers, app, fake_redis, tmp_path):
+    dataset_id = _summary_dataset(app, tmp_path, ROWS)
+    created = _create(client, auth_headers, dataset_id)
+    model_id = created.get_json()["model"]["id"]
+    client.post(f"/api/models/{model_id}/train", json={}, headers=auth_headers)
+    task = json.loads(fake_redis.rpop("training_queue"))
+    model_dir = tmp_path / "tiny-t5"
+    model_dir.mkdir()
+    task["parameters"]["model_name"] = _tiny_t5(model_dir)
+
+    process_training_task(task, fake_redis, app.config["MODEL_FOLDER"])
+    job = db.session.get(TrainingJob, task["job_id"])
+
+    assert job.status == "completed", job.error_message
+    bundle = joblib.load(get_model_path(app.config["MODEL_FOLDER"], model_id))
+    assert bundle["prefix"] == "summarize: "
+    result = process_prediction_task(
+        {"prediction_id": "p", "model_id": model_id, "model_type": "t5_small", "texts": ["The appeal failed.", "  "]},
+        app.config["MODEL_FOLDER"],
+    )
+    assert isinstance(result["predictions"][0]["prediction"], str)
+    assert result["predictions"][1]["prediction"] == ""
+
+
+def test_numbers_in_a_json_file_are_read_as_text(tmp_path):
+    from legal_ml_core.annotation_queue import summarization_examples
+
+    path = tmp_path / "rows.json"
+    pd.DataFrame({"text": [12345, "A text"], "summary": ["num", 7]}).to_json(path, orient="records")
+
+    assert summarization_examples(str(path)) == [("12345", "num"), ("A text", "7")]
+
+
+def test_rouge_counts_words_in_any_alphabet():
+    from rouge_score import rouge_scorer
+
+    from legal_ml_core.compute.trainer import _UnicodeWords
+
+    scorer = rouge_scorer.RougeScorer(["rouge1"], use_stemmer=False, tokenizer=_UnicodeWords())
+    assert scorer.score("Το δικαστήριο αποφάσισε", "Το δικαστήριο αποφάσισε")["rouge1"].fmeasure == 1.0
+    assert scorer.score("Überprüfung des Vertrags", "überprüfung des vertrags")["rouge1"].fmeasure == 1.0

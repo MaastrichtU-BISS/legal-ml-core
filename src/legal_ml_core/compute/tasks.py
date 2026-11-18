@@ -689,8 +689,13 @@ def process_prediction_task(task_info, model_storage_path):
 
         # The raw texts, as the model was trained on them (never cleaned), a
         # few at a time: beam search over long documents is the heaviest pass.
-        for first in range(0, len(texts), PREDICTION_WINDOW_BATCH):
-            batch = texts[first : first + PREDICTION_WINDOW_BATCH]
+        summaries = {}
+        # A blank text has nothing to summarise: it gets an empty summary rather
+        # than one the model invents from the prefix alone.
+        written = [index for index, text in enumerate(texts) if str(text or "").strip()]
+        for first in range(0, len(written), PREDICTION_WINDOW_BATCH):
+            indexes = written[first : first + PREDICTION_WINDOW_BATCH]
+            batch = [texts[index] for index in indexes]
             inputs = tokenizer(
                 [prefix + text for text in batch],
                 return_tensors="pt",
@@ -700,8 +705,10 @@ def process_prediction_task(task_info, model_storage_path):
             ).to(device)
             with torch.no_grad():
                 outputs = clf.generate(**inputs, max_new_tokens=max_target_length, num_beams=4)
-            for text, summary in zip(batch, tokenizer.batch_decode(outputs, skip_special_tokens=True)):
-                predictions.append({"text": text, "prediction": summary.strip()})
+            for index, summary in zip(indexes, tokenizer.batch_decode(outputs, skip_special_tokens=True)):
+                summaries[index] = summary.strip()
+        for index, text in enumerate(texts):
+            predictions.append({"text": text, "prediction": summaries.get(index, "")})
     elif model_type in ("legalbert", "roberta"):
         import torch
 
