@@ -8,6 +8,15 @@ While the version is 0.x, minor releases may contain breaking changes.
 
 ## [Unreleased]
 
+## [0.15.0] - 2026-11-17
+
+### Added
+
+- `GET /api/datasets/limits` returns `{"max_rows": n}`: the row cap a new
+  dataset meets (the host's `LEGAL_ML_MAX_ROWS`, else 1000), read on each call
+  and public like the task types, so upload copy can show the cap an admin set
+  (reducing_digital_divide #118).
+
 ## [0.14.1] - 2026-11-17
 
 ### Added
@@ -526,7 +535,8 @@ version was not tagged; it corresponds to commit `02c5b61`.
 - Worker foreign-key resolution and the missing `psycopg2` dependency.
 - Model/task compatibility checks, live progress and failure reasons.
 
-[Unreleased]: https://github.com/shashankmc/legal-ml-core/compare/v0.14.1...HEAD
+[Unreleased]: https://github.com/shashankmc/legal-ml-core/compare/v0.15.0...HEAD
+[0.15.0]: https://github.com/shashankmc/legal-ml-core/compare/v0.14.1...v0.15.0
 [0.14.1]: https://github.com/shashankmc/legal-ml-core/compare/v0.14.0...v0.14.1
 [0.14.0]: https://github.com/shashankmc/legal-ml-core/compare/v0.13.0...v0.14.0
 [0.13.0]: https://github.com/shashankmc/legal-ml-core/compare/v0.12.1...v0.13.0

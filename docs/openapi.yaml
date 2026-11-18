@@ -170,6 +170,25 @@ paths:
                   task_types:
                     type: array
                     items: { $ref: "#/components/schemas/TaskType" }
+  /api/datasets/limits:
+    get:
+      tags: [datasets]
+      summary: The row cap a new dataset meets (public)
+      description: >
+        The host's LEGAL_ML_MAX_ROWS (or 1000), read on each call, so a cap an
+        admin changes shows at once.
+      operationId: getDatasetLimits
+      security: []
+      responses:
+        "200":
+          description: Limits
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [max_rows]
+                properties:
+                  max_rows: { type: integer, minimum: 1 }
   /api/datasets/{dataset_id}:
     parameters:
       - $ref: "#/components/parameters/DatasetId"
