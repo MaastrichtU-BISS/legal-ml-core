@@ -2,7 +2,12 @@ from flask import Blueprint, request, jsonify, current_app
 from ..auth import jwt_required, get_jwt_identity
 from ..db import db
 from ..active_learning.loop import training_refusal
-from ..annotation_queue import apply_saved_annotations, ensure_dataset_tasks, has_ner_examples
+from ..annotation_queue import (
+    apply_saved_annotations,
+    ensure_dataset_tasks,
+    has_ner_examples,
+    has_summarization_examples,
+)
 from ..annotation_format import SPAN_TYPES
 from ..models import ALRound, Model, Dataset, TrainingJob
 from ..db_utils import project_belongs_to_owner
@@ -36,6 +41,9 @@ CLASS_WEIGHT_PARAMETER = {
 
 # Token-classification models, whose predictions find spans rather than one label.
 TOKEN_CLASSIFICATION_MODELS = {"legalbert_ner", "distilbert_ner"}
+
+# Seq2seq models, whose prediction writes a summary rather than one label.
+SUMMARIZATION_MODELS = {"t5_small"}
 
 # Model types whose prediction loads a transformer, so it gets the longer wait.
 TRANSFORMER_PREDICTION_MODELS = {"legalbert", "roberta"} | TOKEN_CLASSIFICATION_MODELS
@@ -614,6 +622,61 @@ AVAILABLE_MODELS = {
             },
         },
     },
+    "seq2seq": {
+        "t5_small": {
+            "name": "T5 small (summaries)",
+            "description": "A small text-to-text model fine-tuned to write summaries",
+            "parameters": {
+                "model_name": {
+                    "label": "Variant",
+                    "type": "select",
+                    "options": ["t5-small"],
+                    "default": "t5-small",
+                    "description": "T5 model size",
+                },
+                "max_source_length": {
+                    "label": "Maximum Document Length",
+                    "type": "int",
+                    "min": 128,
+                    "max": 1024,
+                    "default": 512,
+                    "description": "How much of each text the model reads",
+                },
+                "max_target_length": {
+                    "label": "Maximum Summary Length",
+                    "type": "int",
+                    "min": 32,
+                    "max": 256,
+                    "default": 128,
+                    "description": "How long the summaries it writes may be",
+                },
+                "learning_rate": {
+                    "label": "Learning Rate",
+                    "type": "float",
+                    "min": 1e-6,
+                    "max": 1e-2,
+                    "default": 3e-4,
+                    "description": "Learning rate",
+                },
+                "batch_size": {
+                    "label": "Batch Size",
+                    "type": "int",
+                    "min": 2,
+                    "max": 16,
+                    "default": 8,
+                    "description": "Training batch size",
+                },
+                "epochs": {
+                    "label": "Training Epochs",
+                    "type": "int",
+                    "min": 1,
+                    "max": 10,
+                    "default": 3,
+                    "description": "Number of training epochs",
+                },
+            },
+        },
+    },
 }
 
 
@@ -627,18 +690,22 @@ for _category, _models in AVAILABLE_MODELS.items():
 
 # Dataset task types whose training is not implemented in the worker yet. Kept
 # explicit so uploads/selection can explain the limitation instead of failing
-# silently at training time.
-UNSUPPORTED_TASK_TYPES = {"summarization"}
+# silently at training time. Empty since summarization trains t5_small, but the
+# checks that read it stay in place for a task type that slips past
+# _TASK_CATEGORIES (an upload the worker cannot train).
+UNSUPPORTED_TASK_TYPES = set()
 
 # Which model categories each dataset task type may use. Transformer models
 # (LegalBERT/RoBERTa) are supervised text classifiers, so they are offered for
-# every supervised text task; NER needs span models instead.
+# every supervised text task; NER needs span models and summarization a
+# text-to-text model.
 _TASK_CATEGORIES = {
     "classification": ["classification", "transformer"],
     "document_classification": ["classification", "transformer"],
     "judgment_prediction": ["classification", "transformer"],
     "ner": ["token_classification"],
     "named_entity_recognition": ["token_classification"],
+    "summarization": ["seq2seq"],
     "topic_modeling": ["topic_modeling", "clustering"],
     "clustering": ["clustering", "topic_modeling"],
 }
@@ -665,6 +732,7 @@ _CATEGORY_NEEDS = {
     "classification": "learns labels: it trains on Text Classification, Document Classification or Judgment Prediction Datasets.",
     "transformer": "learns labels: it trains on Text Classification, Document Classification or Judgment Prediction Datasets.",
     "token_classification": "finds named entities: it trains on Named Entity Recognition Datasets.",
+    "seq2seq": "writes summaries: it trains on Text Summarization Datasets.",
     "clustering": "groups texts without labels: it trains on Clustering or Topic modelling Datasets.",
     "topic_modeling": "finds topics in texts without labels: it trains on Topic modelling or Clustering Datasets.",
 }
@@ -705,6 +773,8 @@ def model_fit_refusal(model_type, dataset):
         return f"{name} {_CATEGORY_NEEDS[category]}"
     if category == "token_classification" and not has_ner_examples(dataset):
         return NO_ENTITIES_ADVICE
+    if category == "seq2seq" and not has_summarization_examples(dataset):
+        return NO_SUMMARIES_ADVICE
     shape = labels_not_categories(dataset) if category in _LEARNS_LABELS else None
     if shape:
         labelled, different = shape
@@ -724,6 +794,10 @@ NO_ENTITIES_ADVICE = (
     "Annotate some rows first: this Dataset has no labelled entities to learn from."
 )
 
+NO_SUMMARIES_ADVICE = (
+    "Add some summaries first: this Dataset has no rows with both a text and a summary to learn from."
+)
+
 
 def model_fit(dataset):
     """Every model, with whether it can train this Dataset and why not; and, when
@@ -740,6 +814,8 @@ def model_fit(dataset):
             advice = f"Training for {_task_label(task_type)} Datasets is not available yet."
         elif task_type in SPAN_TYPES and not has_ner_examples(dataset):
             advice = NO_ENTITIES_ADVICE
+        elif task_type == "summarization" and not has_summarization_examples(dataset):
+            advice = NO_SUMMARIES_ADVICE
         elif labels_not_categories(dataset):
             advice = NOT_CATEGORIES_ADVICE
     return {"models": models, "advice": advice}
@@ -939,6 +1015,9 @@ HEADLINE_SCORES = (
     "n_clusters",
     "n_topics",
     "perplexity",
+    "rouge1",
+    "rouge2",
+    "rougeL",
 )
 
 
@@ -1316,6 +1395,9 @@ def explain_model(model_id):
         if model.model_type in TOKEN_CLASSIFICATION_MODELS:
             return jsonify({"error": "Explanations are not available for entity models."}), 400
 
+        if model.model_type in SUMMARIZATION_MODELS:
+            return jsonify({"error": "Explanations are not available for summary models."}), 400
+
         # Generate unique explanation ID
         import uuid
 
@@ -1432,6 +1514,9 @@ def explain_model_batch(model_id):
         if model.model_type in TOKEN_CLASSIFICATION_MODELS:
             return jsonify({"error": "Explanations are not available for entity models."}), 400
 
+        if model.model_type in SUMMARIZATION_MODELS:
+            return jsonify({"error": "Explanations are not available for summary models."}), 400
+
         # Queue explanation tasks for each text
         import uuid
 
@@ -1505,7 +1590,14 @@ def predict(model_id):
             "owner_id": str(owner_id),
         }
 
-        timeout = 120 if model.model_type in TRANSFORMER_PREDICTION_MODELS else 30
+        # Writing a summary is a forward pass per generated token, and beam
+        # search multiplies that: the longest wait.
+        if model.model_type in SUMMARIZATION_MODELS:
+            timeout = 300
+        elif model.model_type in TRANSFORMER_PREDICTION_MODELS:
+            timeout = 120
+        else:
+            timeout = 30
 
         r = current_app.redis_client
         r.lpush(current_app.config.get("LEGAL_ML_PREDICTION_QUEUE", "prediction_queue"), json.dumps(task))

@@ -36,10 +36,19 @@ The catalogue is served by `GET /api/datasets/task-types` (source:
 | `clustering` | `text` | nothing (unsupervised) | yes |
 | `ner` | `text`, `entities` | entity spans as JSON, or the entity types (e.g. `PERSON, ORG`) | yes |
 | `named_entity_recognition` | `text`, `entities` | same as `ner` (alias) | yes |
-| `summarization` | `text`, `summary` | the target summary | not yet |
+| `summarization` | `text`, `summary` | the target summary | yes |
 
-"Not yet" task types can be uploaded, previewed, explored (EDA) and annotated,
-but training them returns 400.
+A summarization Dataset trains `t5_small` on its `text` and `summary` columns,
+found by name and read exactly as written (never cleaned or lowercased); rows
+with a blank text or summary are skipped, and a Dataset with none left is
+refused. Runs report ROUGE-1, ROUGE-2 and ROUGE-L (0–1) on summaries written
+for up to 200 evaluation rows (`rouge_rows`), and prediction returns the
+written summary as `prediction`. ROUGE counts words in any alphabet,
+combining marks included, after NFKC normalisation and case-folding (no
+stemming; scripts written without spaces count a run as one word) and is scored on greedy summaries, while prediction uses beam
+search, so the summaries users get are usually a little better than the score
+suggests. Texts longer than `max_source_length` tokens are cut there for both
+training and prediction; a blank text gets an empty summary.
 
 An NER `entities` cell may hold the annotated spans as a JSON list, with
 character offsets into that row's `text` (`end` exclusive):
@@ -81,11 +90,14 @@ Upload validation checks column *names*, but the trainer reads columns *by
 position* and reads the file as CSV. For a dataset you want to train on:
 
 1. Upload it as **CSV** (XLSX and JSON pass upload and EDA, but training reads
-   the stored file with `pandas.read_csv`).
+   the stored file with `pandas.read_csv`; summarization, below, is the
+   exception).
 2. Put the **text in the first column**, and for supervised tasks the
-   **label (`label`, `judgment`, `summary` or `entities`) in the second column**.
-   Extra columns after these are ignored. NER training reads the saved spans on
-   the Dataset's annotation tasks, so its raw text keeps its offsets.
+   **label (`label`, `judgment` or `entities`) in the second column**.
+   Extra columns after these are ignored. Two task types differ: NER training
+   reads the saved spans on the Dataset's annotation tasks, so its raw text
+   keeps its offsets, and summarization reads the `text` and `summary` columns
+   by name, from CSV, XLSX or JSON, exactly as written.
 
 ## Trained models
 
@@ -116,14 +128,16 @@ dict (`Trainer.save_model` in `src/legal_ml_core/compute/trainer.py`):
 
 | Key | Contents |
 |---|---|
-| `task` | `"ner"` for an entity model, else `None` |
-| `preprocessor` | the fitted `TextPreprocessor` (cleaning options used at training); `None` for entity models, which keep raw text |
+| `task` | `"ner"` for an entity model, `"summarization"` for a summary model, else `None` |
+| `preprocessor` | the fitted `TextPreprocessor` (cleaning options used at training); `None` for entity and summary models, which keep raw text |
 | `vectorizer` | fitted scikit-learn vectorizer, or `None` for transformers |
 | `model` | the scikit-learn estimator, or the fine-tuned HuggingFace model |
 | `label_encoder` | fitted `LabelEncoder` for supervised tasks, else `None` |
 | `tokenizer` | HuggingFace tokenizer for transformers and entity models, else `None` |
 | `label_list` | entity models only: the token labels, `O` first |
 | `max_length` | entity models only: the longest text the tokenizer reads |
+| `max_source_length`, `max_target_length` | summary models only: the longest text read and summary written, in tokens |
+| `prefix` | summary models only: the text put before each input (`"summarize: "` for T5, `""` otherwise) |
 
 Loading it needs Python with this package and its pinned dependencies
 installed (the preprocessor class lives in `legal_ml_core.compute`):

@@ -11,7 +11,12 @@ from flask import current_app
 
 from ..active_learning.scoring import queue_pool_scoring, verify_finished_model
 from ..annotation_format import SPAN_TYPES
-from ..annotation_queue import apply_saved_annotations, ensure_dataset_tasks, ner_examples
+from ..annotation_queue import (
+    apply_saved_annotations,
+    ensure_dataset_tasks,
+    ner_examples,
+    summarization_examples,
+)
 from ..db import db
 from ..job_state import ACTIVE_JOB_STATUSES, COULD_NOT_START_MESSAGE, transition
 from ..metric_groups import metric_group_for
@@ -31,6 +36,9 @@ REDIS_DOWN_ERRORS = (redis_lib.ConnectionError, redis_lib.TimeoutError)
 
 # Model types that fine-tune a token classifier instead of a text classifier.
 TOKEN_CLASSIFICATION_TYPES = ("legalbert_ner", "distilbert_ner")
+
+# Model types that fine-tune a text-to-text model instead of a classifier.
+SEQ2SEQ_TYPES = ("t5_small",)
 
 
 def merge_word_spans(text, word_ids, offsets, labels, scores):
@@ -331,15 +339,24 @@ def process_training_task(
         # Preprocess data. NER text is never cleaned: cleaning would move every
         # span's character offsets. A span task reads no file either: its
         # examples are the saved spans, and the CSV holds nothing it learns from.
+        # A summarization task reads the file itself, verbatim (NA, null and
+        # 00123 stay text) and uncleaned (a summary is text), by column name.
         span_task = (
             task_info["task_type"] in SPAN_TYPES
             and task_info["model_type"] in TOKEN_CLASSIFICATION_TYPES
+        )
+        seq2seq_task = (
+            task_info["task_type"] == "summarization"
+            and task_info["model_type"] in SEQ2SEQ_TYPES
         )
         if span_task:
             # The worker may write: an imported Dataset gets its tasks here,
             # before its spans are read.
             ensure_dataset_tasks(dataset)
             examples = ner_examples(dataset)
+            texts, labels, label_names = None, None, None
+        elif seq2seq_task:
+            examples = summarization_examples(task_info["dataset_path"], dataset)
             texts, labels, label_names = None, None, None
         else:
             df = pd.read_csv(task_info["dataset_path"])
@@ -362,6 +379,13 @@ def process_training_task(
             metrics = trainer.train_token_classification(
                 examples, task_info["model_type"], parameters
             )
+        elif seq2seq_task:
+            parameters["output_dir"] = get_storage_backend().get_transformer_output_dir(
+                model_storage_path, model_id
+            )
+            # Checks for a Stop between generation batches and raises
+            # TrainingCancelled itself, skipping the scoring pass.
+            metrics = trainer.train_seq2seq(examples, task_info["model_type"], parameters)
         elif task_info["model_type"] in ["legalbert", "roberta"]:
             parameters["output_dir"] = get_storage_backend().get_transformer_output_dir(
                 model_storage_path, model_id
@@ -649,6 +673,42 @@ def process_prediction_task(task_info, model_storage_path):
                 "entities": entities,
             })
 
+    elif model_type in SEQ2SEQ_TYPES:
+        import torch
+
+        tokenizer = model_data.get("tokenizer")
+        if tokenizer is None:
+            raise ValueError("Tokenizer not found in saved model")
+        prefix = model_data.get("prefix") or ""
+        max_source_length = int(model_data.get("max_source_length") or 512)
+        max_target_length = int(model_data.get("max_target_length") or 128)
+
+        clf.eval()
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        clf.to(device)
+
+        # The raw texts, as the model was trained on them (never cleaned), a
+        # few at a time: beam search over long documents is the heaviest pass.
+        summaries = {}
+        # A blank text has nothing to summarise: it gets an empty summary rather
+        # than one the model invents from the prefix alone.
+        written = [index for index, text in enumerate(texts) if text is not None and str(text).strip()]
+        for first in range(0, len(written), PREDICTION_WINDOW_BATCH):
+            indexes = written[first : first + PREDICTION_WINDOW_BATCH]
+            batch = [str(texts[index]) for index in indexes]
+            inputs = tokenizer(
+                [prefix + text for text in batch],
+                return_tensors="pt",
+                truncation=True,
+                padding=True,
+                max_length=max_source_length,
+            ).to(device)
+            with torch.no_grad():
+                outputs = clf.generate(**inputs, max_new_tokens=max_target_length, num_beams=4)
+            for index, summary in zip(indexes, tokenizer.batch_decode(outputs, skip_special_tokens=True)):
+                summaries[index] = summary.strip()
+        for index, text in enumerate(texts):
+            predictions.append({"text": text, "prediction": summaries.get(index, "")})
     elif model_type in ("legalbert", "roberta"):
         import torch
 
