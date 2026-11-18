@@ -596,3 +596,39 @@ def test_ner_entities_that_are_not_spans_stay_pending(client, auth_headers, app,
     assert [(t["status"], t["annotation_label"], t["file_label"]) for t in tasks] == [
         ("pending", None, entities)
     ]
+
+
+def test_a_json_files_span_lists_start_annotated(app, tmp_path):
+    # In a .json file the entities cell is a real JSON array, read as a list.
+    path = tmp_path / "rows.json"
+    pd.DataFrame({"text": ["Smith sued Acme."], "entities": [SPANS]}).to_json(path, orient="records")
+    dataset = Dataset(
+        owner_id=TEST_USER_ID, name="rows.json", file_path=str(path), row_count=1,
+        columns=[{"name": "text"}, {"name": "entities"}], task_type="ner",
+    )
+    db.session.add(dataset)
+    db.session.commit()
+
+    assert has_ner_examples(dataset) is True
+    create_annotation_tasks(dataset)
+    db.session.commit()
+
+    [task] = AnnotationTask.query.filter_by(dataset_id=dataset.id).all()
+    assert task.status == "annotated"
+    assert json.loads(task.annotation_label) == SPANS
+
+
+def test_making_a_classification_model_creates_no_tasks(client, auth_headers, app, tmp_path):
+    # Only NER datasets get their tasks when a Model is made.
+    dataset_id = _link_dataset(app, tmp_path, {"text": ["a", "b"], "label": ["x", "y"]})
+    db.session.get(Dataset, dataset_id).project_id = None
+    db.session.commit()
+
+    resp = client.post(
+        "/api/models/",
+        json={"name": "NB", "dataset_id": dataset_id, "model_type": "naive_bayes", "parameters": {}},
+        headers=auth_headers,
+    )
+
+    assert resp.status_code == 201, resp.get_json()
+    assert AnnotationTask.query.filter_by(dataset_id=dataset_id).count() == 0

@@ -22,7 +22,7 @@ from ..queue_contract import JOB_STATUS_TTL_SECONDS, is_cancel_requested, job_st
 from ..storage import get_storage_backend
 from ..system_metrics import log_system_readings
 from .explain import generate_lime_explanation, generate_shap_explanation
-from .trainer import MLModelTrainer, TrainingCancelled
+from .trainer import PREDICTION_WINDOW_BATCH, MLModelTrainer, TrainingCancelled
 
 logger = logging.getLogger(__name__)
 
@@ -601,9 +601,18 @@ def process_prediction_task(task_info, model_storage_path):
             )
             offsets = encoding.pop("offset_mapping")
             encoding.pop("overflow_to_sample_mapping")
-            inputs = {key: value.to(device) for key, value in encoding.items()}
-            with torch.no_grad():
-                logits = clf(**inputs).logits.cpu()
+            # A few windows at a time: a long judgment is dozens of windows, and
+            # one pass over all of them can exhaust memory.
+            chunks = []
+            windows = encoding["input_ids"].shape[0]
+            for first in range(0, windows, PREDICTION_WINDOW_BATCH):
+                inputs = {
+                    key: value[first:first + PREDICTION_WINDOW_BATCH].to(device)
+                    for key, value in encoding.items()
+                }
+                with torch.no_grad():
+                    chunks.append(clf(**inputs).logits.cpu())
+            logits = torch.cat(chunks)
 
             # One flat token stream over all the windows: merge_word_spans
             # reads each word from the first window that saw it, so a word two

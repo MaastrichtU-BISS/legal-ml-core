@@ -1043,19 +1043,19 @@ def create_model():
         if refusal:
             return jsonify(refusal), 400
 
-        # An imported NER Dataset's spans become tasks on this write path, so
-        # the run finds them: the fit check above only reads. This commits,
-        # before any write of the request's own, so a later refusal cannot
-        # half-commit them.
-        ensure_dataset_tasks(dataset)
-
         # Resolve project_id: explicit payload value takes precedence over dataset's project.
         # `Project` belongs to the host app, not this package, so existence is checked via
         # a direct query against the `projects` table rather than importing its ORM class.
         explicit_project_id = data.get("project_id")
+        if explicit_project_id and not project_belongs_to_owner(db.session, explicit_project_id, owner_id):
+            return jsonify({"error": "Project not found"}), 404
+
+        # An imported NER Dataset's spans become tasks on this write path, so
+        # the run finds them: the fit check above only reads. This commits,
+        # after the last refusal and before any write of the request's own.
+        ensure_dataset_tasks(dataset)
+
         if explicit_project_id:
-            if not project_belongs_to_owner(db.session, explicit_project_id, owner_id):
-                return jsonify({"error": "Project not found"}), 404
             resolved_project_id = explicit_project_id
             # A Dataset outside any Project joins the one its Model is made in, so
             # the Project shows both. One already filed elsewhere stays there.
@@ -1586,9 +1586,13 @@ def start_training_job(owner_id, model_id, data, al_round_id=None):
     # Creating an imported Dataset's tasks commits, which must happen before
     # the model row is locked: a commit inside the locked section would
     # release the lock, and a double-clicked Train could then start two jobs.
-    unlocked = Model.query.filter_by(id=model_id, owner_id=owner_id).first()
-    if unlocked is not None and unlocked.dataset_id:
-        ensure_dataset_tasks(db.session.get(Dataset, unlocked.dataset_id))
+    # Only the dataset id is read here, so no Model object is left in the
+    # session for the locked query below to hand back stale.
+    dataset_id = (
+        db.session.query(Model.dataset_id).filter_by(id=model_id, owner_id=owner_id).scalar()
+    )
+    if dataset_id:
+        ensure_dataset_tasks(db.session.get(Dataset, dataset_id))
 
     model, active = _lock_model_and_find_active_job(model_id, owner_id)
     if not model:

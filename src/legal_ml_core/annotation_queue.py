@@ -162,7 +162,10 @@ def _mark_all_rows_queued(dataset):
 
 
 def _label_text(value):
-    """A file's label as text, or None when blank; 1.0 read from a CSV reads as 1."""
+    """A file's label as text, or None when blank; 1.0 read from a CSV reads as 1.
+    A JSON file's span list arrives as a list and is kept as JSON."""
+    if isinstance(value, (list, tuple)):
+        return json.dumps(list(value))
     if value is None or (isinstance(value, float) and pd.isna(value)) or not str(value).strip():
         return None
     if isinstance(value, float) and value.is_integer():
@@ -178,12 +181,16 @@ def _file_spans(value, text):
     offsets inside ``text`` is a labelled row; anything else, a type list such as
     ``"PERSON, ORG"`` included, is not.
     """
-    if value is None or not str(value).strip():
+    if isinstance(value, (list, tuple)):
+        # A JSON file's cell is already a list, not JSON text.
+        spans = list(value)
+    elif value is None or not str(value).strip():
         return None
-    try:
-        spans = json.loads(str(value))
-    except ValueError:
-        return None
+    else:
+        try:
+            spans = json.loads(str(value))
+        except ValueError:
+            return None
     if not isinstance(spans, list):
         return None
 
@@ -216,7 +223,8 @@ def _checked_spans(value, text, dataset, position):
     when a cell that looks like spans does not fit the row's text. The warning
     names the dataset and the row, never the text."""
     spans = _file_spans(value, text)
-    if spans is None and str(value).strip().startswith("["):
+    looks_like_spans = isinstance(value, (list, tuple)) or str(value).strip().startswith("[")
+    if spans is None and looks_like_spans:
         logger.warning(
             "dataset %s row %s: entities cell looks like spans but does not fit the text",
             dataset.id,
@@ -248,7 +256,9 @@ def ensure_dataset_tasks(dataset):
     An imported NER Dataset's spans live in its file until its rows become
     tasks; ``has_ner_examples`` reads the file instead of creating them, so
     asking what a Dataset can train writes nothing."""
-    if dataset.task_type not in QUEUED_TASK_TYPES or _all_rows_queued(dataset):
+    # Only NER needs this: other task types' file labels train from the file
+    # itself, and their tasks are made when a project's queue is read.
+    if dataset is None or dataset.task_type not in SPAN_TYPES or _all_rows_queued(dataset):
         return
     create_annotation_tasks(dataset)
     try:

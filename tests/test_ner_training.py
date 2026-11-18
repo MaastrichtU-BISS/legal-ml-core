@@ -593,3 +593,14 @@ def test_an_entity_model_cannot_be_exported(client, auth_headers, app, fake_redi
             {"model_id": model_id, "model_type": "distilbert_ner", "texts": ["John Smith"]},
             app.config["MODEL_FOLDER"],
         )
+
+
+def test_a_one_row_dataset_says_it_was_scored_on_its_training_row(
+    client, auth_headers, app, fake_redis, tmp_path
+):
+    dataset_id = _ner_dataset_from(app, tmp_path, TEXTS[:1])
+
+    _, job = _train(client, auth_headers, app, fake_redis, dataset_id, tmp_path)
+
+    assert job.status == "completed", job.error_message
+    assert job.metrics["evaluated_on_training"] is True

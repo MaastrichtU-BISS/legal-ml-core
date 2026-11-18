@@ -152,6 +152,11 @@ def _split(X, labels, test_size):
         return train_test_split(X, labels, test_size=test_size, random_state=42)
 
 
+# How many windows of one text go through the model at once: a long judgment
+# can be dozens of windows, and one pass over all of them can exhaust memory.
+PREDICTION_WINDOW_BATCH = 8
+
+
 def word_labels(word_offsets, spans):
     """One BIO label per word: ``B-`` when the word enters a different span than
     the previous word was in (counted by span, so two adjacent spans of one type
@@ -894,6 +899,53 @@ class MLModelTrainer:
             ]
             return true_labels, predicted_labels
 
+        def row_sequences(model, eval_rows):
+            """Gold and predicted BIO labels per word, one sequence per row: each
+            word labelled by the first window that saw it (as prediction does),
+            the gold from the same spans over the whole row."""
+            model.eval()
+            device = next(model.parameters()).device
+            true_rows, predicted_rows = [], []
+            for text, spans in eval_rows:
+                encoding = tokenizer(
+                    text,
+                    truncation=True,
+                    max_length=max_length,
+                    stride=max(1, max_length // 4),
+                    return_overflowing_tokens=True,
+                    return_offsets_mapping=True,
+                    padding=True,
+                    return_tensors="pt",
+                )
+                offsets = encoding.pop("offset_mapping")
+                encoding.pop("overflow_to_sample_mapping", None)
+                word_span, word_label = {}, {}
+                windows = encoding["input_ids"].shape[0]
+                for first in range(0, windows, PREDICTION_WINDOW_BATCH):
+                    batch = {
+                        key: value[first:first + PREDICTION_WINDOW_BATCH].to(device)
+                        for key, value in encoding.items()
+                    }
+                    with torch.no_grad():
+                        logits = model(**batch).logits.cpu()
+                    for row_index in range(logits.shape[0]):
+                        window = first + row_index
+                        predicted = logits[row_index].argmax(-1).tolist()
+                        for word_id, (start, end), index in zip(
+                            encoding.word_ids(batch_index=window), offsets[window].tolist(), predicted
+                        ):
+                            if word_id is None or start == end:
+                                continue
+                            if word_id in word_span:
+                                word_span[word_id][1] = max(word_span[word_id][1], end)
+                            else:
+                                word_span[word_id] = [start, end]
+                                word_label[word_id] = label_list[index]
+                order = list(word_span)
+                true_rows.append(word_labels([tuple(word_span[w]) for w in order], spans))
+                predicted_rows.append([word_label[w] for w in order])
+            return true_rows, predicted_rows
+
         def no_entities(labels):
             """No entity in any sequence: seqeval cannot score two empty sides."""
             return not any(label != "O" for row in labels for label in row)
@@ -933,8 +985,9 @@ class MLModelTrainer:
         ):
             raise TrainingCancelled()
 
-        predictions = hf_trainer.predict(hf_trainer.eval_dataset)
-        true_labels, predicted_labels = sequences(predictions.predictions, predictions.label_ids)
+        # Scored per row, not per window: overlapping windows repeat words, and
+        # an entity cut by a window edge would otherwise count twice.
+        true_labels, predicted_labels = row_sequences(hf_model, eval_rows)
         metrics = {
             "f1_score": float(entity_f1(true_labels, predicted_labels, average="micro", zero_division=0)),
             "precision": float(entity_precision(true_labels, predicted_labels, average="micro", zero_division=0)),
