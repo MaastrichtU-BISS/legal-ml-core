@@ -10,7 +10,8 @@ import redis as redis_lib
 from flask import current_app
 
 from ..active_learning.scoring import queue_pool_scoring, verify_finished_model
-from ..annotation_queue import apply_saved_annotations
+from ..annotation_format import SPAN_TYPES
+from ..annotation_queue import apply_saved_annotations, ensure_dataset_tasks, ner_examples
 from ..db import db
 from ..job_state import ACTIVE_JOB_STATUSES, COULD_NOT_START_MESSAGE, transition
 from ..metric_groups import metric_group_for
@@ -21,12 +22,52 @@ from ..queue_contract import JOB_STATUS_TTL_SECONDS, is_cancel_requested, job_st
 from ..storage import get_storage_backend
 from ..system_metrics import log_system_readings
 from .explain import generate_lime_explanation, generate_shap_explanation
-from .trainer import MLModelTrainer, TrainingCancelled
+from .trainer import PREDICTION_WINDOW_BATCH, MLModelTrainer, TrainingCancelled
 
 logger = logging.getLogger(__name__)
 
 # Redis being unreachable (vs. a bad command): reported as a retryable failure.
 REDIS_DOWN_ERRORS = (redis_lib.ConnectionError, redis_lib.TimeoutError)
+
+# Model types that fine-tune a token classifier instead of a text classifier.
+TOKEN_CLASSIFICATION_TYPES = ("legalbert_ner", "distilbert_ner")
+
+
+def merge_word_spans(text, word_ids, offsets, labels, scores):
+    """Merge token predictions into whole-word entity spans, in character
+    offsets into ``text``.
+
+    Every token carries its word's number, and the number repeats across the
+    overlapping windows an over-long text is predicted in; so a word's label is
+    its first sub-token's — from the first window that saw the word — while the
+    span reaches the end of the word's last sub-token, wherever a later window
+    saw the rest of it. A continuation piece's own label is ignored. A ``B-``
+    label starts a span; an ``I-`` continues an open span of its type and starts
+    one when none is open; ``O`` closes.
+    """
+    words = {}  # word id -> [label, score, start, end], in first-seen (text) order
+    for word_id, (start, end), label, score in zip(word_ids, offsets, labels, scores):
+        if word_id is None or start == end:  # special and padding tokens
+            continue
+        if word_id in words:
+            words[word_id][3] = max(words[word_id][3], end)
+        else:
+            words[word_id] = [label, score, start, end]
+
+    spans = []
+    current = None
+    for label, score, start, end in words.values():
+        if label == "O":
+            current = None
+            continue
+        prefix, _, kind = label.partition("-")
+        if prefix == "B" or current is None or current["type"] != kind:
+            current = {"start": start, "end": end, "type": kind, "scores": [score]}
+            spans.append(current)
+        else:
+            current["end"] = max(current["end"], end)
+            current["scores"].append(score)
+    return spans
 
 
 class MetricLogger:
@@ -278,8 +319,7 @@ def process_training_task(
         reached("preprocessing_started")
 
         # Load dataset
-        df = pd.read_csv(task_info["dataset_path"])
-        df = apply_saved_annotations(df, db.session.get(Dataset, task_info["dataset_id"]))
+        dataset = db.session.get(Dataset, task_info["dataset_id"])
 
         # Initialize trainer
         trainer = trainer_factory(
@@ -288,10 +328,25 @@ def process_training_task(
             cancel_check=cancel_requested,
         )
 
-        # Preprocess data
-        texts, labels, label_names = trainer.preprocess_data(
-            df, task_info["task_type"], task_info.get("preprocessing_options", {})
+        # Preprocess data. NER text is never cleaned: cleaning would move every
+        # span's character offsets. A span task reads no file either: its
+        # examples are the saved spans, and the CSV holds nothing it learns from.
+        span_task = (
+            task_info["task_type"] in SPAN_TYPES
+            and task_info["model_type"] in TOKEN_CLASSIFICATION_TYPES
         )
+        if span_task:
+            # The worker may write: an imported Dataset gets its tasks here,
+            # before its spans are read.
+            ensure_dataset_tasks(dataset)
+            examples = ner_examples(dataset)
+            texts, labels, label_names = None, None, None
+        else:
+            df = pd.read_csv(task_info["dataset_path"])
+            df = apply_saved_annotations(df, dataset)
+            texts, labels, label_names = trainer.preprocess_data(
+                df, task_info["task_type"], task_info.get("preprocessing_options", {})
+            )
         checkpoint()
 
         set_live({"status": "running", "progress": 25})
@@ -300,7 +355,14 @@ def process_training_task(
 
         # Train model based on task type
         parameters = _chosen_parameters(task_info, monitoring)
-        if task_info["model_type"] in ["legalbert", "roberta"]:
+        if span_task:
+            parameters["output_dir"] = get_storage_backend().get_transformer_output_dir(
+                model_storage_path, model_id
+            )
+            metrics = trainer.train_token_classification(
+                examples, task_info["model_type"], parameters
+            )
+        elif task_info["model_type"] in ["legalbert", "roberta"]:
             parameters["output_dir"] = get_storage_backend().get_transformer_output_dir(
                 model_storage_path, model_id
             )
@@ -508,6 +570,83 @@ def process_prediction_task(task_info, model_storage_path):
                 "prediction": f"Topic {dominant}",
                 "dominant_topic": dominant,
                 "topic_weights": [round(float(w), 4) for w in weights],
+            })
+
+    elif model_type in TOKEN_CLASSIFICATION_TYPES:
+        import torch
+
+        tokenizer = model_data.get("tokenizer")
+        label_list = model_data.get("label_list")
+        if tokenizer is None or not label_list:
+            raise ValueError("Tokenizer or entity labels not found in saved model")
+        max_length = int(model_data.get("max_length") or 256)
+
+        clf.eval()
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        clf.to(device)
+
+        for text in texts:
+            # An over-long text is predicted in overlapping windows of the
+            # training-time max_length, not cut: the stride keeps every word
+            # whole in at least one window, so nothing past a cut is lost.
+            encoding = tokenizer(
+                text,
+                return_tensors="pt",
+                truncation=True,
+                max_length=max_length,
+                stride=max(1, max_length // 4),
+                padding=True,
+                return_overflowing_tokens=True,
+                return_offsets_mapping=True,
+            )
+            offsets = encoding.pop("offset_mapping")
+            encoding.pop("overflow_to_sample_mapping")
+            # A few windows at a time: a long judgment is dozens of windows, and
+            # one pass over all of them can exhaust memory.
+            chunks = []
+            windows = encoding["input_ids"].shape[0]
+            for first in range(0, windows, PREDICTION_WINDOW_BATCH):
+                inputs = {
+                    key: value[first:first + PREDICTION_WINDOW_BATCH].to(device)
+                    for key, value in encoding.items()
+                }
+                with torch.no_grad():
+                    chunks.append(clf(**inputs).logits.cpu())
+            logits = torch.cat(chunks)
+
+            # One flat token stream over all the windows: merge_word_spans
+            # reads each word from the first window that saw it, so a word two
+            # windows both covered is counted once.
+            word_ids, token_offsets, labels, scores = [], [], [], []
+            for window in range(len(encoding["input_ids"])):
+                predicted = logits[window].argmax(-1).tolist()
+                window_scores = torch.softmax(logits[window], dim=-1).tolist()
+                for word_id, (start, end), index, token_scores in zip(
+                    encoding.word_ids(batch_index=window),
+                    offsets[window].tolist(),
+                    predicted,
+                    window_scores,
+                ):
+                    word_ids.append(word_id)
+                    token_offsets.append((start, end))
+                    labels.append(label_list[index])
+                    scores.append(token_scores[index])
+
+            entities = [
+                {
+                    "start": span["start"],
+                    "end": span["end"],
+                    "type": span["type"],
+                    "text": text[span["start"]:span["end"]],
+                    "score": round(sum(span["scores"]) / len(span["scores"]), 4),
+                }
+                for span in merge_word_spans(text, word_ids, token_offsets, labels, scores)
+            ]
+            types = list(dict.fromkeys(entity["type"] for entity in entities))
+            predictions.append({
+                "text": text,
+                "prediction": ", ".join(types),
+                "entities": entities,
             })
 
     elif model_type in ("legalbert", "roberta"):

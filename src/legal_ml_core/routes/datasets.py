@@ -86,11 +86,11 @@ TASK_TYPES = [
             "classification: the output marks entities, not the row."
         ),
         "label_meaning": (
-            "Entity types per span (e.g. PERSON, ORG, DATE), stored in the "
-            "'entities' column."
+            "Entity spans in the 'entities' column, as JSON with character "
+            "offsets and a type (e.g. PERSON, ORG, DATE) per span."
         ),
         "required_columns": ["text", "entities"],
-        "example": 'text="John Smith v. ABC Corp", entities="PERSON, ORG"',
+        "example": 'text="John Smith v. ABC Corp", entities=\'[{"text": "John Smith", "start": 0, "end": 10, "type": "PERSON"}]\'',
     },
     {
         "value": "named_entity_recognition",

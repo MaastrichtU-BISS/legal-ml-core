@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "legal-ml-core"
-version = "0.15.0"
+version = "0.16.0"
 description = "Core ML feature (datasets, training, prediction, visualization, EDA, annotation, experiment monitoring, summarization) for BAIGLE-style legal-ML apps — Flask blueprints, SQLAlchemy models, and the training/prediction/explanation compute engine, shared between the API process and the worker process."
 readme = "README.md"
 license = { text = "MIT" }
@@ -54,6 +54,7 @@ compute = [
     "spacy>=3.7,<4",
     "nltk>=3.8,<4",
     "sumy>=0.11,<1",  # extractive summarisation (compute/summarization.py)
+    "seqeval>=1.2,<2",  # span-level precision, recall and F1 for NER
     "lime>=0.2.0",
     "shap>=0.43",
     "skops>=0.10",  # publishing exports scikit-learn Models as skops (compute/export.py)

@@ -9,6 +9,7 @@ import pytest
 from transformers import BertConfig, BertForSequenceClassification, BertTokenizerFast
 
 from legal_ml_core import Dataset, Model, TrainingJob, db
+from legal_ml_core.annotation_queue import create_annotation_tasks
 from legal_ml_core.compute.tasks import process_training_task
 from legal_ml_core.routes.models import AVAILABLE_MODELS, parameter_refusal
 from tests.conftest import TEST_USER_ID
@@ -23,6 +24,24 @@ DOCUMENTS = [
 ]
 TWO_LABELS = ["civil", "criminal"] * 15
 THREE_LABELS = ["civil", "criminal", "family"] * 10
+NER_TEXTS = [
+    "John Smith works for Acme Corp.",
+    "Maria Garcia sued Acme Corp in Paris.",
+    "The court heard John Smith in Paris.",
+    "Acme Corp hired Maria Garcia.",
+    "Paris is where Acme Corp met John Smith.",
+    "Maria Garcia works for Acme Corp in Paris.",
+]
+NER_ENTITIES = {"John Smith": "PERSON", "Maria Garcia": "PERSON", "Acme Corp": "ORG", "Paris": "LOC"}
+
+
+def _spans(text):
+    spans = []
+    for needle, kind in NER_ENTITIES.items():
+        start = text.find(needle)
+        if start >= 0:
+            spans.append({"text": needle, "start": start, "end": start + len(needle), "type": kind})
+    return sorted(spans, key=lambda span: span["start"])
 
 
 def _dataset(app, tmp_path, task_type, labels, documents=None):
@@ -43,11 +62,33 @@ def _dataset(app, tmp_path, task_type, labels, documents=None):
         return dataset.id
 
 
+def _ner_dataset(app, tmp_path):
+    path = tmp_path / "ner.csv"
+    pd.DataFrame(
+        {"text": NER_TEXTS, "entities": [json.dumps(_spans(text)) for text in NER_TEXTS]}
+    ).to_csv(path, index=False)
+    with app.app_context():
+        dataset = Dataset(
+            owner_id=TEST_USER_ID,
+            name="NER",
+            file_path=str(path),
+            row_count=len(NER_TEXTS),
+            columns=[],
+            task_type="ner",
+        )
+        db.session.add(dataset)
+        db.session.commit()
+        create_annotation_tasks(dataset)
+        db.session.commit()
+        return dataset.id
+
+
 @pytest.fixture
 def datasets(app, tmp_path):
     return {
         "classification": _dataset(app, tmp_path, "classification", TWO_LABELS),
         "transformer": _dataset(app, tmp_path, "classification", TWO_LABELS),
+        "token_classification": _ner_dataset(app, tmp_path),
         "clustering": _dataset(app, tmp_path, "clustering", ["x"] * 30),
         "topic_modeling": _dataset(app, tmp_path, "topic_modeling", ["x"] * 30),
     }
@@ -139,12 +180,40 @@ def tiny_bert(tmp_path):
     return str(path)
 
 
+@pytest.fixture
+def tiny_bert_ner(tmp_path):
+    """Stands in for a download for the entity models."""
+    from transformers import BertConfig, BertForTokenClassification, BertTokenizerFast
+
+    words = sorted({word.strip(".,") for text in NER_TEXTS for word in text.split()})
+    path = tmp_path / "bert-ner"
+    path.mkdir()
+    vocab = path / "vocab.txt"
+    vocab.write_text("\n".join(["[PAD]", "[UNK]", "[CLS]", "[SEP]", "[MASK]", *words]))
+    BertTokenizerFast(vocab_file=str(vocab)).save_pretrained(path)
+    config = BertConfig(
+        vocab_size=5 + len(words),
+        hidden_size=8,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        intermediate_size=8,
+        num_labels=7,
+    )
+    BertForTokenClassification(config).save_pretrained(path)
+    return str(path)
+
+
 @pytest.mark.parametrize("case", SWEEP)
 def test_every_offered_value_trains_or_is_refused_at_creation(
-    client, auth_headers, app, fake_redis, datasets, tiny_bert, case
+    client, auth_headers, app, fake_redis, datasets, tiny_bert, tiny_bert_ner, case
 ):
     category, model_type, chosen = json.loads(case)
-    download = tiny_bert if category == "transformer" else None
+    if category == "transformer":
+        download = tiny_bert
+    elif category == "token_classification":
+        download = tiny_bert_ner
+    else:
+        download = None
 
     refusal = _train_or_refuse(
         client, auth_headers, app, fake_redis, datasets[category], model_type, chosen, swap_download=download
@@ -565,6 +634,16 @@ REFUSALS = [
     ("roberta", "learning_rate", "Learning Rate must be between 0.000001 and 0.01."),
     ("roberta", "batch_size", "Batch Size must be between 4 and 32."),
     ("roberta", "epochs", "Training Epochs must be between 1 and 10."),
+    ("legalbert_ner", "model_name", "Variant must be one of: nlpaueb/legal-bert-base-uncased."),
+    ("legalbert_ner", "max_length", "Maximum Document Length must be between 128 and 512."),
+    ("legalbert_ner", "learning_rate", "Learning Rate must be between 0.000001 and 0.01."),
+    ("legalbert_ner", "batch_size", "Batch Size must be between 4 and 32."),
+    ("legalbert_ner", "epochs", "Training Epochs must be between 1 and 10."),
+    ("distilbert_ner", "model_name", "Variant must be one of: distilbert-base-cased."),
+    ("distilbert_ner", "max_length", "Maximum Document Length must be between 128 and 512."),
+    ("distilbert_ner", "learning_rate", "Learning Rate must be between 0.000001 and 0.01."),
+    ("distilbert_ner", "batch_size", "Batch Size must be between 4 and 32."),
+    ("distilbert_ner", "epochs", "Training Epochs must be between 1 and 10."),
 ]
 
 

@@ -139,7 +139,6 @@ LEARNING_CURVE_FRACTIONS = (0.1, 0.25, 0.5, 0.75, 1.0)
 LOSS_POINTS = 12
 
 
-
 def _split(X, labels, test_size):
     """Train/test split that keeps each label's share when it can.
 
@@ -152,6 +151,35 @@ def _split(X, labels, test_size):
     except ValueError:
         return train_test_split(X, labels, test_size=test_size, random_state=42)
 
+
+# How many windows of one text go through the model at once: a long judgment
+# can be dozens of windows, and one pass over all of them can exhaust memory.
+PREDICTION_WINDOW_BATCH = 8
+
+
+def word_labels(word_offsets, spans):
+    """One BIO label per word: ``B-`` when the word enters a different span than
+    the previous word was in (counted by span, so two adjacent spans of one type
+    each begin their own), ``I-`` while the word stays in that span, ``O``
+    outside every span. A word overlapping a span counts as in it, even when the
+    span starts on a leading space or in the middle of the word."""
+    labels = []
+    previous = None
+    for start, end in word_offsets:
+        index = None
+        for position, span in enumerate(spans):
+            if start < span["end"] and end > span["start"]:
+                index = position
+                break
+        if index is None:
+            labels.append("O")
+        elif index == previous:
+            labels.append(f"I-{spans[index]['type']}")
+        else:
+            labels.append(f"B-{spans[index]['type']}")
+        previous = index
+    return labels
+
 class MLModelTrainer:
     def __init__(self, redis_client, metric_logger=None, cancel_check=None):
         self.redis_client = redis_client
@@ -162,6 +190,10 @@ class MLModelTrainer:
         self.vectorizer = None
         self.model = None
         self.label_encoder = None
+        # Set by train_token_classification, for the saved bundle.
+        self.task = None
+        self.label_list = None
+        self.max_length = None
 
     def preprocess_data(self, df, task_type, preprocessing_options):
         self.preprocessor = TextPreprocessor(preprocessing_options)
@@ -720,12 +752,304 @@ class MLModelTrainer:
         self.tokenizer = tokenizer
         return metrics
 
+    def train_token_classification(self, examples, model_type, parameters):
+        """Fine-tune a token classifier on ``[(text, spans)]``; spans are the
+        stored NER entities, with character offsets into the raw text."""
+        if not any(spans for _, spans in examples):
+            raise ValueError("This Dataset has no labelled entities to learn from.")
+
+        import torch
+        from seqeval.metrics import (
+            classification_report as entity_report,
+            f1_score as entity_f1,
+            precision_score as entity_precision,
+            recall_score as entity_recall,
+        )
+        from torch.utils.data import Dataset as TorchDataset
+        from transformers import (
+            AutoModelForTokenClassification,
+            AutoTokenizer,
+            DataCollatorForTokenClassification,
+            Trainer,
+            TrainingArguments,
+        )
+
+        defaults = {
+            "legalbert_ner": "nlpaueb/legal-bert-base-uncased",
+            "distilbert_ner": "distilbert-base-cased",
+        }
+        model_name = parameters.get("model_name", defaults[model_type])
+        max_length = int(parameters.get("max_length", 256))
+        learning_rate = float(parameters.get("learning_rate", 5e-5))
+        batch_size = int(parameters.get("batch_size", 8))
+        epochs = int(parameters.get("epochs", 3))
+        test_size = float(parameters.get("test_size", 0.2))
+
+        entity_types = sorted({span["type"] for _, spans in examples for span in spans})
+        label_list = ["O"] + sorted(
+            f"{prefix}-{kind}" for kind in entity_types for prefix in ("B", "I")
+        )
+        label_ids = {label: index for index, label in enumerate(label_list)}
+
+        tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
+
+        def encode(text, spans):
+            """The features for ``text``: one token-classifier example per window
+            the tokenizer cuts an over-long text into, with the stride keeping
+            the windows overlapping so nothing past a window edge is lost. The
+            offsets stay in the whole text, so every window is labelled from the
+            same spans."""
+            encoding = tokenizer(
+                text,
+                truncation=True,
+                max_length=max_length,
+                stride=max(1, max_length // 4),
+                return_overflowing_tokens=True,
+                return_offsets_mapping=True,
+            )
+            features = []
+            for window in range(len(encoding["input_ids"])):
+                word_ids = encoding.word_ids(batch_index=window)
+                offsets = encoding["offset_mapping"][window]
+                # One entry per word the window holds, as far into it as the
+                # window reaches.
+                words = {}
+                for word_id, (start, end) in zip(word_ids, offsets):
+                    if word_id is None or start == end:
+                        continue
+                    if word_id in words:
+                        words[word_id][1] = end
+                    else:
+                        words[word_id] = [start, end]
+                labels_by_word = dict(zip(words, word_labels(words.values(), spans)))
+                token_labels = []
+                previous_word = None
+                for word_id, (start, end) in zip(word_ids, offsets):
+                    # Special tokens, unknown tokens without a place, and the
+                    # sub-tokens after a word's first carry no label.
+                    if word_id is None or start == end or word_id == previous_word:
+                        token_labels.append(-100)
+                    else:
+                        token_labels.append(label_ids[labels_by_word[word_id]])
+                    previous_word = word_id
+                features.append(
+                    {
+                        **{
+                            key: encoding[key][window]
+                            for key in encoding
+                            if key not in ("offset_mapping", "overflow_to_sample_mapping")
+                        },
+                        "labels": token_labels,
+                    }
+                )
+            return features
+
+        class TokenDataset(TorchDataset):
+            def __init__(self, rows):
+                # Every window of a row is its own example.
+                self.features = [feature for text, spans in rows for feature in encode(text, spans)]
+
+            def __getitem__(self, index):
+                return {key: torch.tensor(value) for key, value in self.features[index].items()}
+
+            def __len__(self):
+                return len(self.features)
+
+        rows = list(examples)
+        evaluated_on_training = False
+        if len(rows) >= 2:
+            n_eval = min(max(1, round(len(rows) * test_size)), len(rows) - 1)
+            train_rows, eval_rows = train_test_split(rows, test_size=n_eval, random_state=42)
+        else:
+            # One example: it is scored on its own training row, and says so.
+            train_rows = eval_rows = rows
+            evaluated_on_training = True
+
+        # A checkpoint that already has a token head for other labels gets a
+        # fresh head sized to this Dataset's labels.
+        hf_model = AutoModelForTokenClassification.from_pretrained(
+            model_name, num_labels=len(label_list), ignore_mismatched_sizes=True
+        )
+
+        output_dir = parameters.get(
+            "output_dir", f"/tmp/transformer_{parameters['model_id']}"
+        )
+        monitoring = _monitoring(parameters)
+        evaluation = {"eval_strategy": monitoring["eval_strategy"]}
+        if monitoring["eval_strategy"] == "steps":
+            evaluation["eval_steps"] = monitoring["eval_steps"]
+        training_args = TrainingArguments(
+            output_dir=output_dir,
+            num_train_epochs=epochs,
+            per_device_train_batch_size=batch_size,
+            per_device_eval_batch_size=batch_size,
+            learning_rate=learning_rate,
+            save_strategy="no",
+            logging_steps=monitoring["log_every_n_steps"],
+            use_cpu=not torch.cuda.is_available(),
+            **evaluation,
+        )
+
+        def row_sequences(model, eval_rows, stop=None):
+            """Gold and predicted BIO labels per word, one sequence per row: each
+            word labelled by the first window that saw it (as prediction does),
+            the gold from the same spans over the whole row."""
+            model.eval()
+            device = next(model.parameters()).device
+            true_rows, predicted_rows = [], []
+            for text, spans in eval_rows:
+                encoding = tokenizer(
+                    text,
+                    truncation=True,
+                    max_length=max_length,
+                    stride=max(1, max_length // 4),
+                    return_overflowing_tokens=True,
+                    return_offsets_mapping=True,
+                    padding=True,
+                    return_tensors="pt",
+                )
+                offsets = encoding.pop("offset_mapping")
+                encoding.pop("overflow_to_sample_mapping", None)
+                word_span, word_label = {}, {}
+                windows = encoding["input_ids"].shape[0]
+                for first in range(0, windows, PREDICTION_WINDOW_BATCH):
+                    # A Stop asked for mid-pass ends it at the next batch.
+                    if stop is not None and stop():
+                        return None
+                    batch = {
+                        key: value[first:first + PREDICTION_WINDOW_BATCH].to(device)
+                        for key, value in encoding.items()
+                    }
+                    with torch.no_grad():
+                        logits = model(**batch).logits.cpu()
+                    for row_index in range(logits.shape[0]):
+                        window = first + row_index
+                        predicted = logits[row_index].argmax(-1).tolist()
+                        for word_id, (start, end), index in zip(
+                            encoding.word_ids(batch_index=window), offsets[window].tolist(), predicted
+                        ):
+                            if word_id is None or start == end:
+                                continue
+                            if word_id in word_span:
+                                word_span[word_id][1] = max(word_span[word_id][1], end)
+                            else:
+                                word_span[word_id] = [start, end]
+                                word_label[word_id] = label_list[index]
+                order = list(word_span)
+                true_rows.append(word_labels([tuple(word_span[w]) for w in order], spans))
+                predicted_rows.append([word_label[w] for w in order])
+            return true_rows, predicted_rows
+
+        def no_entities(labels):
+            """No entity in any sequence: seqeval cannot score two empty sides."""
+            return not any(label != "O" for row in labels for label in row)
+
+        def row_scores(model, stop=None):
+            """Entity F1, precision and recall over whole eval rows, or None
+            when a Stop arrived while scoring."""
+            sequences = row_sequences(model, eval_rows, stop)
+            if sequences is None:
+                return None
+            true_labels, predicted_labels = sequences
+            if no_entities(true_labels) and no_entities(predicted_labels):
+                return {"f1_score": 0.0, "precision": 0.0, "recall": 0.0}
+            return {
+                "f1_score": float(entity_f1(true_labels, predicted_labels, average="micro", zero_division=0)),
+                "precision": float(entity_precision(true_labels, predicted_labels, average="micro", zero_division=0)),
+                "recall": float(entity_recall(true_labels, predicted_labels, average="micro", zero_division=0)),
+            }
+
+        metric_logger = self.metric_logger
+        cancel_check = self.cancel_check
+
+        class RowScoreCallback(TrainerCallback):
+            """After each evaluation, logs the entity scores per whole row, as
+            the final scores are: the Trainer's own metrics would score each
+            overlapping window apart, counting repeated words twice. The
+            evaluation itself still logs its loss."""
+
+            def on_evaluate(self, args, state, control, model=None, **kwargs):
+                if model is None:
+                    return
+                was_training = model.training
+                try:
+                    # The scoring pass checks for a Stop between batches, so a
+                    # stopped run does not wait for a whole extra pass; the
+                    # check after train() then settles it as cancelled.
+                    scores = row_scores(model, stop=cancel_check)
+                    if scores is None:
+                        control.should_training_stop = True
+                        return control
+                    for name, value in scores.items():
+                        metric_logger.log(
+                            metric_name=f"eval_{name}",
+                            value=value,
+                            epoch=state.epoch,
+                            training_step=state.global_step,
+                        )
+                finally:
+                    if was_training:
+                        model.train()
+
+        callbacks = (
+            [TrainingMetricCallback(self.metric_logger), RowScoreCallback()] if self.metric_logger else []
+        )
+        if self.metric_logger and monitoring.get("system_metrics"):
+            callbacks.append(SystemMetricsCallback(self.metric_logger))
+        cancel_callback = None
+        if self.cancel_check:
+            cancel_callback = TrainingCancelCallback(self.cancel_check)
+            callbacks.append(cancel_callback)
+
+        hf_trainer = Trainer(
+            model=hf_model,
+            args=training_args,
+            train_dataset=TokenDataset(train_rows),
+            eval_dataset=TokenDataset(eval_rows),
+            data_collator=DataCollatorForTokenClassification(tokenizer),
+            callbacks=callbacks,
+        )
+
+        hf_trainer.train()
+        # Stopped: skip predict and keep no model (D4/OV-E4).
+        if (cancel_callback and cancel_callback.cancelled) or (
+            self.cancel_check and self.cancel_check()
+        ):
+            raise TrainingCancelled()
+
+        # Scored per row, not per window: overlapping windows repeat words, and
+        # an entity cut by a window edge would otherwise count twice.
+        true_labels, predicted_labels = row_sequences(hf_model, eval_rows)
+        metrics = {
+            "f1_score": float(entity_f1(true_labels, predicted_labels, average="micro", zero_division=0)),
+            "precision": float(entity_precision(true_labels, predicted_labels, average="micro", zero_division=0)),
+            "recall": float(entity_recall(true_labels, predicted_labels, average="micro", zero_division=0)),
+            "classification_report": (
+                ""
+                if no_entities(true_labels) and no_entities(predicted_labels)
+                else entity_report(true_labels, predicted_labels, zero_division=0)
+            ),
+            "entity_types": entity_types,
+        }
+        if evaluated_on_training:
+            metrics["evaluated_on_training"] = True
+
+        self.model = hf_model
+        self.tokenizer = tokenizer
+        self.task = "ner"
+        self.label_list = label_list
+        self.max_length = max_length
+        return metrics
+
     def save_model(self, model_path):
         model_data = {
+            "task": self.task,
             "preprocessor": self.preprocessor,
             "vectorizer": self.vectorizer,
             "model": self.model,
             "label_encoder": self.label_encoder,
             "tokenizer": getattr(self, "tokenizer", None),
+            "label_list": self.label_list,
+            "max_length": self.max_length,
         }
         joblib.dump(model_data, model_path)
