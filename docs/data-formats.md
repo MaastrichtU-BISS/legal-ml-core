@@ -90,7 +90,8 @@ Upload validation checks column *names*, but the trainer reads columns *by
 position* and reads the file as CSV. For a dataset you want to train on:
 
 1. Upload it as **CSV** (XLSX and JSON pass upload and EDA, but training reads
-   the stored file with `pandas.read_csv`).
+   the stored file with `pandas.read_csv`; summarization, below, is the
+   exception).
 2. Put the **text in the first column**, and for supervised tasks the
    **label (`label`, `judgment` or `entities`) in the second column**.
    Extra columns after these are ignored. Two task types differ: NER training

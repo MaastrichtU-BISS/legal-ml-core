@@ -692,7 +692,7 @@ def process_prediction_task(task_info, model_storage_path):
         summaries = {}
         # A blank text has nothing to summarise: it gets an empty summary rather
         # than one the model invents from the prefix alone.
-        written = [index for index, text in enumerate(texts) if str(text or "").strip()]
+        written = [index for index, text in enumerate(texts) if text is not None and str(text).strip()]
         for first in range(0, len(written), PREDICTION_WINDOW_BATCH):
             indexes = written[first : first + PREDICTION_WINDOW_BATCH]
             batch = [str(texts[index]) for index in indexes]
