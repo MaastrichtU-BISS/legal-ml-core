@@ -8,6 +8,19 @@ While the version is 0.x, minor releases may contain breaking changes.
 
 ## [Unreleased]
 
+## [0.18.0] - 2026-11-23
+
+### Fixed
+
+- `GET /api/llm/status` answers for a shared-key user even while the usage
+  meter is down (#166): the response still says `mode: "shared"` with
+  `remaining_tokens` unknown, and new fields `shared_key_available: false` and
+  `shared_key_unavailable_reason` (the message that was previously the whole
+  error) let the panel offer the user's own API key instead of a failure.
+  Saving an own key still switches the account to BYOK, and everything that
+  would spend the shared key — suggestions, prompt checks, annotation jobs —
+  keeps failing closed until the meter answers again.
+
 ## [0.17.0] - 2026-11-18
 
 ### Added

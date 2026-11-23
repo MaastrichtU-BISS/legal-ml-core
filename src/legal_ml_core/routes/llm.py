@@ -26,6 +26,7 @@ from ..llm.prompts import (
 from ..llm.suggest import (
     CONFIRMED_SOURCES,
     BudgetExhausted,
+    METER_DOWN_MESSAGE,
     call_metered,
     current_prompt,
     estimate_job_tokens,
@@ -185,9 +186,20 @@ def status():
         "remaining_tokens": None,
         # The most items one POST .../suggestions may ask for.
         "max_sync_tasks": int_setting("LLM_MAX_SYNC_TASKS"),
+        # False only when the shared key is the credential but its usage meter
+        # could not be asked: it is still the key this account would use, so
+        # ``mode`` stays ``shared``, yet nothing can be charged to it right
+        # now, and the panel can offer the user's own key instead of an error.
+        # Anything that would spend the key keeps failing closed.
+        "shared_key_available": True,
+        "shared_key_unavailable_reason": None,
     }
     if credential and credential.mode == "shared":
-        body["remaining_tokens"] = remaining_tokens(owner_id)
+        try:
+            body["remaining_tokens"] = remaining_tokens(owner_id)
+        except LLMError:
+            body["shared_key_available"] = False
+            body["shared_key_unavailable_reason"] = METER_DOWN_MESSAGE
 
     dataset_id = request.args.get("dataset_id")
     if dataset_id:

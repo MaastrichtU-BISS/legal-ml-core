@@ -15,7 +15,7 @@ from legal_ml_core import (
 )
 from legal_ml_core.llm import access, client as llm_client
 from legal_ml_core.llm.prompts import DEFAULT_TEMPLATE
-from legal_ml_core.llm.suggest import process_llm_annotation_task
+from legal_ml_core.llm.suggest import METER_DOWN_MESSAGE, process_llm_annotation_task
 from tests.conftest import TEST_USER_ID
 
 PROJECT = "proj-1"
@@ -132,6 +132,8 @@ def test_gated_user_with_verified_email_gets_the_shared_key(client, gated):
     assert body["mode"] == "shared"
     assert body["destination"] == DESTINATION
     assert body["remaining_tokens"] == 200_000
+    assert body["shared_key_available"] is True
+    assert body["shared_key_unavailable_reason"] is None
 
 
 @pytest.mark.parametrize("verified", [False, None])
@@ -690,6 +692,36 @@ def test_a_broken_meter_blocks_the_shared_key(client, app, gated, provider):
     _ack(client, dataset_id, gated)
     assert _suggest(client, dataset_id, task_ids, gated).status_code == 502
     assert provider.calls == []
+
+
+def test_a_broken_meter_still_answers_status_and_marks_the_shared_key(client, app, gated):
+    app.config["USAGE_METER"] = BrokenMeter()
+    resp = client.get("/api/llm/status", headers=gated)
+    body = resp.get_json()
+    assert resp.status_code == 200
+    assert body["mode"] == "shared"
+    assert body["shared_key_available"] is False
+    assert body["shared_key_unavailable_reason"] == METER_DOWN_MESSAGE
+    assert body["remaining_tokens"] is None
+
+
+def test_with_the_meter_down_saving_an_own_key_switches_to_byok(client, app, gated):
+    app.config["USAGE_METER"] = BrokenMeter()
+    assert client.get("/api/llm/status", headers=gated).get_json()["shared_key_available"] is False
+    assert _save_key(client, gated).status_code == 200
+    body = client.get("/api/llm/status", headers=gated).get_json()
+    assert body["mode"] == "byok"
+    assert body["shared_key_available"] is True
+    assert body["shared_key_unavailable_reason"] is None
+
+
+def test_an_own_key_user_reads_available_even_with_a_broken_meter(client, app, outsider):
+    app.config["USAGE_METER"] = BrokenMeter()
+    _save_key(client, outsider)
+    body = client.get("/api/llm/status", headers=outsider).get_json()
+    assert body["mode"] == "byok"
+    assert body["shared_key_available"] is True
+    assert body["remaining_tokens"] is None
 
 
 def test_a_broken_meter_does_not_touch_byok(client, app, outsider, provider):
