@@ -8,6 +8,19 @@ While the version is 0.x, minor releases may contain breaking changes.
 
 ## [Unreleased]
 
+## [0.18.0] - 2026-11-23
+
+### Fixed
+
+- `GET /api/llm/status` answers for a shared-key user even while the usage
+  meter is down (#166): the response still says `mode: "shared"` with
+  `remaining_tokens` unknown, and new fields `shared_key_available: false` and
+  `shared_key_unavailable_reason` (the message that was previously the whole
+  error) let the panel offer the user's own API key instead of a failure.
+  Saving an own key still switches the account to BYOK, and everything that
+  would spend the shared key — suggestions, prompt checks, annotation jobs —
+  keeps failing closed until the meter answers again.
+
 ## [0.17.0] - 2026-11-18
 
 ### Added
@@ -609,7 +622,8 @@ version was not tagged; it corresponds to commit `02c5b61`.
 - Worker foreign-key resolution and the missing `psycopg2` dependency.
 - Model/task compatibility checks, live progress and failure reasons.
 
-[Unreleased]: https://github.com/shashankmc/legal-ml-core/compare/v0.17.0...HEAD
+[Unreleased]: https://github.com/shashankmc/legal-ml-core/compare/v0.18.0...HEAD
+[0.18.0]: https://github.com/shashankmc/legal-ml-core/compare/v0.17.0...v0.18.0
 [0.17.0]: https://github.com/shashankmc/legal-ml-core/compare/v0.16.0...v0.17.0
 [0.16.0]: https://github.com/shashankmc/legal-ml-core/compare/v0.15.0...v0.16.0
 [0.15.0]: https://github.com/shashankmc/legal-ml-core/compare/v0.14.1...v0.15.0
