@@ -622,7 +622,8 @@ version was not tagged; it corresponds to commit `02c5b61`.
 - Worker foreign-key resolution and the missing `psycopg2` dependency.
 - Model/task compatibility checks, live progress and failure reasons.
 
-[Unreleased]: https://github.com/shashankmc/legal-ml-core/compare/v0.17.0...HEAD
+[Unreleased]: https://github.com/shashankmc/legal-ml-core/compare/v0.18.0...HEAD
+[0.18.0]: https://github.com/shashankmc/legal-ml-core/compare/v0.17.0...v0.18.0
 [0.17.0]: https://github.com/shashankmc/legal-ml-core/compare/v0.16.0...v0.17.0
 [0.16.0]: https://github.com/shashankmc/legal-ml-core/compare/v0.15.0...v0.16.0
 [0.15.0]: https://github.com/shashankmc/legal-ml-core/compare/v0.14.1...v0.15.0
