@@ -375,9 +375,73 @@ def test_a_repeated_model_member_is_refused(client, outsider):
     assert LLMCredential.query.one().model == "my-model"
 
 
+def test_a_model_with_a_nul_is_refused_not_stored(client, outsider):
+    _save_key(client, outsider)
+    # Postgres refuses NUL in a string, so it must never reach the update.
+    resp = client.patch(
+        "/api/llm/key", data='{"model": "a\\u0000b"}', content_type="application/json", headers=outsider
+    )
+    assert resp.status_code == 400
+    assert resp.get_json()["code"] == "invalid_request"
+    assert LLMCredential.query.one().model == "my-model"
+
+
+@pytest.mark.parametrize("content_type", ["text/plain", "application/x-www-form-urlencoded", None])
+def test_a_json_body_not_sent_as_json_is_refused(client, outsider, content_type):
+    _save_key(client, outsider)
+    kwargs = {"content_type": content_type} if content_type else {}
+    resp = client.patch("/api/llm/key", data='{"model": "other-model"}', headers=outsider, **kwargs)
+    assert resp.status_code == 400
+    assert resp.get_json()["code"] == "invalid_request"
+    assert LLMCredential.query.one().model == "my-model"
+
+
+def test_a_deeply_nested_body_is_a_400_not_a_500(client, outsider):
+    _save_key(client, outsider)
+    resp = client.patch(
+        "/api/llm/key", data='{"model": ' + "[" * 100000 + "]" * 100000 + "}",
+        content_type="application/json", headers=outsider,
+    )
+    assert resp.status_code == 400
+    assert resp.get_json()["code"] == "invalid_request"
+
+
+def test_the_answer_names_the_base_url_of_the_row_that_changed(client, outsider, monkeypatch):
+    """A PUT from another tab that lands after the lookup must not leave a stale URL in the answer."""
+    _save_key(client, outsider)
+    # Unbound, so a column query like db.session.query(LLMCredential.base_url) stays one.
+    real_filter_by = type(LLMCredential.query).filter_by
+    calls = []
+
+    class ProviderChangedAfterTheRead:
+        def __init__(self, query):
+            self.query = query
+
+        def first(self):
+            row = self.query.first()
+            LLMCredential.query.filter_by(owner_id=row.owner_id).update(
+                {"base_url": "https://api.mistral.ai/v1"}, synchronize_session=False
+            )
+            return row
+
+        def __getattr__(self, name):
+            return getattr(self.query, name)
+
+    def filter_by(self, **kwargs):
+        calls.append(kwargs)
+        query = real_filter_by(self, **kwargs)
+        return ProviderChangedAfterTheRead(query) if len(calls) == 1 else query
+
+    monkeypatch.setattr(type(LLMCredential.query), "filter_by", filter_by)
+    resp = _change_model(client, outsider, {"model": "mistral-small-latest"})
+    assert resp.status_code == 200
+    assert resp.get_json() == {"base_url": "https://api.mistral.ai/v1", "model": "mistral-small-latest"}
+
+
 def test_a_key_removed_while_the_model_changes_is_404_not_a_500(client, outsider, monkeypatch):
     _save_key(client, outsider)
-    real_filter_by = LLMCredential.query.filter_by
+    # Unbound, so a column query like db.session.query(LLMCredential.base_url) stays one.
+    real_filter_by = type(LLMCredential.query).filter_by
 
     class RemovedAfterTheRead:
         """The first lookup finds the row, then another tab's DELETE lands."""
@@ -395,12 +459,12 @@ def test_a_key_removed_while_the_model_changes_is_404_not_a_500(client, outsider
 
     calls = []
 
-    def filter_by(**kwargs):
+    def filter_by(self, **kwargs):
         calls.append(kwargs)
-        query = real_filter_by(**kwargs)
+        query = real_filter_by(self, **kwargs)
         return RemovedAfterTheRead(query) if len(calls) == 1 else query
 
-    monkeypatch.setattr(type(LLMCredential.query), "filter_by", lambda self, **kw: filter_by(**kw))
+    monkeypatch.setattr(type(LLMCredential.query), "filter_by", filter_by)
     resp = _change_model(client, outsider, {"model": "other-model"})
     assert resp.status_code == 404
     assert resp.get_json()["code"] == "no_saved_key"
