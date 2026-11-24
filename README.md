@@ -194,11 +194,18 @@ app.config["LLM_ENCRYPTION_KEY"] = os.environ["LLM_ENCRYPTION_KEY"]  # Fernet ke
 - `POST /api/llm/models` lists a provider's chat models, so a host can check a
   key before saving it and offer a model list instead of a typed id. Send
   `{base_url, api_key}` (the key is never stored) or `{use_saved_key: true}`.
-  The base URL passes the same check as a saved key, `api.anthropic.com` also
-  gets an `anthropic-version` header, and refusals carry a `code`
-  (`key_rejected`, `provider_unreachable`, `listing_unsupported`,
-  `no_saved_key`, `saved_key_unreadable`, `base_url_refused`,
-  `invalid_request`). It is not rate limited here; the host should limit it.
+  The base URL passes the same check as a saved key and may not have a query
+  or fragment; the key must be printable ASCII without whitespace, at most 512
+  characters. The key goes only in `Authorization: Bearer` (Anthropic also
+  gets `anthropic-version`), and OpenRouter, which lists models to any key, is
+  asked `GET /key` first. The request runs over urllib3 with no redirects,
+  `Accept-Encoding: identity` (a compressed body is refused, never inflated),
+  a 2 MB cap and one `max(1, min(LLM_TIMEOUT_SECONDS, 15))`-second deadline
+  over connect, headers and body. Refusals carry a `code` (`key_rejected`,
+  `provider_unreachable` with a 502, also for 408, 429 and 5xx,
+  `listing_unsupported`, `no_saved_key`, `saved_key_unreadable`,
+  `base_url_refused`, `invalid_request`). It is not rate limited here; the
+  host should limit it.
 - Call `purge_owner_llm_data(owner_id)` from account erasure.
 - `LLM_AUDIT_HOOK`, a callable `(event, owner_id, **fields)`, receives each new
   acknowledgement for the host's audit log.

@@ -1536,19 +1536,32 @@ paths:
       summary: List the chat models a provider offers, to check a key or pick a model
       description: |
         Calls `GET {base_url}/models` with the key sent here (never stored) or
-        the caller's saved key, decrypted on the server. The base URL passes the
-        same public-host and `LLM_BYOK_ALLOWED_HOSTS` check as a saved key.
-        OpenRouter models are kept when their output modalities include text;
-        for other providers, ids naming embed, whisper, tts, dall-e, image,
-        audio, moderation, realtime or transcribe are dropped. Times out after
-        `min(LLM_TIMEOUT_SECONDS, 15)` seconds; a listing over 2 MB is
-        `listing_unsupported`. Refusals carry a `code`: `invalid_request`,
+        the caller's saved key, decrypted on the server. The key goes only in
+        `Authorization: Bearer` (for `api.anthropic.com` with
+        `anthropic-version: 2023-06-01` and `?limit=1000`); it must be printable
+        ASCII with no whitespace, at most 512 characters. The base URL passes
+        the same public-host and `LLM_BYOK_ALLOWED_HOSTS` check as a saved key,
+        and may not have a query or fragment. On OpenRouter, which lists models
+        to any key, `GET {base_url}/key` is asked first, and only models whose
+        output modalities include text are kept; for other providers, ids
+        naming embed, whisper, tts (as a token), dall-e, image, audio,
+        moderation, realtime or transcribe are dropped. A bare top-level list of
+        models is read as well as `{data: [...]}`. A model whose id contains
+        the key is dropped, and a name that contains it is left out.
+
+        No redirect is followed, `Accept-Encoding: identity` is sent and a
+        compressed body is refused unread, and a body over 2 MB is
+        `listing_unsupported`. One budget of
+        `max(1, min(LLM_TIMEOUT_SECONDS, 15))` seconds covers connect, headers
+        and body. Refusals carry a `code`: `invalid_request`,
         `base_url_refused`, `no_saved_key`, `saved_key_unreadable`,
-        `key_rejected`, `listing_unsupported` (all 400) or
-        `provider_unreachable` (502). Not rate limited here: that is the host's
-        policy.
+        `key_rejected` (401, 403, or a 400 saying "API key"),
+        `listing_unsupported` (all 400) or `provider_unreachable` (502: network
+        errors, the deadline, 408, 429 and 5xx). Not rate limited here: that is
+        the host's policy.
       operationId: listLlmModels
       requestBody:
+        required: true
         content:
           application/json:
             schema:
@@ -1571,6 +1584,7 @@ paths:
             application/json:
               schema:
                 type: object
+                required: [models]
                 properties:
                   models:
                     type: array
@@ -1579,7 +1593,9 @@ paths:
                       required: [id]
                       properties:
                         id: { type: string }
-                        name: { type: string }
+                        name:
+                          type: string
+                          description: Left out when the provider gives none, or the same as the id
         "400": { $ref: "#/components/responses/BadRequest" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "502":
@@ -1953,6 +1969,11 @@ components:
       required: [error]
       properties:
         error: { type: string }
+        code:
+          type: string
+          description: >-
+            A machine-readable reason, on refusals that have one (such as
+            `key_rejected` from `POST /api/llm/models`).
         field:
           type: string
           description: >-
