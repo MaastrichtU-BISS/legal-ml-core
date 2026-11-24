@@ -1,8 +1,9 @@
 """LLM assistance API: access, keys, prompts, suggestions and standalone jobs."""
 import json
+import re
 import uuid
 from datetime import datetime
-from urllib.parse import urlparse
+from urllib.parse import urlsplit
 
 from flask import Blueprint, current_app, jsonify, request
 
@@ -19,7 +20,7 @@ from ..llm.access import (
 )
 from ..llm.client import LLMError
 from ..llm.config import float_setting, int_setting, shared_endpoint
-from ..llm.models_list import ModelListError, list_chat_models
+from ..llm.models_list import MESSAGES as LISTING_MESSAGES, ModelListError, list_chat_models
 from ..llm.prompts import (
     PromptRejected,
     check_template,
@@ -244,16 +245,28 @@ def save_key():
     return jsonify({"base_url": row.base_url, "model": row.model}), 200
 
 
+# Printable ASCII with no spaces: anything else can't go in a header as typed.
+API_KEY_PATTERN = re.compile(r"[!-~]{1,512}")
+BASE_URL_PATTERN = re.compile(r"[!-~]+")
+BAD_KEY = "The API key has characters an API key can't contain."
+PLAIN_HTTPS = "The base URL must be a plain https URL."
+
+
 def _models_request(data):
     """``(base_url, api_key)`` from ``{base_url, api_key}`` or ``{use_saved_key: true}``."""
     if data.get("use_saved_key") is True and set(data) == {"use_saved_key"}:
         row = LLMCredential.query.filter_by(owner_id=_owner()).first()
         if row is None:
             raise ApiError(400, "There is no saved API key.", code="no_saved_key")
+        unreadable = None
         try:
             api_key = decrypt_key(row.encrypted_key)
         except CredentialError as exc:
-            raise ApiError(400, str(exc), code="saved_key_unreadable") from None
+            unreadable = str(exc)
+        if unreadable is None and not API_KEY_PATTERN.fullmatch(api_key):
+            unreadable = LISTING_MESSAGES["saved_key_unreadable"]
+        if unreadable is not None:
+            raise ApiError(400, unreadable, code="saved_key_unreadable")
         return row.base_url, api_key
 
     api_key = data.get("api_key")
@@ -272,7 +285,29 @@ def _models_request(data):
         )
     if len(base_url) > 500:
         raise ApiError(400, "base_url is too long.", code="invalid_request")
-    return base_url.strip().rstrip("/"), api_key.strip()
+    api_key = api_key.strip()
+    if not API_KEY_PATTERN.fullmatch(api_key):
+        raise ApiError(400, BAD_KEY, code="invalid_request")
+    return base_url.strip().rstrip("/"), api_key
+
+
+def _check_base_url(base_url):
+    """``base_url_refused`` unless it is a plain public https URL with no query."""
+    refused = None
+    if not BASE_URL_PATTERN.fullmatch(base_url):
+        refused = PLAIN_HTTPS
+    elif "?" in base_url or "#" in base_url:
+        refused = "The base URL can't have a query or fragment."
+    else:
+        try:
+            urlsplit(base_url).port  # a bad port or IPv6 literal raises here
+            validate_byok_url(base_url)
+        except CredentialError as exc:
+            refused = str(exc)
+        except ValueError:
+            refused = PLAIN_HTTPS
+    if refused is not None:
+        raise ApiError(400, refused, code="base_url_refused")
 
 
 @llm_bp.route("/models", methods=["POST"])
@@ -281,21 +316,23 @@ def list_models():
     """The chat models a provider offers, to check a key or pick a model id.
 
     The key sent here is never stored. Rate limiting is the host's policy.
+    Refusals are raised outside ``except`` blocks, so none carries a library
+    exception, which can hold the request headers, as its context.
     """
     base_url, api_key = _models_request(_body())
-    try:
-        validate_byok_url(base_url)
-    except CredentialError as exc:
-        raise ApiError(400, str(exc), code="base_url_refused") from None
+    _check_base_url(base_url)
+    refusal = None
     try:
         models = list_chat_models(base_url, api_key)
     except ModelListError as exc:
+        refusal = exc
+    if refusal is not None:
         # Neither the key nor the provider's answer is logged, only the outcome.
         current_app.logger.info(
-            "model listing refused for %s: %s", urlparse(base_url).hostname, exc.code
+            "model listing refused for %s: %s", urlsplit(base_url).hostname, refusal.code
         )
-        status = 502 if exc.code == "provider_unreachable" else 400
-        raise ApiError(status, str(exc), code=exc.code) from None
+        status = 502 if refusal.code == "provider_unreachable" else 400
+        raise ApiError(status, str(refusal), code=refusal.code)
     return jsonify({"models": models}), 200
 
 
