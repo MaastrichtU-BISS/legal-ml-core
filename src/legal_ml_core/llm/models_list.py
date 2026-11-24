@@ -27,6 +27,7 @@ from urllib.parse import urlsplit
 
 import urllib3
 from urllib3.connection import HTTPConnection, HTTPSConnection
+from urllib3.util.connection import allowed_gai_family
 
 from .config import int_setting
 
@@ -146,14 +147,25 @@ class _Watched:
         if host.startswith("["):
             host = host.strip("[]")
         # Not bounded by the deadline: the system resolver can't be interrupted.
-        addresses = socket.getaddrinfo(host, self.port, 0, socket.SOCK_STREAM)
+        # The families urllib3 itself asks for (IPv4 only where this host has no IPv6).
+        unresolvable = False
+        try:
+            addresses = socket.getaddrinfo(host, self.port, allowed_gai_family(), socket.SOCK_STREAM)
+        except UnicodeError:
+            # A host IDNA can't encode (an empty or over-long label), say from an allowlist.
+            unresolvable = True
+        if unresolvable:
+            raise ModelListError("provider_unreachable")
         sock = None
         error = None
         for family, kind, proto, _, address in addresses:
             if self.aborted or monotonic() >= deadline:
                 raise ModelListError("provider_unreachable")
-            candidate = socket.socket(family, kind, proto)
+            candidate = None
             try:
+                # Inside the try, as in urllib3: a family this host can't open
+                # (EAFNOSUPPORT for IPv6 here) falls through to the next address.
+                candidate = socket.socket(family, kind, proto)
                 for option in self.socket_options or ():
                     candidate.setsockopt(*option)
                 candidate.settimeout(min(MAX_CONNECT_SECONDS, max(deadline - monotonic(), 0.001)))
@@ -161,7 +173,8 @@ class _Watched:
                     candidate.bind(self.source_address)
                 candidate.connect(address)
             except OSError as exc:
-                candidate.close()
+                if candidate is not None:
+                    candidate.close()
                 error = exc
                 continue
             sock = candidate
@@ -311,6 +324,9 @@ def _exchange(conn, target, headers, deadline):
                 raise ModelListError("key_rejected")
             raise ModelListError("listing_unsupported")
         declared = (response.headers.get("Content-Length") or "").strip()
+        if ALL_DIGITS.fullmatch(declared):
+            # Leading zeros don't make a length longer: ``0000000000000000012`` is 12.
+            declared = declared.lstrip("0") or "0"
         if DECLARED_LENGTH.fullmatch(declared):
             if int(declared) > MAX_BODY_BYTES:
                 raise ModelListError("listing_unsupported")

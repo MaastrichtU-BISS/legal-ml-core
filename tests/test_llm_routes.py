@@ -1,3 +1,4 @@
+import errno
 import gzip
 import http.client
 import io
@@ -1800,6 +1801,55 @@ def test_real_socket_a_crafted_content_length_never_crashes(raw_server, declared
         assert outcome == "listing_unsupported"
     if declared in ("\u00b2", "\u00b9\u00b3"):
         assert outcome == "read"
+
+
+def test_real_socket_a_zero_padded_content_length_is_its_value(raw_server):
+    body = json.dumps({"data": [{"id": "a"}]}).encode()
+    padded = str(len(body)).rjust(20, "0")  # 20 digits, the value well under the cap
+
+    def handle(conn):
+        conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: " + padded.encode() + b"\r\n\r\n" + body)
+
+    server = raw_server(handle)
+    assert json.loads(_fetch(server, budget=2.0)) == {"data": [{"id": "a"}]}
+
+
+def test_real_socket_an_address_family_this_host_lacks_falls_through(raw_server, monkeypatch):
+    """IPv6 listed first on a host without IPv6 (``EAFNOSUPPORT``) must not stop IPv4."""
+    body = json.dumps({"data": [{"id": "a"}]}).encode()
+
+    def handle(conn):
+        conn.sendall(b"HTTP/1.1 200 OK\r\n" + f"Content-Length: {len(body)}\r\n\r\n".encode() + body)
+
+    server = raw_server(handle)
+    real_socket = socket.socket
+    opened = []
+
+    def getaddrinfo(host, port, *args, **kwargs):
+        return [
+            (socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("::1", port, 0, 0)),
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", port)),
+        ]
+
+    def no_ipv6(family=-1, *args, **kwargs):
+        if family == socket.AF_INET6 and kwargs.get("fileno") is None:
+            opened.append("AF_INET6 refused")
+            raise OSError(errno.EAFNOSUPPORT, "Address family not supported by protocol")
+        return real_socket(family, *args, **kwargs)
+
+    monkeypatch.setattr(models_list.socket, "getaddrinfo", getaddrinfo)
+    monkeypatch.setattr(models_list.socket, "socket", no_ipv6)
+    raw = models_list._fetch(f"http://provider.test:{server.port}/v1/models", {}, monotonic() + 3.0)
+    assert json.loads(raw) == {"data": [{"id": "a"}]}
+    assert opened == ["AF_INET6 refused"]
+
+
+def test_a_host_idna_cannot_encode_is_unreachable_not_a_500():
+    """An empty label (say from LLM_BYOK_ALLOWED_HOSTS) makes getaddrinfo raise UnicodeError."""
+    with pytest.raises(models_list.ModelListError) as caught:
+        models_list._fetch("http://api..example.org:9/v1/models", {}, monotonic() + 2.0)
+    assert caught.value.code == "provider_unreachable"
+    assert caught.value.__context__ is None
 
 
 def _blackholed(monkeypatch, addresses, reachable=None):

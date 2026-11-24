@@ -38,7 +38,9 @@ While the version is 0.x, minor releases may contain breaking changes.
     `Content-Encoding` is refused unread, so nothing is ever decompressed;
     bodies are read in bounded amounts against a 2 MB cap. One wall-clock
     budget of `max(1, min(LLM_TIMEOUT_SECONDS, 15))` seconds covers each
-    connection attempt (at most 5 s each, tried address by address), the TLS
+    connection attempt (at most 5 s each, tried address by address over the
+    address families urllib3 itself would use, so an IPv6 address the host
+    can't open falls through to IPv4), the TLS
     handshake, the headers and the body, enforced by a watchdog that cuts the
     socket, so a provider trickling bytes can't hold the request open. The
     DNS lookup is not covered: it is left to the system resolver, and bounding
