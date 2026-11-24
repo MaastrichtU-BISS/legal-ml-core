@@ -1547,7 +1547,10 @@ paths:
         naming embed, whisper, tts (as a token), dall-e, image, audio,
         moderation, realtime or transcribe are dropped. A bare top-level list of
         models is read as well as `{data: [...]}`. A model whose id contains
-        the key is dropped, and a name that contains it is left out.
+        the key is dropped, and a name that contains it is left out. An empty
+        list, or one the chat filter empties, is a 200 with no models; a
+        non-empty list without one model id is `listing_unsupported`, so it
+        can't pass for a working key.
 
         No redirect is followed, `Accept-Encoding: identity` is sent and a
         compressed body is refused unread, and a body over 2 MB is

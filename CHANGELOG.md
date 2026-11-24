@@ -55,7 +55,9 @@ While the version is 0.x, minor releases may contain breaking changes.
     8 KB say "API key", as Gemini answers a bad key), `provider_unreachable`
     (502: network errors, the deadline, 408, 5xx, and 429 with "The provider is
     limiting requests. Try again in a moment."), `listing_unsupported` (any
-    other status, a redirect, a compressed, oversized or unreadable body),
+    other status, a redirect, a compressed, oversized or unreadable body, or
+    a non-empty list without one model id; an empty list, or one the chat
+    filter empties, is still a 200 with no models),
     `no_saved_key`, `saved_key_unreadable`, `base_url_refused` and
     `invalid_request`. A refusal never carries the library exception (which
     can hold the request headers) as its context. No rate limit: the host owns
