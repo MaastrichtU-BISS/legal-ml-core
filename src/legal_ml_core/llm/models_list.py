@@ -54,6 +54,9 @@ def timeout_seconds():
 def _headers(host, api_key):
     headers = {"Authorization": f"Bearer {api_key}"}
     if host == ANTHROPIC_HOST:
+        # Bearer is documented today; x-api-key is what older keys and proxies
+        # still expect. Both go to the same host, so sending both adds no exposure.
+        headers["x-api-key"] = api_key
         headers["anthropic-version"] = ANTHROPIC_VERSION
     return headers
 

@@ -1100,6 +1100,7 @@ def test_anthropic_gets_its_version_header_and_display_names(client, outsider, l
     assert call["url"] == "https://api.anthropic.com/v1/models?limit=1000"
     assert call["headers"] == {
         "Authorization": f"Bearer {SECRET}",
+        "x-api-key": SECRET,
         "anthropic-version": "2023-06-01",
     }
 
