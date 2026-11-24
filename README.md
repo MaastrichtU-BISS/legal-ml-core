@@ -201,7 +201,9 @@ app.config["LLM_ENCRYPTION_KEY"] = os.environ["LLM_ENCRYPTION_KEY"]  # Fernet ke
   asked `GET /key` first. The request runs over urllib3 with no redirects,
   `Accept-Encoding: identity` (a compressed body is refused, never inflated),
   a 2 MB cap and one `max(1, min(LLM_TIMEOUT_SECONDS, 15))`-second deadline
-  over connect, headers and body. Refusals carry a `code` (`key_rejected`,
+  over each connection attempt, the TLS handshake, the headers and the body.
+  The DNS lookup isn't covered: it is left to the system resolver, and
+  bounding it is a tracked follow-up. Refusals carry a `code` (`key_rejected`,
   `provider_unreachable` with a 502, also for 408, 429 and 5xx,
   `listing_unsupported`, `no_saved_key`, `saved_key_unreadable`,
   `base_url_refused`, `invalid_request`). It is not rate limited here; the

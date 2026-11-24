@@ -37,9 +37,18 @@ While the version is 0.x, minor releases may contain breaking changes.
     followed or read; `Accept-Encoding: identity` is sent and any other
     `Content-Encoding` is refused unread, so nothing is ever decompressed;
     bodies are read in bounded amounts against a 2 MB cap. One wall-clock
-    budget of `max(1, min(LLM_TIMEOUT_SECONDS, 15))` seconds covers connect
-    (at most 5 s), headers and body, enforced by a watchdog that cuts the
-    socket, so a provider trickling bytes can't hold the request open.
+    budget of `max(1, min(LLM_TIMEOUT_SECONDS, 15))` seconds covers each
+    connection attempt (at most 5 s each, tried address by address), the TLS
+    handshake, the headers and the body, enforced by a watchdog that cuts the
+    socket, so a provider trickling bytes can't hold the request open. The
+    DNS lookup is not covered: it is left to the system resolver, and bounding
+    it (with DNS pinning) is a tracked follow-up.
+  - urllib3's "Failed to parse headers" log, which can carry header text a
+    provider echoed back, is dropped for the listing's own thread while it
+    runs; other users of urllib3 log as before. A crafted `Content-Length`
+    (`²`, thousands of digits) is refused or ignored, never a 500. A base URL
+    host with a trailing dot (`openrouter.ai.`) gets the same provider
+    handling as without it.
   - Refusals carry a `code`: `key_rejected` (401, 403, or a 400 whose first
     8 KB say "API key", as Gemini answers a bad key), `provider_unreachable`
     (502: network errors, the deadline, 408, 5xx, and 429 with "The provider is

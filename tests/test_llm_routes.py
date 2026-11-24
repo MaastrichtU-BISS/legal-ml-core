@@ -2,7 +2,9 @@ import gzip
 import http.client
 import io
 import json
+import logging
 import socket
+import ssl
 import threading
 import time
 import tracemalloc
@@ -1208,6 +1210,27 @@ def test_openrouter_checks_the_key_before_listing(client, outsider, listing, sta
     assert [c["url"] for c in listing.calls] == ["https://openrouter.ai/api/v1/key"]
 
 
+def test_a_trailing_dot_on_openrouter_still_checks_the_key(client, outsider, listing):
+    listing.responses["/key"] = (401, b'{"error": {"message": "No auth credentials found"}}')
+
+    resp = _list_models(
+        client, outsider, {"base_url": "https://openrouter.ai./api/v1", "api_key": SECRET}
+    )
+
+    _refusal(resp, 400, "key_rejected")
+    assert [c["url"] for c in listing.calls] == ["https://openrouter.ai./api/v1/key"]
+
+
+def test_a_trailing_dot_on_anthropic_still_sends_its_version(client, outsider, listing):
+    resp = _list_models(
+        client, outsider, {"base_url": "https://API.Anthropic.com./v1", "api_key": SECRET}
+    )
+
+    assert resp.status_code == 200
+    assert listing.calls[0]["headers"]["anthropic-version"] == models_list.ANTHROPIC_VERSION
+    assert listing.calls[0]["url"].endswith("/v1/models?limit=1000")
+
+
 def test_anthropic_gets_bearer_only_its_version_header_and_display_names(
     client, outsider, listing
 ):
@@ -1745,3 +1768,304 @@ def test_real_socket_body_over_two_megabytes_is_refused(raw_server, declared):
 def test_real_socket_unencodable_saved_key_is_unreadable(raw_server):
     server = raw_server(lambda conn: None)
     _timed_refusal(server, "saved_key_unreadable", api_key=f"{SECRET}“")
+
+
+@pytest.mark.parametrize(
+    "declared", ["\u00b2", "\u00b9\u00b3", "1" * 5000, "12, 12", "-5", "0x10"]
+)
+def test_real_socket_a_crafted_content_length_never_crashes(raw_server, declared):
+    body = json.dumps({"data": [{"id": "a"}]}).encode()
+
+    def handle(conn):
+        conn.sendall(
+            b"HTTP/1.1 200 OK\r\nContent-Length: "
+            + declared.encode("latin-1")
+            + b"\r\nConnection: close\r\n\r\n"
+            + body
+        )
+        conn.shutdown(socket.SHUT_WR)
+
+    server = raw_server(handle)
+    started = monotonic()
+    try:
+        raw = _fetch(server, budget=2.0)
+    except models_list.ModelListError as exc:
+        assert exc.code in ("listing_unsupported", "provider_unreachable")
+        outcome = exc.code
+    else:
+        assert json.loads(raw) == {"data": [{"id": "a"}]}
+        outcome = "read"
+    print(f"Content-Length {declared[:12]!r}: {outcome} after {monotonic() - started:.2f}s")
+    if declared == "1" * 5000:
+        assert outcome == "listing_unsupported"
+    if declared in ("\u00b2", "\u00b9\u00b3"):
+        assert outcome == "read"
+
+
+def _blackholed(monkeypatch, addresses, reachable=None):
+    """``getaddrinfo`` returns ``addresses`` (and ``reachable`` last, if given);
+    connecting to any of ``addresses`` hangs until the socket's timeout."""
+    real_connect = socket.socket.connect
+    tried = []
+
+    def getaddrinfo(host, port, *args, **kwargs):
+        infos = [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", (a, port)) for a in addresses
+        ]
+        if reachable is not None:
+            infos.append((socket.AF_INET, socket.SOCK_STREAM, 6, "", reachable))
+        return infos
+
+    def connect(self, address):
+        tried.append((address[0], self.gettimeout()))
+        if address[0] in addresses:
+            time.sleep(self.gettimeout())
+            raise TimeoutError("timed out")
+        return real_connect(self, address)
+
+    monkeypatch.setattr(models_list.socket, "getaddrinfo", getaddrinfo)
+    monkeypatch.setattr(socket.socket, "connect", connect)
+    return tried
+
+
+def test_real_socket_connect_attempts_share_the_deadline(monkeypatch):
+    tried = _blackholed(monkeypatch, ["10.255.255.1", "10.255.255.2", "10.255.255.3"])
+    started = monotonic()
+    with pytest.raises(models_list.ModelListError) as caught:
+        models_list._fetch(
+            "https://provider.test/v1/models", {"Authorization": f"Bearer {SECRET}"},
+            monotonic() + 1.0,
+        )
+    elapsed = monotonic() - started
+    print(f"3 blackholed addresses on a 1 s budget refused after {elapsed:.2f}s, tried {tried}")
+    assert caught.value.code == "provider_unreachable"
+    assert caught.value.__context__ is None
+    assert elapsed < 1.3
+    assert len(tried) == 1
+
+
+def test_real_socket_a_dead_address_falls_through_to_the_next(raw_server, monkeypatch):
+    body = json.dumps({"data": [{"id": "a"}]}).encode()
+
+    def handle(conn):
+        conn.sendall(b"HTTP/1.1 200 OK\r\n" + f"Content-Length: {len(body)}\r\n\r\n".encode() + body)
+
+    server = raw_server(handle)
+    monkeypatch.setattr(models_list, "MAX_CONNECT_SECONDS", 0.3)
+    tried = _blackholed(monkeypatch, ["10.255.255.1"], reachable=("127.0.0.1", server.port))
+    started = monotonic()
+    raw = models_list._fetch(
+        f"http://provider.test:{server.port}/v1/models", {}, monotonic() + 3.0
+    )
+    print(f"fell through to the second address after {monotonic() - started:.2f}s")
+    assert json.loads(raw) == {"data": [{"id": "a"}]}
+    assert [a for a, _ in tried] == ["10.255.255.1", "127.0.0.1"]
+    assert tried[0][1] == pytest.approx(0.3)
+
+
+def test_real_socket_malformed_headers_never_log_the_key(raw_server, caplog):
+    caplog.set_level("DEBUG")
+    body = json.dumps({"data": [{"id": "a"}]}).encode()
+    urllib3_log = logging.getLogger("urllib3.connection")
+
+    def handle(conn):
+        # Another thread logging during the listing is not silenced.
+        urllib3_log.warning("server thread says hello")
+        conn.sendall(
+            b"HTTP/1.1 200 OK\r\n"
+            + f"Content-Length: {len(body)}\r\n".encode()
+            + f"Echo of Bearer {SECRET} without a colon\r\n\r\n".encode()
+            + body
+        )
+        conn.shutdown(socket.SHUT_WR)
+
+    server = raw_server(handle)
+    try:
+        _fetch(server, budget=2.0)
+    except models_list.ModelListError:
+        pass
+    urllib3_log.warning("main thread outside a listing")
+
+    assert SECRET not in caplog.text
+    assert "server thread says hello" in caplog.text
+    assert "main thread outside a listing" in caplog.text
+
+
+def test_the_log_filter_only_drops_records_inside_a_listing():
+    quiet = next(
+        f for f in logging.getLogger("urllib3.connection").filters
+        if isinstance(f, models_list._QuietWhileListing)
+    )
+    record = logging.LogRecord("urllib3.connection", logging.WARNING, "", 0, "x", None, None)
+    assert quiet.filter(record)
+    models_list._listing.active = True
+    try:
+        assert not quiet.filter(record)
+        seen = []
+        other = threading.Thread(target=lambda: seen.append(quiet.filter(record)))
+        other.start()
+        other.join()
+        assert seen == [True]
+    finally:
+        models_list._listing.active = False
+
+
+# The transport over TLS, against a throwaway CA.
+
+
+def _tls_material(directory):
+    from datetime import UTC, datetime, timedelta
+
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.x509.oid import NameOID
+
+    now = datetime.now(UTC)
+
+    def name(cn):
+        return x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, cn)])
+
+    def write(path, cert, key=None):
+        data = cert.public_bytes(serialization.Encoding.PEM)
+        if key is not None:
+            data += key.private_bytes(
+                serialization.Encoding.PEM,
+                serialization.PrivateFormat.PKCS8,
+                serialization.NoEncryption(),
+            )
+        path.write_bytes(data)
+        return str(path)
+
+    def ca(cn):
+        key = ec.generate_private_key(ec.SECP256R1())
+        cert = (
+            x509.CertificateBuilder()
+            .subject_name(name(cn)).issuer_name(name(cn))
+            .public_key(key.public_key()).serial_number(x509.random_serial_number())
+            .not_valid_before(now - timedelta(days=1)).not_valid_after(now + timedelta(days=1))
+            .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+            .add_extension(
+                x509.KeyUsage(False, False, False, False, False, True, True, False, False),
+                critical=True,
+            )
+            .add_extension(x509.SubjectKeyIdentifier.from_public_key(key.public_key()), critical=False)
+            .sign(key, hashes.SHA256())
+        )
+        return cert, key
+
+    def leaf(issuer_cert, issuer_key):
+        key = ec.generate_private_key(ec.SECP256R1())
+        cert = (
+            x509.CertificateBuilder()
+            .subject_name(name("localhost")).issuer_name(issuer_cert.subject)
+            .public_key(key.public_key()).serial_number(x509.random_serial_number())
+            .not_valid_before(now - timedelta(days=1)).not_valid_after(now + timedelta(days=1))
+            .add_extension(x509.SubjectAlternativeName([x509.DNSName("localhost")]), critical=False)
+            .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+            .add_extension(
+                x509.ExtendedKeyUsage([x509.oid.ExtendedKeyUsageOID.SERVER_AUTH]), critical=False
+            )
+            .add_extension(
+                x509.AuthorityKeyIdentifier.from_issuer_public_key(issuer_key.public_key()),
+                critical=False,
+            )
+            .sign(issuer_key, hashes.SHA256())
+        )
+        return cert, key
+
+    trusted_cert, trusted_key = ca("legal-ml-core test CA")
+    stranger_cert, stranger_key = ca("someone else's CA")
+    return {
+        "ca": write(directory / "ca.pem", trusted_cert),
+        "server": write(directory / "server.pem", *leaf(trusted_cert, trusted_key)),
+        "stranger": write(directory / "stranger.pem", *leaf(stranger_cert, stranger_key)),
+    }
+
+
+class TLSServer(RawServer):
+    """``RawServer`` behind TLS, listening on 127.0.0.1 and named ``localhost``."""
+
+    def __init__(self, handle, certfile):
+        self.context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        self.context.load_cert_chain(certfile)
+        super().__init__(handle)
+        self.url = f"https://localhost:{self.port}"
+
+    def _one(self, conn):
+        try:
+            conn.settimeout(10)
+            conn = self.context.wrap_socket(conn, server_side=True)
+        except OSError:
+            conn.close()
+            return
+        super()._one(conn)
+
+
+@pytest.fixture(scope="module")
+def tls_material(tmp_path_factory):
+    return _tls_material(tmp_path_factory.mktemp("tls"))
+
+
+@pytest.fixture
+def tls_server(tls_material, monkeypatch):
+    monkeypatch.setattr(models_list, "CA_CERTS", tls_material["ca"])
+    servers = []
+
+    def start(handle, cert="server"):
+        server = TLSServer(handle, tls_material[cert])
+        servers.append(server)
+        return server
+
+    yield start
+    for server in servers:
+        server.close()
+
+
+def _listing_body(conn):
+    body = json.dumps({"data": [{"id": "b"}, {"id": "a"}]}).encode()
+    conn.sendall(b"HTTP/1.1 200 OK\r\n" + f"Content-Length: {len(body)}\r\n\r\n".encode() + body)
+
+
+def test_tls_lists_models(tls_server):
+    server = tls_server(_listing_body)
+    raw = _fetch(server, budget=3.0)
+    assert json.loads(raw) == {"data": [{"id": "b"}, {"id": "a"}]}
+    assert f"Authorization: Bearer {SECRET}\r\n" in server.requests[0]
+
+
+def test_tls_handshake_that_never_answers_is_cut(raw_server, tls_material, monkeypatch):
+    monkeypatch.setattr(models_list, "CA_CERTS", tls_material["ca"])
+    server = raw_server(lambda conn: None)  # takes the ClientHello and says nothing
+    server.url = f"https://localhost:{server.port}"
+    elapsed = _timed_refusal(server, "provider_unreachable", budget=1.0)
+    print(f"silent TLS handshake refused after {elapsed:.2f}s")
+    assert elapsed < 1.5
+
+
+def test_tls_certificate_from_an_untrusted_ca_is_unreachable(tls_server):
+    server = tls_server(_listing_body, cert="stranger")
+    _timed_refusal(server, "provider_unreachable", budget=3.0)
+    assert server.requests == []
+
+
+def test_tls_hostname_mismatch_is_unreachable(tls_server):
+    server = tls_server(_listing_body)
+    server.url = f"https://127.0.0.1:{server.port}"  # the certificate names localhost only
+    _timed_refusal(server, "provider_unreachable", budget=3.0)
+    assert server.requests == []
+
+
+def test_tls_trickled_body_is_cut_at_the_deadline(tls_server):
+    body = b'{"data": [' + b" " * 200 + b"]}"
+
+    def handle(conn):
+        conn.sendall(b"HTTP/1.1 200 OK\r\n" + f"Content-Length: {len(body)}\r\n\r\n".encode())
+        for byte in body:
+            conn.sendall(bytes([byte]))
+            time.sleep(0.3)
+
+    server = tls_server(handle)
+    elapsed = _timed_refusal(server, "provider_unreachable", budget=1.0)
+    print(f"trickled TLS body refused after {elapsed:.2f}s")
+    assert elapsed < 1.5

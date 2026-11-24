@@ -1552,8 +1552,10 @@ paths:
         No redirect is followed, `Accept-Encoding: identity` is sent and a
         compressed body is refused unread, and a body over 2 MB is
         `listing_unsupported`. One budget of
-        `max(1, min(LLM_TIMEOUT_SECONDS, 15))` seconds covers connect, headers
-        and body. Refusals carry a `code`: `invalid_request`,
+        `max(1, min(LLM_TIMEOUT_SECONDS, 15))` seconds covers each connection
+        attempt, the TLS handshake, the headers and the body; the DNS lookup is
+        left to the system resolver and isn't covered (a tracked follow-up).
+        Refusals carry a `code`: `invalid_request`,
         `base_url_refused`, `no_saved_key`, `saved_key_unreadable`,
         `key_rejected` (401, 403, or a 400 saying "API key"),
         `listing_unsupported` (all 400) or `provider_unreachable` (502: network

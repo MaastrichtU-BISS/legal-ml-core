@@ -6,14 +6,20 @@ exception message and never returned.
 
 The transport is urllib3 on a single connection, not ``requests``: no redirect
 is followed or read, nothing is decompressed, every body is read in bounded
-amounts against a byte cap, and one wall-clock deadline covers connect, headers
-and body together. Refusals are raised outside ``except`` blocks, so none
-carries a library exception (which can hold the request headers) as context.
+amounts against a byte cap, and one wall-clock deadline covers each connection
+attempt, the TLS handshake, the headers and the body together. The DNS lookup
+is not covered: it is left to the system resolver (a follow-up). Refusals are
+raised outside ``except`` blocks, so none carries a library exception (which can
+hold the request headers) as context. While a listing runs, the thread's records
+on the ``urllib3.connection`` logger are dropped, since urllib3 logs raw header
+text there when a provider's headers fail to parse.
 """
 
 import json
+import logging
 import re
 import socket
+import sys
 import threading
 from http.client import HTTPException
 from time import monotonic
@@ -76,6 +82,34 @@ class ModelListError(Exception):
         self.code = code
 
 
+# Set while this thread is inside a model listing.
+_listing = threading.local()
+
+
+class _QuietWhileListing(logging.Filter):
+    """Drops this thread's urllib3.connection records during a listing only.
+
+    urllib3 logs "Failed to parse headers" there with the raw header text, which
+    can be a provider echoing the key back. Other threads, and this thread
+    outside a listing, log as before.
+    """
+
+    def filter(self, record):
+        return not getattr(_listing, "active", False)
+
+
+def _install_log_filter():
+    logger = logging.getLogger("urllib3.connection")
+    if not any(isinstance(f, _QuietWhileListing) for f in logger.filters):
+        logger.addFilter(_QuietWhileListing())
+
+
+_install_log_filter()
+
+DECLARED_LENGTH = re.compile(r"[0-9]{1,15}")
+ALL_DIGITS = re.compile(r"[0-9]+")
+
+
 def timeout_seconds():
     """The whole budget for one listing: at least 1 s, at most 15 s."""
     return max(1, min(int_setting("LLM_TIMEOUT_SECONDS"), MAX_TIMEOUT_SECONDS))
@@ -84,22 +118,72 @@ def timeout_seconds():
 class _Watched:
     """A connection the watchdog can cut, whatever phase it is in.
 
-    ``_new_conn`` keeps a duplicate of the TCP socket: TLS takes over (detaches)
-    the original, but ``shutdown`` on the duplicate still ends the connection,
-    which wakes a blocked connect handshake, header read or body read.
+    ``_new_conn`` connects within ``deadline`` itself, one address at a time,
+    and keeps a duplicate of the TCP socket: TLS takes over (detaches) the
+    original, but ``shutdown`` on the duplicate still ends the connection, which
+    wakes a blocked TLS handshake, header read or body read. ``connect`` in
+    urllib3 calls ``_new_conn`` and then wraps the socket for TLS, so
+    certificate checking is urllib3's own.
+
+    ``_lock`` keeps ``abort`` (on the watchdog thread) and ``dispose`` apart, so
+    the watchdog never shuts down a descriptor number that was closed and then
+    reused by another socket.
     """
 
     aborted = False
+    deadline = None
     _handle = None
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._lock = threading.Lock()
+
     def _new_conn(self):
-        sock = super()._new_conn()
-        self._handle = sock.dup()
-        if self.aborted:  # the watchdog fired while the socket was connecting
-            self._cut()
+        deadline = self.deadline
+        if deadline is None:
+            deadline = monotonic() + MAX_CONNECT_SECONDS
+        host = self._dns_host
+        if host.startswith("["):
+            host = host.strip("[]")
+        # Not bounded by the deadline: the system resolver can't be interrupted.
+        addresses = socket.getaddrinfo(host, self.port, 0, socket.SOCK_STREAM)
+        sock = None
+        error = None
+        for family, kind, proto, _, address in addresses:
+            if self.aborted or monotonic() >= deadline:
+                raise ModelListError("provider_unreachable")
+            candidate = socket.socket(family, kind, proto)
+            try:
+                for option in self.socket_options or ():
+                    candidate.setsockopt(*option)
+                candidate.settimeout(min(MAX_CONNECT_SECONDS, max(deadline - monotonic(), 0.001)))
+                if self.source_address:
+                    candidate.bind(self.source_address)
+                candidate.connect(address)
+            except OSError as exc:
+                candidate.close()
+                error = exc
+                continue
+            sock = candidate
+            break
+        if sock is None:
+            if error is None:
+                raise OSError("getaddrinfo returned no addresses")
+            raise error
+        sys.audit("http.client.connect", self, self.host, self.port)
+        try:
+            handle = sock.dup()
+        except OSError:
+            sock.close()
+            raise
+        with self._lock:
+            self._handle = handle
+            if self.aborted:  # the watchdog fired while the socket was connecting
+                self._cut()
         return sock
 
     def _cut(self):
+        """Shut the duplicate down. Call with ``_lock`` held."""
         handle = self._handle
         if handle is not None:
             try:
@@ -108,8 +192,9 @@ class _Watched:
                 pass
 
     def abort(self):
-        self.aborted = True
-        self._cut()
+        with self._lock:
+            self.aborted = True
+            self._cut()
 
     def set_read_timeout(self, seconds):
         self.timeout = seconds
@@ -126,9 +211,10 @@ class _Watched:
         try:
             self.close()
         finally:
-            handle, self._handle = self._handle, None
-            if handle is not None:
-                handle.close()
+            with self._lock:
+                handle, self._handle = self._handle, None
+                if handle is not None:
+                    handle.close()
 
 
 class _WatchedHTTPS(_Watched, HTTPSConnection):
@@ -225,8 +311,13 @@ def _exchange(conn, target, headers, deadline):
                 raise ModelListError("key_rejected")
             raise ModelListError("listing_unsupported")
         declared = (response.headers.get("Content-Length") or "").strip()
-        if declared.isdigit() and int(declared) > MAX_BODY_BYTES:
+        if DECLARED_LENGTH.fullmatch(declared):
+            if int(declared) > MAX_BODY_BYTES:
+                raise ModelListError("listing_unsupported")
+        elif ALL_DIGITS.fullmatch(declared):
+            # More than 15 digits: far over the cap, and too long for int().
             raise ModelListError("listing_unsupported")
+        # Anything else (``²``, ``1,2``) is ignored: the capped read still holds.
         body = _read_capped(response, deadline, MAX_BODY_BYTES)
         if len(body) > MAX_BODY_BYTES:
             raise ModelListError("listing_unsupported")
@@ -245,11 +336,13 @@ def _fetch(url, headers, deadline):
     target = (parts.path or "/") + (f"?{parts.query}" if parts.query else "")
     remaining = _remaining(deadline)
     conn = _open(parts.scheme, parts.hostname, parts.port, min(remaining, MAX_CONNECT_SECONDS))
+    conn.deadline = deadline
     watchdog = threading.Timer(remaining, conn.abort)
     watchdog.daemon = True
     watchdog.start()
     body = refusal = None
     unreachable = False
+    _listing.active = True
     try:
         body = _exchange(conn, target, headers, deadline)
     except ModelListError as exc:
@@ -257,7 +350,9 @@ def _fetch(url, headers, deadline):
     except NETWORK_ERRORS:
         unreachable = True
     finally:
+        _listing.active = False
         watchdog.cancel()
+        watchdog.join()
         conn.dispose()
     # A read the watchdog cut can look like a clean end of the body.
     if unreachable or conn.aborted:
@@ -325,7 +420,8 @@ def list_chat_models(base_url, api_key):
     The caller has already passed ``base_url`` through ``validate_byok_url``.
     """
     base_url = base_url.rstrip("/")
-    host = urlsplit(base_url).hostname
+    # ``openrouter.ai.`` is ``openrouter.ai``: compare without the trailing dot.
+    host = (urlsplit(base_url).hostname or "").lower().rstrip(".")
     headers = _headers(host, api_key)
     deadline = monotonic() + timeout_seconds()
 
