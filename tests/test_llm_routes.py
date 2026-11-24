@@ -337,7 +337,73 @@ def test_changing_the_model_touches_only_the_owners_key(client, outsider):
     other = {"Authorization": "Bearer test-token::" + json.dumps({"sub": "someone-else"})}
     resp = _change_model(client, other, {"model": "other-model"})
     assert resp.status_code == 404
+    assert resp.get_json()["code"] == "no_saved_key"
     assert LLMCredential.query.one().model == "my-model"
+
+
+def test_changing_the_model_with_two_saved_keys_writes_only_the_callers(client, outsider):
+    other = {"Authorization": "Bearer test-token::" + json.dumps({"sub": "someone-else"})}
+    _save_key(client, outsider)
+    _save_key(client, other)
+    resp = _change_model(client, other, {"model": "their-model"})
+    assert resp.status_code == 200
+    db.session.expire_all()
+    models = {row.owner_id: row.model for row in LLMCredential.query.all()}
+    assert sorted(models.values()) == ["my-model", "their-model"]
+    assert models["someone-else"] == "their-model"
+
+
+def test_a_model_with_a_lone_surrogate_is_refused_not_stored(client, outsider):
+    _save_key(client, outsider)
+    # "\\ud800" in JSON decodes to a lone surrogate, which no database can store as UTF-8.
+    resp = client.patch(
+        "/api/llm/key", data='{"model": "m\\ud800"}', content_type="application/json", headers=outsider
+    )
+    assert resp.status_code == 400
+    assert resp.get_json()["code"] == "invalid_request"
+    assert LLMCredential.query.one().model == "my-model"
+
+
+def test_a_repeated_model_member_is_refused(client, outsider):
+    _save_key(client, outsider)
+    # The JSON decoder would keep the last one; the first, a number, must not slip through.
+    resp = client.patch(
+        "/api/llm/key", data='{"model": 1, "model": "x"}', content_type="application/json", headers=outsider
+    )
+    assert resp.status_code == 400
+    assert resp.get_json()["code"] == "invalid_request"
+    assert LLMCredential.query.one().model == "my-model"
+
+
+def test_a_key_removed_while_the_model_changes_is_404_not_a_500(client, outsider, monkeypatch):
+    _save_key(client, outsider)
+    real_filter_by = LLMCredential.query.filter_by
+
+    class RemovedAfterTheRead:
+        """The first lookup finds the row, then another tab's DELETE lands."""
+
+        def __init__(self, query):
+            self.query = query
+
+        def first(self):
+            row = self.query.first()
+            LLMCredential.query.filter_by(owner_id=row.owner_id).delete(synchronize_session=False)
+            return row
+
+        def __getattr__(self, name):
+            return getattr(self.query, name)
+
+    calls = []
+
+    def filter_by(**kwargs):
+        calls.append(kwargs)
+        query = real_filter_by(**kwargs)
+        return RemovedAfterTheRead(query) if len(calls) == 1 else query
+
+    monkeypatch.setattr(type(LLMCredential.query), "filter_by", lambda self, **kw: filter_by(**kw))
+    resp = _change_model(client, outsider, {"model": "other-model"})
+    assert resp.status_code == 404
+    assert resp.get_json()["code"] == "no_saved_key"
 
 
 def test_saving_a_key_without_encryption_configured_fails(client, app, outsider):
