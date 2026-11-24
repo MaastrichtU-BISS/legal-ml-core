@@ -13,6 +13,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import pytest
 import urllib3
+from urllib3.util.connection import allowed_gai_family
 from cryptography.fernet import Fernet
 
 from legal_ml_core import (
@@ -1134,6 +1135,29 @@ def test_a_bare_list_of_models_is_accepted(client, outsider, listing):
     assert _list_models(client, outsider).get_json() == {"models": [{"id": "a"}, {"id": "b"}]}
 
 
+@pytest.mark.parametrize(
+    "payload",
+    [{"data": [{"name": "missing id"}]}, {"data": [{"id": ""}, {"id": "  "}, "x", 3]}, [{"id": None}]],
+)
+def test_entries_without_one_model_id_are_not_a_listing(client, outsider, listing, payload):
+    # Otherwise any 200 would pass as a working key with an empty list.
+    listing.payload = payload
+    _refusal(_list_models(client, outsider), 400, "listing_unsupported")
+
+
+def test_an_empty_list_and_a_list_the_filter_empties_still_succeed(client, outsider, listing):
+    listing.payload = {"data": []}
+    assert _list_models(client, outsider).get_json() == {"models": []}
+    listing.payload = {"data": [{"id": "text-embedding-3-small"}, {"id": "whisper-1"}]}
+    assert _list_models(client, outsider).get_json() == {"models": []}
+
+
+def test_an_allowlisted_host_idna_cannot_encode_is_a_502_through_the_route(client, app, outsider):
+    app.config["LLM_BYOK_ALLOWED_HOSTS"] = "api..example.org"
+    resp = _list_models(client, outsider, {"base_url": "https://api..example.org/v1", "api_key": SECRET})
+    _refusal(resp, 502, "provider_unreachable")
+
+
 def test_the_saved_key_is_decrypted_on_the_server(client, outsider, listing):
     _save_key(client, outsider, "https://api.example.org/v1/")
     listing.payload = {"data": [{"id": "my-model"}]}
@@ -1825,7 +1849,9 @@ def test_real_socket_an_address_family_this_host_lacks_falls_through(raw_server,
     real_socket = socket.socket
     opened = []
 
-    def getaddrinfo(host, port, *args, **kwargs):
+    def getaddrinfo(host, port, family=0, *args, **kwargs):
+        # The family urllib3 itself would ask for, not "any".
+        assert family == allowed_gai_family()
         return [
             (socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("::1", port, 0, 0)),
             (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", port)),

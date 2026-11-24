@@ -182,7 +182,11 @@ class _Watched:
         if sock is None:
             if error is None:
                 raise OSError("getaddrinfo returned no addresses")
-            raise error
+            try:
+                raise error
+            finally:
+                # As urllib3 does: break the exception -> traceback -> frame cycle.
+                error = None
         sys.audit("http.client.connect", self, self.host, self.port)
         try:
             handle = sock.dup()
@@ -392,11 +396,16 @@ def _entries(raw):
     )
     if not isinstance(data, list):
         raise ModelListError("listing_unsupported")
-    return [
+    entries = [
         e
         for e in data
         if isinstance(e, dict) and isinstance(e.get("id"), str) and e["id"].strip()
     ]
+    if data and not entries:
+        # Something came back, but not one model in it: not a model list, so not a
+        # sign the key works. An empty list, or models the chat filter drops, still is.
+        raise ModelListError("listing_unsupported")
+    return entries
 
 
 def _outputs_text(entry):
