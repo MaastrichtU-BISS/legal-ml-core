@@ -6,7 +6,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 While the version is 0.x, minor releases may contain breaking changes.
 
-## [Unreleased]
+## [Unreleased] - 0.19.0
+
+### Added
+
+- `POST /api/llm/models` lists the chat models an OpenAI-compatible provider
+  offers (#25), for checking a key before saving it and picking a model from a
+  list. The body is `{base_url, api_key}`, a key that is never stored, or
+  `{use_saved_key: true}`. The base URL passes `validate_byok_url` on every
+  call. Returns `{models: [{id, name?}]}` sorted by id: OpenRouter models whose
+  output modalities include text, and for other providers every id that doesn't
+  name embed, whisper, tts, dall-e, image, audio, moderation, realtime or
+  transcribe. `api.anthropic.com` also gets `anthropic-version: 2023-06-01`.
+  Refusals carry a `code`: `key_rejected`, `provider_unreachable` (502),
+  `listing_unsupported`, `no_saved_key`, `saved_key_unreadable`,
+  `base_url_refused` and `invalid_request`. The call times out after
+  `min(LLM_TIMEOUT_SECONDS, 15)` seconds and reads at most 2 MB. No rate limit:
+  the host owns that policy.
 
 ## [0.18.0] - 2026-11-23
 

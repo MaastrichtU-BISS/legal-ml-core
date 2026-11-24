@@ -1530,6 +1530,63 @@ paths:
       responses:
         "200": { description: OK }
         "401": { $ref: "#/components/responses/Unauthorized" }
+  /api/llm/models:
+    post:
+      tags: [llm]
+      summary: List the chat models a provider offers, to check a key or pick a model
+      description: |
+        Calls `GET {base_url}/models` with the key sent here (never stored) or
+        the caller's saved key, decrypted on the server. The base URL passes the
+        same public-host and `LLM_BYOK_ALLOWED_HOSTS` check as a saved key.
+        OpenRouter models are kept when their output modalities include text;
+        for other providers, ids naming embed, whisper, tts, dall-e, image,
+        audio, moderation, realtime or transcribe are dropped. Times out after
+        `min(LLM_TIMEOUT_SECONDS, 15)` seconds; a listing over 2 MB is
+        `listing_unsupported`. Refusals carry a `code`: `invalid_request`,
+        `base_url_refused`, `no_saved_key`, `saved_key_unreadable`,
+        `key_rejected`, `listing_unsupported` (all 400) or
+        `provider_unreachable` (502). Not rate limited here: that is the host's
+        policy.
+      operationId: listLlmModels
+      requestBody:
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - type: object
+                  required: [base_url, api_key]
+                  additionalProperties: false
+                  properties:
+                    base_url: { type: string, description: Public https URL }
+                    api_key: { type: string }
+                - type: object
+                  required: [use_saved_key]
+                  additionalProperties: false
+                  properties:
+                    use_saved_key: { type: boolean, const: true }
+      responses:
+        "200":
+          description: The provider's chat models, sorted by id
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  models:
+                    type: array
+                    items:
+                      type: object
+                      required: [id]
+                      properties:
+                        id: { type: string }
+                        name: { type: string }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "502":
+          description: The provider could not be reached (`provider_unreachable`)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
   /api/llm/datasets/{dataset_id}/acknowledgement:
     parameters:
       - { name: dataset_id, in: path, required: true, schema: { type: string } }

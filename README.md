@@ -191,6 +191,14 @@ app.config["LLM_ENCRYPTION_KEY"] = os.environ["LLM_ENCRYPTION_KEY"]  # Fernet ke
   200000). Pass the same kind to `run_ml_worker(usage_meter=...)`.
 - `LLM_BYOK_ALLOWED_HOSTS` limits where users' keys may go. Unset, any public https
   host is allowed.
+- `POST /api/llm/models` lists a provider's chat models, so a host can check a
+  key before saving it and offer a model list instead of a typed id. Send
+  `{base_url, api_key}` (the key is never stored) or `{use_saved_key: true}`.
+  The base URL passes the same check as a saved key, `api.anthropic.com` also
+  gets an `anthropic-version` header, and refusals carry a `code`
+  (`key_rejected`, `provider_unreachable`, `listing_unsupported`,
+  `no_saved_key`, `saved_key_unreadable`, `base_url_refused`,
+  `invalid_request`). It is not rate limited here; the host should limit it.
 - Call `purge_owner_llm_data(owner_id)` from account erasure.
 - `LLM_AUDIT_HOOK`, a callable `(event, owner_id, **fields)`, receives each new
   acknowledgement for the host's audit log.

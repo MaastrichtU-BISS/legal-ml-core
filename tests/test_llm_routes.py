@@ -13,7 +13,7 @@ from legal_ml_core import (
     db,
     purge_owner_llm_data,
 )
-from legal_ml_core.llm import access, client as llm_client
+from legal_ml_core.llm import access, client as llm_client, models_list
 from legal_ml_core.llm.prompts import DEFAULT_TEMPLATE
 from legal_ml_core.llm.suggest import METER_DOWN_MESSAGE, process_llm_annotation_task
 from tests.conftest import TEST_USER_ID
@@ -948,3 +948,311 @@ def test_suggestions_on_held_out_items_are_not_listed(client, app, gated, provid
     body = client.get(f"/api/llm/datasets/{dataset_id}/suggestions", headers=gated).get_json()
 
     assert [s["task_id"] for s in body["suggestions"]] == task_ids[1:]
+
+
+# Listing a provider's chat models
+
+
+class FakeListing:
+    """Stands in for ``requests.get`` and records what would have been sent."""
+
+    def __init__(self):
+        self.calls = []
+        self.status_code = 200
+        self.payload = {"data": []}
+        self.raw = None
+        self.error = None
+        self.closed = False
+
+    def iter_content(self, size):
+        raw = self.raw if self.raw is not None else json.dumps(self.payload).encode()
+        for start in range(0, len(raw), size):
+            yield raw[start : start + size]
+
+    def close(self):
+        self.closed = True
+
+    def __call__(self, url, headers=None, **kwargs):
+        self.calls.append({"url": url, "headers": headers, **kwargs})
+        if self.error is not None:
+            raise self.error
+        return self
+
+
+@pytest.fixture
+def listing(monkeypatch):
+    fake = FakeListing()
+    monkeypatch.setattr(models_list.requests, "get", fake)
+    return fake
+
+
+def _list_models(client, headers, body=None):
+    if body is None:
+        body = {"base_url": "https://api.example.org/v1", "api_key": SECRET}
+    return client.post("/api/llm/models", json=body, headers=headers)
+
+
+def _refusal(resp, status, code):
+    assert resp.status_code == status, resp.get_json()
+    body = resp.get_json()
+    assert body["code"] == code
+    assert body["error"]
+    assert SECRET not in resp.get_data(as_text=True)
+
+
+def test_listing_models_needs_a_login(client, listing):
+    assert client.post("/api/llm/models", json={"use_saved_key": True}).status_code == 401
+    assert listing.calls == []
+
+
+def test_a_key_being_checked_lists_chat_models_sorted_and_is_not_stored(
+    client, outsider, listing
+):
+    listing.payload = {
+        "data": [
+            {"id": "gpt-4o"},
+            {"id": "text-embedding-3-small"},
+            {"id": "whisper-1"},
+            {"id": "gpt-4o-mini-tts"},
+            {"id": "dall-e-3"},
+            {"id": "gpt-image-1"},
+            {"id": "gpt-4o-audio-preview"},
+            {"id": "omni-moderation-latest"},
+            {"id": "gpt-4o-realtime-preview"},
+            {"id": "gpt-4o-transcribe"},
+            {"id": "Text-Embed-Large"},
+            {"id": "gpt-3.5-turbo"},
+            {"id": "gpt-4o"},
+            {"name": "no id"},
+            "not a model",
+        ]
+    }
+
+    resp = _list_models(client, outsider)
+
+    assert resp.status_code == 200
+    assert resp.get_json() == {"models": [{"id": "gpt-3.5-turbo"}, {"id": "gpt-4o"}]}
+    call = listing.calls[0]
+    assert call["url"] == "https://api.example.org/v1/models"
+    assert call["headers"] == {"Authorization": f"Bearer {SECRET}"}
+    assert call["allow_redirects"] is False
+    assert call["stream"] is True
+    assert listing.closed
+    assert LLMCredential.query.count() == 0
+
+
+def test_the_saved_key_is_decrypted_on_the_server(client, outsider, listing):
+    _save_key(client, outsider, "https://api.example.org/v1/")
+    listing.payload = {"data": [{"id": "my-model"}]}
+
+    resp = _list_models(client, outsider, {"use_saved_key": True})
+
+    assert resp.status_code == 200
+    assert resp.get_json() == {"models": [{"id": "my-model"}]}
+    assert listing.calls[0]["url"] == "https://api.example.org/v1/models"
+    assert listing.calls[0]["headers"]["Authorization"] == f"Bearer {SECRET}"
+    assert SECRET not in resp.get_data(as_text=True)
+
+
+def test_openrouter_keeps_models_that_output_text(client, app, outsider, listing):
+    listing.payload = {
+        "data": [
+            {"id": "z/chat", "name": "Z Chat", "architecture": {"output_modalities": ["text"]}},
+            {"id": "a/vision", "architecture": {"output_modalities": ["text", "image"]}},
+            {"id": "b/painter", "architecture": {"output_modalities": ["image"]}},
+            {"id": "c/old-style", "architecture": {"modality": "text+image->text"}},
+            {"id": "d/old-painter", "architecture": {"modality": "text->image"}},
+            # Says it outputs text, so the id pattern doesn't apply.
+            {"id": "e/image-reasoner", "architecture": {"output_modalities": ["text"]}},
+            {"id": "f/no-architecture"},
+            {"id": "g/text-embed-no-architecture"},
+        ]
+    }
+
+    resp = _list_models(
+        client, outsider, {"base_url": "https://openrouter.ai/api/v1", "api_key": SECRET}
+    )
+
+    assert resp.status_code == 200
+    assert resp.get_json()["models"] == [
+        {"id": "a/vision"},
+        {"id": "c/old-style"},
+        {"id": "e/image-reasoner"},
+        {"id": "f/no-architecture"},
+        {"id": "z/chat", "name": "Z Chat"},
+    ]
+
+
+def test_anthropic_gets_its_version_header_and_display_names(client, outsider, listing):
+    listing.payload = {
+        "data": [{"id": "claude-opus-5-5", "display_name": "Claude Opus 5.5", "type": "model"}],
+        "has_more": False,
+    }
+
+    resp = _list_models(
+        client, outsider, {"base_url": "https://api.anthropic.com/v1", "api_key": SECRET}
+    )
+
+    assert resp.get_json() == {
+        "models": [{"id": "claude-opus-5-5", "name": "Claude Opus 5.5"}]
+    }
+    call = listing.calls[0]
+    assert call["url"] == "https://api.anthropic.com/v1/models?limit=1000"
+    assert call["headers"] == {
+        "Authorization": f"Bearer {SECRET}",
+        "anthropic-version": "2023-06-01",
+    }
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {},
+        {"use_saved_key": False},
+        {"use_saved_key": "yes"},
+        {"use_saved_key": True, "api_key": SECRET},
+        {"base_url": "https://api.example.org/v1"},
+        {"api_key": SECRET},
+        {"base_url": "https://api.example.org/v1", "api_key": "  "},
+        {"base_url": "https://api.example.org/v1", "api_key": 7},
+        {"base_url": "https://api.example.org/v1", "api_key": SECRET, "model": "x"},
+        {"base_url": "https://api.example.org/" + "a" * 500, "api_key": SECRET},
+        [],
+    ],
+)
+def test_any_other_body_is_a_400(client, outsider, listing, body):
+    _refusal(_list_models(client, outsider, body), 400, "invalid_request")
+    assert listing.calls == []
+
+
+@pytest.mark.parametrize(
+    "url", ["http://api.example.org/v1", "https://internal.test/v1", "https://user:pw@api.example.org/v1"]
+)
+def test_a_refused_base_url_never_gets_the_key(client, outsider, listing, url):
+    resp = _list_models(client, outsider, {"base_url": url, "api_key": SECRET})
+    _refusal(resp, 400, "base_url_refused")
+    assert listing.calls == []
+
+
+def test_the_host_allowlist_applies_to_listing(client, app, outsider, listing):
+    app.config["LLM_BYOK_ALLOWED_HOSTS"] = "openrouter.ai"
+    resp = _list_models(client, outsider)
+    _refusal(resp, 400, "base_url_refused")
+    assert resp.get_json()["error"] == "This base URL is not allowed on this platform."
+    assert listing.calls == []
+
+
+def test_a_saved_key_whose_host_turned_private_is_refused(client, outsider, listing, monkeypatch):
+    _save_key(client, outsider)
+    monkeypatch.setattr(access, "_is_public", lambda host: False)
+    _refusal(_list_models(client, outsider, {"use_saved_key": True}), 400, "base_url_refused")
+    assert listing.calls == []
+
+
+@pytest.mark.parametrize("status", [401, 403])
+def test_a_rejected_key(client, outsider, listing, status):
+    listing.status_code = status
+    _refusal(_list_models(client, outsider), 400, "key_rejected")
+    assert listing.closed
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        models_list.requests.ConnectionError(f"failed with {SECRET}"),
+        models_list.requests.Timeout(f"timed out with {SECRET}"),
+    ],
+)
+def test_an_unreachable_provider(client, outsider, listing, error, caplog):
+    listing.error = error
+    _refusal(_list_models(client, outsider), 502, "provider_unreachable")
+    assert SECRET not in caplog.text
+
+
+@pytest.mark.parametrize("status", [429, 500, 503])
+def test_a_provider_that_cannot_answer_now_is_unreachable(client, outsider, listing, status):
+    listing.status_code = status
+    _refusal(_list_models(client, outsider), 502, "provider_unreachable")
+
+
+@pytest.mark.parametrize(
+    "status, raw",
+    [
+        (404, b"{}"),
+        (302, b""),
+        (200, b"<html>not json</html>"),
+        (200, b'{"object": "list"}'),
+        (200, b'{"data": "nope"}'),
+        (200, b'[{"id": "a"}]'),
+    ],
+)
+def test_no_model_list_means_listing_unsupported(client, outsider, listing, status, raw):
+    listing.status_code = status
+    listing.raw = raw
+    _refusal(_list_models(client, outsider), 400, "listing_unsupported")
+
+
+def test_a_listing_over_two_megabytes_is_unsupported(client, outsider, listing):
+    listing.raw = b'{"data": [' + b" " * (2 * 1024 * 1024) + b"]}"
+    _refusal(_list_models(client, outsider), 400, "listing_unsupported")
+    assert listing.closed
+
+
+def test_a_listing_just_under_two_megabytes_is_read(client, outsider, listing):
+    padding = 2 * 1024 * 1024 - len(b'{"data": [{"id": "m"}]}')
+    listing.raw = b'{"data": [{"id": "m"}]}' + b" " * padding
+    assert _list_models(client, outsider).get_json() == {"models": [{"id": "m"}]}
+
+
+@pytest.mark.parametrize("configured, expected", [(30, 15), (5, 5)])
+def test_the_timeout_is_capped_at_fifteen_seconds(client, app, outsider, listing, configured, expected):
+    app.config["LLM_TIMEOUT_SECONDS"] = configured
+    _list_models(client, outsider)
+    assert listing.calls[0]["timeout"] == expected
+
+
+def test_a_trickling_provider_is_cut_off_at_the_deadline(client, outsider, listing, monkeypatch):
+    clock = iter([0.0, 100.0])
+    monkeypatch.setattr(models_list, "monotonic", lambda: next(clock))
+    listing.raw = b'{"data": []}'
+    _refusal(_list_models(client, outsider), 502, "provider_unreachable")
+
+
+def test_a_read_error_mid_body_is_unreachable(client, outsider, listing, monkeypatch):
+    def broken(size):
+        yield b'{"data": ['
+        raise models_list.requests.exceptions.ChunkedEncodingError(SECRET)
+
+    monkeypatch.setattr(listing, "iter_content", broken)
+    _refusal(_list_models(client, outsider), 502, "provider_unreachable")
+
+
+def test_no_saved_key(client, outsider, listing):
+    _refusal(_list_models(client, outsider, {"use_saved_key": True}), 400, "no_saved_key")
+    assert listing.calls == []
+
+
+def test_an_unreadable_saved_key(client, app, outsider, listing):
+    _save_key(client, outsider)
+    app.config["LLM_ENCRYPTION_KEY"] = Fernet.generate_key().decode()
+    _refusal(_list_models(client, outsider, {"use_saved_key": True}), 400, "saved_key_unreadable")
+    assert listing.calls == []
+
+
+def test_the_key_never_reaches_the_logs(client, app, outsider, listing, caplog):
+    caplog.set_level("DEBUG")
+    for status in (200, 401, 404, 500):
+        listing.status_code = status
+        _list_models(client, outsider)
+    _save_key(client, outsider)
+    _list_models(client, outsider, {"use_saved_key": True})
+    assert "api.example.org" in caplog.text
+    assert SECRET not in caplog.text
+
+
+def test_saving_a_key_is_unchanged_by_listing(client, outsider, listing):
+    assert _save_key(client, outsider).get_json() == {
+        "base_url": "https://api.example.org/v1",
+        "model": "my-model",
+    }
+    assert listing.calls == []

@@ -2,6 +2,7 @@
 import json
 import uuid
 from datetime import datetime
+from urllib.parse import urlparse
 
 from flask import Blueprint, current_app, jsonify, request
 
@@ -10,6 +11,7 @@ from ..db import db
 from ..llm.access import (
     CredentialError,
     acknowledgement,
+    decrypt_key,
     encrypt_key,
     resolve_credential,
     shared_key_allowed,
@@ -17,6 +19,7 @@ from ..llm.access import (
 )
 from ..llm.client import LLMError
 from ..llm.config import float_setting, int_setting, shared_endpoint
+from ..llm.models_list import ModelListError, list_chat_models
 from ..llm.prompts import (
     PromptRejected,
     check_template,
@@ -239,6 +242,61 @@ def save_key():
     db.session.commit()
     # The key itself is never returned.
     return jsonify({"base_url": row.base_url, "model": row.model}), 200
+
+
+def _models_request(data):
+    """``(base_url, api_key)`` from ``{base_url, api_key}`` or ``{use_saved_key: true}``."""
+    if data.get("use_saved_key") is True and set(data) == {"use_saved_key"}:
+        row = LLMCredential.query.filter_by(owner_id=_owner()).first()
+        if row is None:
+            raise ApiError(400, "There is no saved API key.", code="no_saved_key")
+        try:
+            api_key = decrypt_key(row.encrypted_key)
+        except CredentialError as exc:
+            raise ApiError(400, str(exc), code="saved_key_unreadable") from None
+        return row.base_url, api_key
+
+    api_key = data.get("api_key")
+    base_url = data.get("base_url")
+    if (
+        set(data) != {"api_key", "base_url"}
+        or not isinstance(api_key, str)
+        or not api_key.strip()
+        or not isinstance(base_url, str)
+        or not base_url.strip()
+    ):
+        raise ApiError(
+            400,
+            "Send base_url and api_key, or use_saved_key: true.",
+            code="invalid_request",
+        )
+    if len(base_url) > 500:
+        raise ApiError(400, "base_url is too long.", code="invalid_request")
+    return base_url.strip().rstrip("/"), api_key.strip()
+
+
+@llm_bp.route("/models", methods=["POST"])
+@jwt_required()
+def list_models():
+    """The chat models a provider offers, to check a key or pick a model id.
+
+    The key sent here is never stored. Rate limiting is the host's policy.
+    """
+    base_url, api_key = _models_request(_body())
+    try:
+        validate_byok_url(base_url)
+    except CredentialError as exc:
+        raise ApiError(400, str(exc), code="base_url_refused") from None
+    try:
+        models = list_chat_models(base_url, api_key)
+    except ModelListError as exc:
+        # Neither the key nor the provider's answer is logged, only the outcome.
+        current_app.logger.info(
+            "model listing refused for %s: %s", urlparse(base_url).hostname, exc.code
+        )
+        status = 502 if exc.code == "provider_unreachable" else 400
+        raise ApiError(status, str(exc), code=exc.code) from None
+    return jsonify({"models": models}), 200
 
 
 @llm_bp.route("/key", methods=["DELETE"])
