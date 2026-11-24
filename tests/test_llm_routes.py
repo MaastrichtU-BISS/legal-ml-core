@@ -27,6 +27,7 @@ from legal_ml_core import (
 from legal_ml_core.llm import access, client as llm_client, models_list
 from legal_ml_core.llm.prompts import DEFAULT_TEMPLATE
 from legal_ml_core.llm.suggest import METER_DOWN_MESSAGE, process_llm_annotation_task
+from legal_ml_core.routes import llm as llm_routes
 from tests.conftest import TEST_USER_ID
 
 monotonic = time.monotonic
@@ -250,6 +251,93 @@ def test_key_can_be_deleted(client, outsider):
     assert client.delete("/api/llm/key", headers=outsider).status_code == 200
     assert LLMCredential.query.count() == 0
     assert client.get("/api/llm/status", headers=outsider).get_json()["mode"] == "none"
+
+
+def _change_model(client, headers, body):
+    return client.patch("/api/llm/key", json=body, headers=headers)
+
+
+def test_changing_the_model_keeps_the_saved_key(client, app, outsider, monkeypatch):
+    _save_key(client, outsider)
+    before = LLMCredential.query.one()
+    ciphertext, base_url = before.encrypted_key, before.base_url
+
+    def no_decrypt(*args, **kwargs):
+        raise AssertionError("the key must not be decrypted")
+
+    monkeypatch.setattr(access, "decrypt_key", no_decrypt)
+    monkeypatch.setattr(llm_routes, "decrypt_key", no_decrypt)
+    resp = _change_model(client, outsider, {"model": "  other-model  "})
+    assert resp.status_code == 200
+    assert resp.get_json() == {"base_url": base_url, "model": "other-model"}
+    assert SECRET not in resp.get_data(as_text=True)
+    db.session.expire_all()
+    row = LLMCredential.query.one()
+    assert row.encrypted_key == ciphertext
+    assert row.base_url == base_url
+    assert row.model == "other-model"
+
+
+def test_changing_the_model_without_a_saved_key_is_404(client, outsider):
+    resp = _change_model(client, outsider, {"model": "other-model"})
+    assert resp.status_code == 404
+    assert resp.get_json()["code"] == "no_saved_key"
+    assert LLMCredential.query.count() == 0
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {},
+        {"model": ""},
+        {"model": "   "},
+        {"model": "m" * 256},
+        {"model": 42},
+        {"model": None},
+        {"model": ["my-model"]},
+        {"model": "other-model", "api_key": SECRET},
+        {"model": "other-model", "base_url": "https://evil.example.org/v1"},
+        {"model": "other-model", "use_saved_key": True},
+    ],
+)
+def test_changing_the_model_refuses_any_other_body(client, outsider, body):
+    _save_key(client, outsider)
+    resp = _change_model(client, outsider, body)
+    assert resp.status_code == 400
+    assert resp.get_json()["code"] == "invalid_request"
+    row = LLMCredential.query.one()
+    assert (row.base_url, row.model) == ("https://api.example.org/v1", "my-model")
+
+
+def test_changing_the_model_refuses_a_non_object_body(client, outsider):
+    _save_key(client, outsider)
+    for data in ('"other-model"', '["other-model"]', "not json"):
+        resp = client.patch(
+            "/api/llm/key", data=data, content_type="application/json", headers=outsider
+        )
+        assert resp.status_code == 400
+        assert resp.get_json()["code"] == "invalid_request"
+
+
+def test_a_model_of_255_characters_after_trimming_is_accepted(client, outsider):
+    _save_key(client, outsider)
+    resp = _change_model(client, outsider, {"model": " " + "m" * 255 + " "})
+    assert resp.status_code == 200
+    assert resp.get_json()["model"] == "m" * 255
+
+
+def test_changing_the_model_needs_a_login(client, outsider):
+    _save_key(client, outsider)
+    assert client.patch("/api/llm/key", json={"model": "other-model"}).status_code == 401
+    assert LLMCredential.query.one().model == "my-model"
+
+
+def test_changing_the_model_touches_only_the_owners_key(client, outsider):
+    _save_key(client, outsider)
+    other = {"Authorization": "Bearer test-token::" + json.dumps({"sub": "someone-else"})}
+    resp = _change_model(client, other, {"model": "other-model"})
+    assert resp.status_code == 404
+    assert LLMCredential.query.one().model == "my-model"
 
 
 def test_saving_a_key_without_encryption_configured_fails(client, app, outsider):

@@ -80,3 +80,13 @@ def test_spec_refs_resolve():
 
 def test_spec_describes_the_refused_field():
     assert "field" in _load_spec()["components"]["schemas"]["Error"]["properties"]
+
+
+def test_spec_patch_llm_key_takes_only_a_model():
+    op = _load_spec()["paths"]["/api/llm/key"]["patch"]
+    schema = op["requestBody"]["content"]["application/json"]["schema"]
+    assert schema["required"] == ["model"]
+    assert schema["additionalProperties"] is False
+    assert set(schema["properties"]) == {"model"}
+    assert schema["properties"]["model"]["maxLength"] == 255
+    assert {"200", "400", "401", "404"} <= set(op["responses"])

@@ -245,6 +245,31 @@ def save_key():
     return jsonify({"base_url": row.base_url, "model": row.model}), 200
 
 
+@llm_bp.route("/key", methods=["PATCH"])
+@jwt_required()
+def change_key_model():
+    """Change only the saved key's model; the key is never decrypted or returned."""
+    data = _body()
+    model = data.get("model")
+    if (
+        set(data) != {"model"}
+        or not isinstance(model, str)
+        or not model.strip()
+        or len(model.strip()) > 255
+    ):
+        raise ApiError(
+            400,
+            "Send only model, a non-empty string of at most 255 characters.",
+            code="invalid_request",
+        )
+    row = LLMCredential.query.filter_by(owner_id=_owner()).first()
+    if row is None:
+        raise ApiError(404, "There is no saved API key.", code="no_saved_key")
+    row.model = model.strip()
+    db.session.commit()
+    return jsonify({"base_url": row.base_url, "model": row.model}), 200
+
+
 # Printable ASCII with no spaces: anything else can't go in a header as typed.
 API_KEY_PATTERN = re.compile(r"[!-~]{1,512}")
 BASE_URL_PATTERN = re.compile(r"[!-~]+")

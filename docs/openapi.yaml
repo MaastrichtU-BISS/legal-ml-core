@@ -1523,6 +1523,39 @@ paths:
         "200": { description: OK }
         "400": { $ref: "#/components/responses/BadRequest" }
         "401": { $ref: "#/components/responses/Unauthorized" }
+    patch:
+      tags: [llm]
+      summary: Change the saved key's model without sending the key
+      description: |
+        Updates only the model of the caller's saved key. The key and base URL
+        are untouched, and the key is never decrypted or returned. The body is
+        exactly `{model}`: a non-empty string of at most 255 characters after
+        trimming; anything else is 400 `invalid_request`. Without a saved key,
+        404 `no_saved_key`.
+      operationId: changeLlmKeyModel
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [model]
+              additionalProperties: false
+              properties:
+                model: { type: string, minLength: 1, maxLength: 255 }
+      responses:
+        "200":
+          description: The saved key's base URL and new model (the same shape as PUT)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/LlmKey" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404":
+          description: No saved key (`no_saved_key`)
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Error" }
     delete:
       tags: [llm]
       summary: Delete the caller's own key
@@ -1986,6 +2019,12 @@ components:
             rule across two parameters, the one the rule limits, such as `solver`
             when a penalty needs another solver. Absent otherwise.
         success: { type: boolean, const: false }
+    LlmKey:
+      type: object
+      required: [base_url, model]
+      properties:
+        base_url: { type: string }
+        model: { type: string }
     PlotlyFigureJson:
       type: string
       description: A Plotly figure serialised with PlotlyJSONEncoder (parse, then pass to Plotly).

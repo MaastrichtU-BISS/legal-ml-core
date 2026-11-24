@@ -8,6 +8,16 @@ While the version is 0.x, minor releases may contain breaking changes.
 
 ## [Unreleased]
 
+### Added
+
+- `PATCH /api/llm/key` changes the saved key's model without the key (#27),
+  so a host can offer "Change model" after listing models with
+  `{use_saved_key: true}`. The body is exactly `{model}`, a non-empty string of
+  at most 255 characters after trimming; anything else is 400
+  `invalid_request`. No saved key is 404 `no_saved_key`. Returns
+  `{base_url, model}`, like `PUT`. The encrypted key and `base_url` are left
+  alone, and the key is never decrypted. `PUT` and `DELETE` are unchanged.
+
 ## [0.19.0] - 2026-11-24
 
 ### Added
