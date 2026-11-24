@@ -212,8 +212,8 @@ app.config["LLM_ENCRYPTION_KEY"] = os.environ["LLM_ENCRYPTION_KEY"]  # Fernet ke
   without sending the key again, for a host whose browser never holds it.
   Only the model changes; the key is not decrypted or returned. It answers
   `{base_url, model}` like `PUT`, 400 `invalid_request` for any other body
-  (a blank model, one over 255 characters after trimming, extra or repeated
-  fields), and 404 `no_saved_key` when there is no saved key, or it was
+  (a blank model, one over 255 characters after trimming, one with a NUL,
+  extra or repeated fields, or a body not sent as `application/json`), and 404 `no_saved_key` when there is no saved key, or it was
   removed meanwhile.
 - Call `purge_owner_llm_data(owner_id)` from account erasure.
 - `LLM_AUDIT_HOOK`, a callable `(event, owner_id, **fields)`, receives each new

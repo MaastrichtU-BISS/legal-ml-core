@@ -1535,8 +1535,8 @@ paths:
         are untouched, and the key is never decrypted or returned. The body is
         exactly `{model}`: a non-empty string of at most 255 characters after
         trimming (so surrounding spaces don't count, and a blank one is
-        refused), with no repeated member; anything else is 400
-        `invalid_request`. Without a saved key, or if it is removed meanwhile,
+        refused), with no NUL and no repeated member, sent as
+        `application/json`; anything else is 400 `invalid_request`. Without a saved key, or if it is removed meanwhile,
         404 `no_saved_key`.
       operationId: changeLlmKeyModel
       requestBody:
