@@ -1,8 +1,19 @@
+import errno
+import gzip
+import http.client
+import io
 import json
+import logging
+import socket
+import ssl
 import threading
+import time
+import tracemalloc
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import pytest
+import urllib3
+from urllib3.util.connection import allowed_gai_family
 from cryptography.fernet import Fernet
 
 from legal_ml_core import (
@@ -13,10 +24,12 @@ from legal_ml_core import (
     db,
     purge_owner_llm_data,
 )
-from legal_ml_core.llm import access, client as llm_client
+from legal_ml_core.llm import access, client as llm_client, models_list
 from legal_ml_core.llm.prompts import DEFAULT_TEMPLATE
 from legal_ml_core.llm.suggest import METER_DOWN_MESSAGE, process_llm_annotation_task
 from tests.conftest import TEST_USER_ID
+
+monotonic = time.monotonic
 
 PROJECT = "proj-1"
 DESTINATION = "llm.test"
@@ -948,3 +961,1187 @@ def test_suggestions_on_held_out_items_are_not_listed(client, app, gated, provid
     body = client.get(f"/api/llm/datasets/{dataset_id}/suggestions", headers=gated).get_json()
 
     assert [s["task_id"] for s in body["suggestions"]] == task_ids[1:]
+
+
+# Listing a provider's chat models
+
+
+class FakeResponse:
+    def __init__(self, owner, status, raw, headers):
+        self.owner = owner
+        self.status = status
+        self.headers = headers
+        self._body = io.BytesIO(raw)
+
+    def read(self, amt, decode_content=True):
+        assert decode_content is False
+        if self.owner.read_error is not None:
+            chunk = self._body.read(8)
+            if self._body.tell() > 8:
+                raise self.owner.read_error
+            return chunk
+        return self._body.read(amt)
+
+    def close(self):
+        self.owner.response_closed = True
+
+
+class FakeListing:
+    """Stands in for ``models_list._open``: records what would have been sent.
+
+    ``responses`` maps a path suffix (``/key``, ``/models``) to ``(status, raw)``;
+    anything else gets ``status`` and ``payload`` (or ``raw``).
+    """
+
+    def __init__(self):
+        self.calls = []
+        self.status = 200
+        self.payload = {"data": []}
+        self.raw = None
+        self.headers = {}
+        self.responses = {}
+        self.error = None
+        self.read_error = None
+        self.closed = False
+        self.response_closed = False
+        self.aborted = False
+
+    def __call__(self, scheme, host, port, connect_timeout):
+        self._origin = f"{scheme}://{host}" + (f":{port}" if port else "")
+        self._connect_timeout = connect_timeout
+        return self
+
+    def connect(self):
+        if self.error is not None:
+            raise self.error
+
+    def set_read_timeout(self, seconds):
+        self._read_timeout = seconds
+
+    def request(self, method, target, headers=None, **kwargs):
+        self.calls.append(
+            {
+                "method": method,
+                "url": self._origin + target,
+                "headers": headers,
+                "connect_timeout": self._connect_timeout,
+                **kwargs,
+            }
+        )
+        self._path = target.split("?", 1)[0]
+
+    def getresponse(self):
+        for suffix, (status, raw) in self.responses.items():
+            if self._path.endswith(suffix):
+                return FakeResponse(self, status, raw, self.headers)
+        raw = self.raw if self.raw is not None else json.dumps(self.payload).encode()
+        return FakeResponse(self, self.status, raw, self.headers)
+
+    def abort(self):
+        self.aborted = True
+
+    def dispose(self):
+        self.closed = True
+
+
+@pytest.fixture
+def listing(monkeypatch):
+    fake = FakeListing()
+    monkeypatch.setattr(models_list, "_open", fake)
+    return fake
+
+
+def _list_models(client, headers, body=None):
+    if body is None:
+        body = {"base_url": "https://api.example.org/v1", "api_key": SECRET}
+    return client.post("/api/llm/models", json=body, headers=headers)
+
+
+def _refusal(resp, status, code):
+    assert resp.status_code == status, resp.get_json()
+    body = resp.get_json()
+    assert body["code"] == code
+    assert body["error"]
+    assert SECRET not in resp.get_data(as_text=True)
+    return body
+
+
+def _sent(headers=None):
+    return {
+        "Authorization": f"Bearer {SECRET}",
+        "Accept": "application/json",
+        "Accept-Encoding": "identity",
+        **(headers or {}),
+    }
+
+
+def test_listing_models_needs_a_login(client, listing):
+    assert client.post("/api/llm/models", json={"use_saved_key": True}).status_code == 401
+    assert listing.calls == []
+
+
+def test_a_key_being_checked_lists_chat_models_sorted_and_is_not_stored(
+    client, outsider, listing
+):
+    listing.payload = {
+        "data": [
+            {"id": "gpt-4o"},
+            {"id": "text-embedding-3-small"},
+            {"id": "whisper-1"},
+            {"id": "tts-1"},
+            {"id": "gpt-4o-mini-tts"},
+            {"id": "dall-e-3"},
+            {"id": "gpt-image-1"},
+            {"id": "gpt-4o-audio-preview"},
+            {"id": "omni-moderation-latest"},
+            {"id": "gpt-4o-realtime-preview"},
+            {"id": "gpt-4o-transcribe"},
+            {"id": "Text-Embed-Large"},
+            {"id": "gpt-3.5-turbo"},
+            {"id": "mattshumer/reflection-70b"},
+            {"id": "gpt-4o"},
+            {"id": "   "},
+            {"name": "no id"},
+            "not a model",
+        ]
+    }
+
+    resp = _list_models(client, outsider)
+
+    assert resp.status_code == 200
+    assert resp.get_json() == {
+        "models": [{"id": "gpt-3.5-turbo"}, {"id": "gpt-4o"}, {"id": "mattshumer/reflection-70b"}]
+    }
+    call = listing.calls[0]
+    assert call["method"] == "GET"
+    assert call["url"] == "https://api.example.org/v1/models"
+    assert call["headers"] == _sent()
+    assert call["preload_content"] is False
+    assert call["decode_content"] is False
+    assert call["connect_timeout"] <= 5
+    assert listing.closed and listing.response_closed
+    assert LLMCredential.query.count() == 0
+
+
+def test_a_name_equal_to_the_id_is_left_out(client, outsider, listing):
+    listing.payload = {"data": [{"id": "m", "name": "m"}, {"id": "n", "name": " N "}]}
+    assert _list_models(client, outsider).get_json() == {
+        "models": [{"id": "m"}, {"id": "n", "name": "N"}]
+    }
+
+
+def test_a_bare_list_of_models_is_accepted(client, outsider, listing):
+    listing.raw = b'[{"id": "b"}, {"id": "a"}]'
+    assert _list_models(client, outsider).get_json() == {"models": [{"id": "a"}, {"id": "b"}]}
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [{"data": [{"name": "missing id"}]}, {"data": [{"id": ""}, {"id": "  "}, "x", 3]}, [{"id": None}]],
+)
+def test_entries_without_one_model_id_are_not_a_listing(client, outsider, listing, payload):
+    # Otherwise any 200 would pass as a working key with an empty list.
+    listing.payload = payload
+    _refusal(_list_models(client, outsider), 400, "listing_unsupported")
+
+
+def test_an_empty_list_and_a_list_the_filter_empties_still_succeed(client, outsider, listing):
+    listing.payload = {"data": []}
+    assert _list_models(client, outsider).get_json() == {"models": []}
+    listing.payload = {"data": [{"id": "text-embedding-3-small"}, {"id": "whisper-1"}]}
+    assert _list_models(client, outsider).get_json() == {"models": []}
+
+
+def test_an_allowlisted_host_idna_cannot_encode_is_a_502_through_the_route(client, app, outsider):
+    app.config["LLM_BYOK_ALLOWED_HOSTS"] = "api..example.org"
+    resp = _list_models(client, outsider, {"base_url": "https://api..example.org/v1", "api_key": SECRET})
+    _refusal(resp, 502, "provider_unreachable")
+
+
+def test_the_saved_key_is_decrypted_on_the_server(client, outsider, listing):
+    _save_key(client, outsider, "https://api.example.org/v1/")
+    listing.payload = {"data": [{"id": "my-model"}]}
+
+    resp = _list_models(client, outsider, {"use_saved_key": True})
+
+    assert resp.status_code == 200
+    assert resp.get_json() == {"models": [{"id": "my-model"}]}
+    assert listing.calls[0]["url"] == "https://api.example.org/v1/models"
+    assert listing.calls[0]["headers"]["Authorization"] == f"Bearer {SECRET}"
+    assert SECRET not in resp.get_data(as_text=True)
+
+
+def test_a_provider_echoing_the_saved_key_never_returns_it(client, outsider, listing):
+    _save_key(client, outsider)
+    listing.payload = {
+        "data": [
+            {"id": f"model-{SECRET}"},
+            {"id": "named", "name": f"Key {SECRET}"},
+            {"id": "plain", "display_name": "Plain"},
+        ]
+    }
+
+    resp = _list_models(client, outsider, {"use_saved_key": True})
+
+    assert resp.get_json() == {"models": [{"id": "named"}, {"id": "plain", "name": "Plain"}]}
+    assert SECRET not in resp.get_data(as_text=True)
+
+
+def test_openrouter_keeps_models_that_output_text(client, outsider, listing):
+    listing.responses["/key"] = (200, b'{"data": {"label": "sk-or-...", "usage": 0}}')
+    listing.payload = {
+        "data": [
+            {"id": "z/chat", "name": "Z Chat", "architecture": {"output_modalities": ["text"]}},
+            {"id": "a/vision", "architecture": {"output_modalities": ["text", "image"]}},
+            {"id": "b/painter", "architecture": {"output_modalities": ["image"]}},
+            {"id": "c/old-style", "architecture": {"modality": "text+image->text"}},
+            {"id": "d/old-painter", "architecture": {"modality": "text->image"}},
+            # Says it outputs text, so the id pattern doesn't apply.
+            {"id": "e/image-reasoner", "architecture": {"output_modalities": ["text"]}},
+            # Says nothing about what it outputs, so it is left out.
+            {"id": "f/no-architecture"},
+            {"id": "g/empty-architecture", "architecture": {}},
+        ]
+    }
+
+    resp = _list_models(
+        client, outsider, {"base_url": "https://openrouter.ai/api/v1", "api_key": SECRET}
+    )
+
+    assert resp.status_code == 200
+    assert resp.get_json()["models"] == [
+        {"id": "a/vision"},
+        {"id": "c/old-style"},
+        {"id": "e/image-reasoner"},
+        {"id": "z/chat", "name": "Z Chat"},
+    ]
+    assert [c["url"] for c in listing.calls] == [
+        "https://openrouter.ai/api/v1/key",
+        "https://openrouter.ai/api/v1/models",
+    ]
+    assert all(c["headers"] == _sent() for c in listing.calls)
+
+
+@pytest.mark.parametrize("status", [401, 403])
+def test_openrouter_checks_the_key_before_listing(client, outsider, listing, status):
+    listing.responses["/key"] = (status, b'{"error": {"message": "No auth credentials found"}}')
+    listing.payload = {"data": [{"id": "z/chat", "architecture": {"output_modalities": ["text"]}}]}
+
+    resp = _list_models(
+        client, outsider, {"base_url": "https://openrouter.ai/api/v1", "api_key": SECRET}
+    )
+
+    _refusal(resp, 400, "key_rejected")
+    assert [c["url"] for c in listing.calls] == ["https://openrouter.ai/api/v1/key"]
+
+
+def test_a_trailing_dot_on_openrouter_still_checks_the_key(client, outsider, listing):
+    listing.responses["/key"] = (401, b'{"error": {"message": "No auth credentials found"}}')
+
+    resp = _list_models(
+        client, outsider, {"base_url": "https://openrouter.ai./api/v1", "api_key": SECRET}
+    )
+
+    _refusal(resp, 400, "key_rejected")
+    assert [c["url"] for c in listing.calls] == ["https://openrouter.ai./api/v1/key"]
+
+
+def test_a_trailing_dot_on_anthropic_still_sends_its_version(client, outsider, listing):
+    resp = _list_models(
+        client, outsider, {"base_url": "https://API.Anthropic.com./v1", "api_key": SECRET}
+    )
+
+    assert resp.status_code == 200
+    assert listing.calls[0]["headers"]["anthropic-version"] == models_list.ANTHROPIC_VERSION
+    assert listing.calls[0]["url"].endswith("/v1/models?limit=1000")
+
+
+def test_anthropic_gets_bearer_only_its_version_header_and_display_names(
+    client, outsider, listing
+):
+    listing.payload = {
+        "data": [{"id": "claude-opus-5-5", "display_name": "Claude Opus 5.5", "type": "model"}],
+        "has_more": False,
+    }
+
+    resp = _list_models(
+        client, outsider, {"base_url": "https://api.anthropic.com/v1", "api_key": SECRET}
+    )
+
+    assert resp.get_json() == {
+        "models": [{"id": "claude-opus-5-5", "name": "Claude Opus 5.5"}]
+    }
+    call = listing.calls[0]
+    assert call["url"] == "https://api.anthropic.com/v1/models?limit=1000"
+    assert call["headers"] == _sent({"anthropic-version": "2023-06-01"})
+    assert "x-api-key" not in {k.lower() for k in call["headers"]}
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {},
+        {"use_saved_key": False},
+        {"use_saved_key": "yes"},
+        {"use_saved_key": True, "api_key": SECRET},
+        {"base_url": "https://api.example.org/v1"},
+        {"api_key": SECRET},
+        {"base_url": "https://api.example.org/v1", "api_key": "  "},
+        {"base_url": "https://api.example.org/v1", "api_key": 7},
+        {"base_url": "https://api.example.org/v1", "api_key": SECRET, "model": "x"},
+        {"base_url": "https://api.example.org/" + "a" * 500, "api_key": SECRET},
+        [],
+    ],
+)
+def test_any_other_body_is_a_400(client, outsider, listing, body):
+    _refusal(_list_models(client, outsider, body), 400, "invalid_request")
+    assert listing.calls == []
+
+
+@pytest.mark.parametrize(
+    "api_key",
+    [
+        "sk-“quoted”",
+        "sk-zero​width",
+        "sk-two\r\nX-Injected: 1",
+        "sk-with space",
+        "sk-tab\tkey",
+        "sk-\x00nul",
+        "sk-" + "a" * 510,
+    ],
+)
+def test_a_key_with_characters_a_key_cant_contain_is_a_400(client, outsider, listing, api_key):
+    resp = _list_models(
+        client, outsider, {"base_url": "https://api.example.org/v1", "api_key": api_key}
+    )
+    body = _refusal(resp, 400, "invalid_request")
+    assert body["error"] == "The API key has characters an API key can't contain."
+    assert api_key.strip() not in resp.get_data(as_text=True)
+    assert listing.calls == []
+
+
+def test_a_key_of_512_printable_characters_is_accepted(client, outsider, listing):
+    resp = _list_models(
+        client, outsider, {"base_url": "https://api.example.org/v1", "api_key": "k" * 512}
+    )
+    assert resp.status_code == 200
+
+
+def test_a_saved_key_that_cant_be_sent_is_unreadable(client, outsider, listing):
+    client.put(
+        "/api/llm/key",
+        json={"api_key": "sk-​hidden", "base_url": "https://api.example.org/v1", "model": "m"},
+        headers=outsider,
+    )
+    resp = _list_models(client, outsider, {"use_saved_key": True})
+    _refusal(resp, 400, "saved_key_unreadable")
+    assert "hidden" not in resp.get_data(as_text=True)
+    assert listing.calls == []
+
+
+@pytest.mark.parametrize(
+    "url", ["http://api.example.org/v1", "https://internal.test/v1", "https://user:pw@api.example.org/v1"]
+)
+def test_a_refused_base_url_never_gets_the_key(client, outsider, listing, url):
+    resp = _list_models(client, outsider, {"base_url": url, "api_key": SECRET})
+    _refusal(resp, 400, "base_url_refused")
+    assert listing.calls == []
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://[::1/v1",
+        "https://[not-an-ip]/v1",
+        "https://api.example.org:99999/v1",
+        "https://api.example.org:port/v1",
+        "https://api.exa mple.org/v1",
+        "https://api.example.org/vü",
+    ],
+)
+def test_a_malformed_base_url_is_refused(client, outsider, listing, url):
+    resp = _list_models(client, outsider, {"base_url": url, "api_key": SECRET})
+    _refusal(resp, 400, "base_url_refused")
+    assert listing.calls == []
+
+
+@pytest.mark.parametrize(
+    "url",
+    ["https://api.example.org/v1?x=1", "https://api.example.org/v1#frag", "https://api.example.org/v1?"],
+)
+def test_a_base_url_with_a_query_or_fragment_is_refused(client, outsider, listing, url):
+    resp = _list_models(client, outsider, {"base_url": url, "api_key": SECRET})
+    body = _refusal(resp, 400, "base_url_refused")
+    assert body["error"] == "The base URL can't have a query or fragment."
+    assert listing.calls == []
+
+
+def test_the_host_allowlist_applies_to_listing(client, app, outsider, listing):
+    app.config["LLM_BYOK_ALLOWED_HOSTS"] = "openrouter.ai"
+    resp = _list_models(client, outsider)
+    _refusal(resp, 400, "base_url_refused")
+    assert resp.get_json()["error"] == "This base URL is not allowed on this platform."
+    assert listing.calls == []
+
+
+def test_a_saved_key_whose_host_turned_private_is_refused(client, outsider, listing, monkeypatch):
+    _save_key(client, outsider)
+    monkeypatch.setattr(access, "_is_public", lambda host: False)
+    _refusal(_list_models(client, outsider, {"use_saved_key": True}), 400, "base_url_refused")
+    assert listing.calls == []
+
+
+@pytest.mark.parametrize("status", [401, 403])
+def test_a_rejected_key(client, outsider, listing, status):
+    listing.status = status
+    _refusal(_list_models(client, outsider), 400, "key_rejected")
+    assert listing.closed and listing.response_closed
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        b'{"error": {"code": 400, "message": "API key not valid. Please pass a valid API key."}}',
+        b'[{"error": {"message": "api KEY expired"}}]',
+    ],
+)
+def test_a_400_that_names_the_api_key_is_a_rejected_key(client, outsider, listing, raw):
+    listing.status = 400
+    listing.raw = raw
+    _refusal(_list_models(client, outsider), 400, "key_rejected")
+    assert listing.closed and listing.response_closed
+
+
+def test_a_400_that_names_the_api_key_past_8_kb_is_not_read_that_far(client, outsider, listing):
+    listing.status = 400
+    listing.raw = b" " * (8 * 1024 + 1) + b"API key not valid"
+    _refusal(_list_models(client, outsider), 400, "listing_unsupported")
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        OSError(f"failed with {SECRET}"),
+        urllib3.exceptions.NewConnectionError(None, f"failed with {SECRET}"),
+        urllib3.exceptions.ConnectTimeoutError(f"timed out with {SECRET}"),
+        urllib3.exceptions.ProtocolError(f"broken with {SECRET}"),
+        http.client.RemoteDisconnected(f"gone with {SECRET}"),
+    ],
+)
+def test_an_unreachable_provider(client, outsider, listing, error, caplog):
+    caplog.set_level("INFO")
+    listing.error = error
+    _refusal(_list_models(client, outsider), 502, "provider_unreachable")
+    assert listing.closed
+    assert SECRET not in caplog.text
+
+
+@pytest.mark.parametrize("status", [408, 500, 503])
+def test_a_provider_that_cannot_answer_now_is_unreachable(client, outsider, listing, status):
+    listing.status = status
+    body = _refusal(_list_models(client, outsider), 502, "provider_unreachable")
+    assert body["error"] == models_list.MESSAGES["provider_unreachable"]
+    assert listing.closed and listing.response_closed
+
+
+def test_a_rate_limited_key_says_so(client, outsider, listing):
+    listing.status = 429
+    body = _refusal(_list_models(client, outsider), 502, "provider_unreachable")
+    assert body["error"] == "The provider is limiting requests. Try again in a moment."
+
+
+@pytest.mark.parametrize(
+    "status, raw",
+    [
+        (404, b"{}"),
+        (302, b""),
+        (400, b'{"error": "bad request"}'),
+        (200, b"<html>not json</html>"),
+        (200, b'{"object": "list"}'),
+        (200, b'{"data": "nope"}'),
+        (200, b'"just a string"'),
+        (200, b"\xff\xfe not utf-8"),
+        (200, b"[" * 100_000 + b"]" * 100_000),
+    ],
+)
+def test_no_model_list_means_listing_unsupported(client, outsider, listing, status, raw):
+    listing.status = status
+    listing.raw = raw
+    _refusal(_list_models(client, outsider), 400, "listing_unsupported")
+    assert listing.closed and listing.response_closed
+
+
+@pytest.mark.parametrize("encoding", ["gzip", "br", "deflate", "x-unknown"])
+def test_a_compressed_listing_is_refused_unread(client, outsider, listing, encoding):
+    listing.headers = {"Content-Encoding": encoding}
+    _refusal(_list_models(client, outsider), 400, "listing_unsupported")
+
+
+def test_an_identity_encoded_listing_is_read(client, outsider, listing):
+    listing.headers = {"Content-Encoding": "identity"}
+    listing.payload = {"data": [{"id": "m"}]}
+    assert _list_models(client, outsider).get_json() == {"models": [{"id": "m"}]}
+
+
+def test_a_listing_over_two_megabytes_is_unsupported(client, outsider, listing):
+    listing.raw = b'{"data": [' + b" " * (2 * 1024 * 1024) + b"]}"
+    _refusal(_list_models(client, outsider), 400, "listing_unsupported")
+    assert listing.closed and listing.response_closed
+
+
+def test_a_declared_length_over_two_megabytes_is_refused_unread(client, outsider, listing):
+    listing.headers = {"Content-Length": str(2 * 1024 * 1024 + 1)}
+    listing.payload = {"data": [{"id": "m"}]}
+    _refusal(_list_models(client, outsider), 400, "listing_unsupported")
+
+
+def test_a_listing_just_under_two_megabytes_is_read(client, outsider, listing):
+    padding = 2 * 1024 * 1024 - len(b'{"data": [{"id": "m"}]}')
+    listing.raw = b'{"data": [{"id": "m"}]}' + b" " * padding
+    assert _list_models(client, outsider).get_json() == {"models": [{"id": "m"}]}
+
+
+@pytest.mark.parametrize("configured, expected", [(30, 15), (5, 5), (0, 1), (-3, 1)])
+def test_the_budget_is_between_one_and_fifteen_seconds(app, configured, expected):
+    app.config["LLM_TIMEOUT_SECONDS"] = configured
+    with app.app_context():
+        assert models_list.timeout_seconds() == expected
+
+
+def test_a_zero_timeout_setting_still_answers(client, app, outsider, listing):
+    app.config["LLM_TIMEOUT_SECONDS"] = 0
+    assert _list_models(client, outsider).status_code == 200
+    assert 0 < listing.calls[0]["connect_timeout"] <= 1
+
+
+def test_a_trickling_provider_is_cut_off_at_the_deadline(client, outsider, listing, monkeypatch):
+    clock = iter([0.0, 0.1, 0.2, 0.3, 100.0, 100.0, 100.0])
+    monkeypatch.setattr(models_list, "monotonic", lambda: next(clock))
+    listing.raw = b'{"data": []}'
+    _refusal(_list_models(client, outsider), 502, "provider_unreachable")
+    assert listing.closed and listing.response_closed
+
+
+def test_a_read_error_mid_body_is_unreachable(client, outsider, listing, caplog):
+    caplog.set_level("INFO")
+    listing.read_error = urllib3.exceptions.ProtocolError(f"Connection broken: {SECRET}")
+    listing.payload = {"data": [{"id": "a" * 100}]}
+    _refusal(_list_models(client, outsider), 502, "provider_unreachable")
+    assert listing.closed and listing.response_closed
+    assert "model listing refused for api.example.org: provider_unreachable" in caplog.text
+    assert SECRET not in caplog.text
+
+
+def test_a_refusal_carries_no_library_exception(app, monkeypatch):
+    class Broken:
+        def connect(self):
+            raise OSError(f"could not send Authorization: Bearer {SECRET}")
+
+        def abort(self):
+            pass
+
+        def dispose(self):
+            pass
+
+        aborted = False
+
+    monkeypatch.setattr(models_list, "_open", lambda *args: Broken())
+    with app.app_context(), pytest.raises(models_list.ModelListError) as caught:
+        models_list.list_chat_models("https://api.example.org/v1", SECRET)
+    exc = caught.value
+    assert exc.code == "provider_unreachable"
+    assert exc.__context__ is None
+    assert exc.__cause__ is None
+
+
+def test_no_saved_key(client, outsider, listing):
+    _refusal(_list_models(client, outsider, {"use_saved_key": True}), 400, "no_saved_key")
+    assert listing.calls == []
+
+
+def test_an_unreadable_saved_key(client, app, outsider, listing):
+    _save_key(client, outsider)
+    app.config["LLM_ENCRYPTION_KEY"] = Fernet.generate_key().decode()
+    _refusal(_list_models(client, outsider, {"use_saved_key": True}), 400, "saved_key_unreadable")
+    assert listing.calls == []
+
+
+def test_the_key_never_reaches_the_logs(client, outsider, listing, caplog):
+    caplog.set_level("DEBUG")
+    for status in (200, 400, 401, 404, 429, 500):
+        listing.status = status
+        _list_models(client, outsider)
+    _save_key(client, outsider)
+    _list_models(client, outsider, {"use_saved_key": True})
+    assert "api.example.org" in caplog.text
+    assert SECRET not in caplog.text
+
+
+def test_saving_a_key_is_unchanged_by_listing(client, outsider, listing):
+    assert _save_key(client, outsider).get_json() == {
+        "base_url": "https://api.example.org/v1",
+        "model": "my-model",
+    }
+    assert listing.calls == []
+
+
+# The transport against a real socket. These call models_list directly, which
+# skips validate_byok_url, so a loopback server is fine.
+
+
+class RawServer:
+    """A loopback TCP server whose handler writes whatever bytes a test wants."""
+
+    def __init__(self, handle):
+        self.handle = handle
+        self.requests = []
+        self.client_gone = threading.Event()
+        self.sock = socket.socket()
+        self.sock.bind(("127.0.0.1", 0))
+        self.sock.listen(4)
+        self.port = self.sock.getsockname()[1]
+        self.url = f"http://127.0.0.1:{self.port}"
+        self._thread = threading.Thread(target=self._serve, daemon=True)
+        self._thread.start()
+
+    def _serve(self):
+        while True:
+            try:
+                conn, _ = self.sock.accept()
+            except OSError:
+                return
+            threading.Thread(target=self._one, args=(conn,), daemon=True).start()
+
+    def _one(self, conn):
+        with conn:
+            conn.settimeout(10)
+            head = b""
+            try:
+                while b"\r\n\r\n" not in head:
+                    chunk = conn.recv(4096)
+                    if not chunk:
+                        return
+                    head += chunk
+                self.requests.append(head.decode("latin-1"))
+                self.handle(conn)
+                # Everything was sent; the client closing shows up as EOF.
+                if conn.recv(1) == b"":
+                    self.client_gone.set()
+            except OSError:
+                self.client_gone.set()
+
+    def close(self):
+        self.sock.close()
+
+
+@pytest.fixture
+def raw_server():
+    servers = []
+
+    def start(handle):
+        server = RawServer(handle)
+        servers.append(server)
+        return server
+
+    yield start
+    for server in servers:
+        server.close()
+
+
+def _fetch(server, path="/v1/models", budget=1.0, api_key=SECRET):
+    return models_list._fetch(
+        server.url + path, {"Authorization": f"Bearer {api_key}"}, monotonic() + budget
+    )
+
+
+def _timed_refusal(server, code, **kwargs):
+    started = monotonic()
+    with pytest.raises(models_list.ModelListError) as caught:
+        _fetch(server, **kwargs)
+    elapsed = monotonic() - started
+    assert caught.value.code == code
+    assert caught.value.__context__ is None
+    return elapsed
+
+
+def _lines(*lines):
+    return [line.encode() + b"\r\n" for line in lines]
+
+
+def test_real_socket_lists_models(raw_server, app):
+    body = json.dumps({"data": [{"id": "b"}, {"id": "a", "name": "A"}]}).encode()
+
+    def handle(conn):
+        conn.sendall(
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+            + f"Content-Length: {len(body)}\r\n\r\n".encode()
+            + body
+        )
+
+    server = raw_server(handle)
+    with app.app_context():
+        models = models_list.list_chat_models(server.url + "/v1", SECRET)
+    assert models == [{"id": "a", "name": "A"}, {"id": "b"}]
+    sent = server.requests[0]
+    assert sent.startswith("GET /v1/models HTTP/1.1\r\n")
+    assert "Accept-Encoding: identity\r\n" in sent
+    assert f"Authorization: Bearer {SECRET}\r\n" in sent
+
+
+def test_real_socket_trickled_headers_are_cut_at_the_deadline(raw_server):
+    def handle(conn):
+        for line in _lines("HTTP/1.1 200 OK", *[f"X-Slow-{i}: y" for i in range(100)]):
+            conn.sendall(line)
+            time.sleep(0.3)
+
+    server = raw_server(handle)
+    elapsed = _timed_refusal(server, "provider_unreachable", budget=1.0)
+    print(f"trickled headers refused after {elapsed:.2f}s")
+    assert elapsed < 2.0
+    assert server.client_gone.wait(2)
+
+
+def test_real_socket_trickled_body_is_cut_at_the_deadline(raw_server):
+    body = b'{"data": [' + b" " * 200 + b"]}"
+
+    def handle(conn):
+        conn.sendall(b"HTTP/1.1 200 OK\r\n" + f"Content-Length: {len(body)}\r\n\r\n".encode())
+        for byte in body:
+            conn.sendall(bytes([byte]))
+            time.sleep(0.3)
+
+    server = raw_server(handle)
+    elapsed = _timed_refusal(server, "provider_unreachable", budget=1.0)
+    print(f"trickled body refused after {elapsed:.2f}s")
+    assert elapsed < 2.0
+    assert server.client_gone.wait(2)
+
+
+def test_real_socket_trickled_unframed_body_is_cut(raw_server):
+    def handle(conn):
+        conn.sendall(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n")
+        for _ in range(100):
+            conn.sendall(b" ")
+            time.sleep(0.3)
+
+    server = raw_server(handle)
+    elapsed = _timed_refusal(server, "provider_unreachable", budget=1.0)
+    print(f"unframed trickled body refused after {elapsed:.2f}s")
+    assert elapsed < 2.0
+
+
+def test_real_socket_gzip_bomb_is_refused_without_inflating(raw_server):
+    bomb = gzip.compress(b'{"data": [' + b" " * (64 * 1024 * 1024) + b"]}", 9)
+    assert len(bomb) < 200 * 1024
+
+    def handle(conn):
+        conn.sendall(
+            b"HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\n"
+            + f"Content-Length: {len(bomb)}\r\n\r\n".encode()
+            + bomb
+        )
+
+    server = raw_server(handle)
+    tracemalloc.start()
+    try:
+        elapsed = _timed_refusal(server, "listing_unsupported", budget=5.0)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    print(f"gzip bomb ({len(bomb)} bytes) refused after {elapsed:.2f}s, peak {peak / 1024:.0f} KiB")
+    assert peak < 1024 * 1024
+
+
+def test_real_socket_redirect_with_a_large_body_is_refused_unread(raw_server):
+    chunk = b"x" * (1024 * 1024)
+
+    def handle(conn):
+        conn.sendall(
+            b"HTTP/1.1 302 Found\r\nLocation: http://127.0.0.2/steal\r\n"
+            + f"Content-Length: {200 * len(chunk)}\r\n\r\n".encode()
+        )
+        for _ in range(200):
+            conn.sendall(chunk)
+
+    server = raw_server(handle)
+    tracemalloc.start()
+    try:
+        elapsed = _timed_refusal(server, "listing_unsupported", budget=5.0)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    print(f"302 with a 200 MB body refused after {elapsed:.2f}s, peak {peak / 1024:.0f} KiB")
+    assert elapsed < 1.0
+    assert server.client_gone.wait(2)
+    assert len(server.requests) == 1
+
+
+@pytest.mark.parametrize("declared", [True, False])
+def test_real_socket_body_over_two_megabytes_is_refused(raw_server, declared):
+    body = b'{"data": [' + b" " * (3 * 1024 * 1024) + b"]}"
+
+    def handle(conn):
+        length = f"Content-Length: {len(body)}\r\n" if declared else "Connection: close\r\n"
+        conn.sendall(b"HTTP/1.1 200 OK\r\n" + length.encode() + b"\r\n" + body)
+
+    server = raw_server(handle)
+    elapsed = _timed_refusal(server, "listing_unsupported", budget=5.0)
+    print(f"3 MB body (declared={declared}) refused after {elapsed:.2f}s")
+    assert server.client_gone.wait(2)
+
+
+def test_real_socket_unencodable_saved_key_is_unreadable(raw_server):
+    server = raw_server(lambda conn: None)
+    _timed_refusal(server, "saved_key_unreadable", api_key=f"{SECRET}“")
+
+
+@pytest.mark.parametrize(
+    "declared", ["\u00b2", "\u00b9\u00b3", "1" * 5000, "12, 12", "-5", "0x10"]
+)
+def test_real_socket_a_crafted_content_length_never_crashes(raw_server, declared):
+    body = json.dumps({"data": [{"id": "a"}]}).encode()
+
+    def handle(conn):
+        conn.sendall(
+            b"HTTP/1.1 200 OK\r\nContent-Length: "
+            + declared.encode("latin-1")
+            + b"\r\nConnection: close\r\n\r\n"
+            + body
+        )
+        conn.shutdown(socket.SHUT_WR)
+
+    server = raw_server(handle)
+    started = monotonic()
+    try:
+        raw = _fetch(server, budget=2.0)
+    except models_list.ModelListError as exc:
+        assert exc.code in ("listing_unsupported", "provider_unreachable")
+        outcome = exc.code
+    else:
+        assert json.loads(raw) == {"data": [{"id": "a"}]}
+        outcome = "read"
+    print(f"Content-Length {declared[:12]!r}: {outcome} after {monotonic() - started:.2f}s")
+    if declared == "1" * 5000:
+        assert outcome == "listing_unsupported"
+    if declared in ("\u00b2", "\u00b9\u00b3"):
+        assert outcome == "read"
+
+
+def test_real_socket_a_zero_padded_content_length_is_its_value(raw_server):
+    body = json.dumps({"data": [{"id": "a"}]}).encode()
+    padded = str(len(body)).rjust(20, "0")  # 20 digits, the value well under the cap
+
+    def handle(conn):
+        conn.sendall(b"HTTP/1.1 200 OK\r\nContent-Length: " + padded.encode() + b"\r\n\r\n" + body)
+
+    server = raw_server(handle)
+    assert json.loads(_fetch(server, budget=2.0)) == {"data": [{"id": "a"}]}
+
+
+def test_real_socket_an_address_family_this_host_lacks_falls_through(raw_server, monkeypatch):
+    """IPv6 listed first on a host without IPv6 (``EAFNOSUPPORT``) must not stop IPv4."""
+    body = json.dumps({"data": [{"id": "a"}]}).encode()
+
+    def handle(conn):
+        conn.sendall(b"HTTP/1.1 200 OK\r\n" + f"Content-Length: {len(body)}\r\n\r\n".encode() + body)
+
+    server = raw_server(handle)
+    real_socket = socket.socket
+    opened = []
+
+    def getaddrinfo(host, port, family=0, *args, **kwargs):
+        # The family urllib3 itself would ask for, not "any".
+        assert family == allowed_gai_family()
+        return [
+            (socket.AF_INET6, socket.SOCK_STREAM, 6, "", ("::1", port, 0, 0)),
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", port)),
+        ]
+
+    def no_ipv6(family=-1, *args, **kwargs):
+        if family == socket.AF_INET6 and kwargs.get("fileno") is None:
+            opened.append("AF_INET6 refused")
+            raise OSError(errno.EAFNOSUPPORT, "Address family not supported by protocol")
+        return real_socket(family, *args, **kwargs)
+
+    monkeypatch.setattr(models_list.socket, "getaddrinfo", getaddrinfo)
+    monkeypatch.setattr(models_list.socket, "socket", no_ipv6)
+    raw = models_list._fetch(f"http://provider.test:{server.port}/v1/models", {}, monotonic() + 3.0)
+    assert json.loads(raw) == {"data": [{"id": "a"}]}
+    assert opened == ["AF_INET6 refused"]
+
+
+def test_a_host_idna_cannot_encode_is_unreachable_not_a_500():
+    """An empty label (say from LLM_BYOK_ALLOWED_HOSTS) makes getaddrinfo raise UnicodeError."""
+    with pytest.raises(models_list.ModelListError) as caught:
+        models_list._fetch("http://api..example.org:9/v1/models", {}, monotonic() + 2.0)
+    assert caught.value.code == "provider_unreachable"
+    assert caught.value.__context__ is None
+
+
+def _blackholed(monkeypatch, addresses, reachable=None):
+    """``getaddrinfo`` returns ``addresses`` (and ``reachable`` last, if given);
+    connecting to any of ``addresses`` hangs until the socket's timeout."""
+    real_connect = socket.socket.connect
+    tried = []
+
+    def getaddrinfo(host, port, *args, **kwargs):
+        infos = [
+            (socket.AF_INET, socket.SOCK_STREAM, 6, "", (a, port)) for a in addresses
+        ]
+        if reachable is not None:
+            infos.append((socket.AF_INET, socket.SOCK_STREAM, 6, "", reachable))
+        return infos
+
+    def connect(self, address):
+        tried.append((address[0], self.gettimeout()))
+        if address[0] in addresses:
+            time.sleep(self.gettimeout())
+            raise TimeoutError("timed out")
+        return real_connect(self, address)
+
+    monkeypatch.setattr(models_list.socket, "getaddrinfo", getaddrinfo)
+    monkeypatch.setattr(socket.socket, "connect", connect)
+    return tried
+
+
+def test_real_socket_connect_attempts_share_the_deadline(monkeypatch):
+    tried = _blackholed(monkeypatch, ["10.255.255.1", "10.255.255.2", "10.255.255.3"])
+    started = monotonic()
+    with pytest.raises(models_list.ModelListError) as caught:
+        models_list._fetch(
+            "https://provider.test/v1/models", {"Authorization": f"Bearer {SECRET}"},
+            monotonic() + 1.0,
+        )
+    elapsed = monotonic() - started
+    print(f"3 blackholed addresses on a 1 s budget refused after {elapsed:.2f}s, tried {tried}")
+    assert caught.value.code == "provider_unreachable"
+    assert caught.value.__context__ is None
+    assert elapsed < 1.3
+    assert len(tried) == 1
+
+
+def test_real_socket_a_dead_address_falls_through_to_the_next(raw_server, monkeypatch):
+    body = json.dumps({"data": [{"id": "a"}]}).encode()
+
+    def handle(conn):
+        conn.sendall(b"HTTP/1.1 200 OK\r\n" + f"Content-Length: {len(body)}\r\n\r\n".encode() + body)
+
+    server = raw_server(handle)
+    monkeypatch.setattr(models_list, "MAX_CONNECT_SECONDS", 0.3)
+    tried = _blackholed(monkeypatch, ["10.255.255.1"], reachable=("127.0.0.1", server.port))
+    started = monotonic()
+    raw = models_list._fetch(
+        f"http://provider.test:{server.port}/v1/models", {}, monotonic() + 3.0
+    )
+    print(f"fell through to the second address after {monotonic() - started:.2f}s")
+    assert json.loads(raw) == {"data": [{"id": "a"}]}
+    assert [a for a, _ in tried] == ["10.255.255.1", "127.0.0.1"]
+    assert tried[0][1] == pytest.approx(0.3)
+
+
+def test_real_socket_malformed_headers_never_log_the_key(raw_server, caplog):
+    caplog.set_level("DEBUG")
+    body = json.dumps({"data": [{"id": "a"}]}).encode()
+    urllib3_log = logging.getLogger("urllib3.connection")
+
+    def handle(conn):
+        # Another thread logging during the listing is not silenced.
+        urllib3_log.warning("server thread says hello")
+        conn.sendall(
+            b"HTTP/1.1 200 OK\r\n"
+            + f"Content-Length: {len(body)}\r\n".encode()
+            + f"Echo of Bearer {SECRET} without a colon\r\n\r\n".encode()
+            + body
+        )
+        conn.shutdown(socket.SHUT_WR)
+
+    server = raw_server(handle)
+    try:
+        _fetch(server, budget=2.0)
+    except models_list.ModelListError:
+        pass
+    urllib3_log.warning("main thread outside a listing")
+
+    assert SECRET not in caplog.text
+    assert "server thread says hello" in caplog.text
+    assert "main thread outside a listing" in caplog.text
+
+
+def test_the_log_filter_only_drops_records_inside_a_listing():
+    quiet = next(
+        f for f in logging.getLogger("urllib3.connection").filters
+        if isinstance(f, models_list._QuietWhileListing)
+    )
+    record = logging.LogRecord("urllib3.connection", logging.WARNING, "", 0, "x", None, None)
+    assert quiet.filter(record)
+    models_list._listing.active = True
+    try:
+        assert not quiet.filter(record)
+        seen = []
+        other = threading.Thread(target=lambda: seen.append(quiet.filter(record)))
+        other.start()
+        other.join()
+        assert seen == [True]
+    finally:
+        models_list._listing.active = False
+
+
+# The transport over TLS, against a throwaway CA.
+
+
+def _tls_material(directory):
+    from datetime import UTC, datetime, timedelta
+
+    from cryptography import x509
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.x509.oid import NameOID
+
+    now = datetime.now(UTC)
+
+    def name(cn):
+        return x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, cn)])
+
+    def write(path, cert, key=None):
+        data = cert.public_bytes(serialization.Encoding.PEM)
+        if key is not None:
+            data += key.private_bytes(
+                serialization.Encoding.PEM,
+                serialization.PrivateFormat.PKCS8,
+                serialization.NoEncryption(),
+            )
+        path.write_bytes(data)
+        return str(path)
+
+    def ca(cn):
+        key = ec.generate_private_key(ec.SECP256R1())
+        cert = (
+            x509.CertificateBuilder()
+            .subject_name(name(cn)).issuer_name(name(cn))
+            .public_key(key.public_key()).serial_number(x509.random_serial_number())
+            .not_valid_before(now - timedelta(days=1)).not_valid_after(now + timedelta(days=1))
+            .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+            .add_extension(
+                x509.KeyUsage(False, False, False, False, False, True, True, False, False),
+                critical=True,
+            )
+            .add_extension(x509.SubjectKeyIdentifier.from_public_key(key.public_key()), critical=False)
+            .sign(key, hashes.SHA256())
+        )
+        return cert, key
+
+    def leaf(issuer_cert, issuer_key):
+        key = ec.generate_private_key(ec.SECP256R1())
+        cert = (
+            x509.CertificateBuilder()
+            .subject_name(name("localhost")).issuer_name(issuer_cert.subject)
+            .public_key(key.public_key()).serial_number(x509.random_serial_number())
+            .not_valid_before(now - timedelta(days=1)).not_valid_after(now + timedelta(days=1))
+            .add_extension(x509.SubjectAlternativeName([x509.DNSName("localhost")]), critical=False)
+            .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+            .add_extension(
+                x509.ExtendedKeyUsage([x509.oid.ExtendedKeyUsageOID.SERVER_AUTH]), critical=False
+            )
+            .add_extension(
+                x509.AuthorityKeyIdentifier.from_issuer_public_key(issuer_key.public_key()),
+                critical=False,
+            )
+            .sign(issuer_key, hashes.SHA256())
+        )
+        return cert, key
+
+    trusted_cert, trusted_key = ca("legal-ml-core test CA")
+    stranger_cert, stranger_key = ca("someone else's CA")
+    return {
+        "ca": write(directory / "ca.pem", trusted_cert),
+        "server": write(directory / "server.pem", *leaf(trusted_cert, trusted_key)),
+        "stranger": write(directory / "stranger.pem", *leaf(stranger_cert, stranger_key)),
+    }
+
+
+class TLSServer(RawServer):
+    """``RawServer`` behind TLS, listening on 127.0.0.1 and named ``localhost``."""
+
+    def __init__(self, handle, certfile):
+        self.context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        self.context.load_cert_chain(certfile)
+        super().__init__(handle)
+        self.url = f"https://localhost:{self.port}"
+
+    def _one(self, conn):
+        try:
+            conn.settimeout(10)
+            conn = self.context.wrap_socket(conn, server_side=True)
+        except OSError:
+            conn.close()
+            return
+        super()._one(conn)
+
+
+@pytest.fixture(scope="module")
+def tls_material(tmp_path_factory):
+    return _tls_material(tmp_path_factory.mktemp("tls"))
+
+
+@pytest.fixture
+def tls_server(tls_material, monkeypatch):
+    monkeypatch.setattr(models_list, "CA_CERTS", tls_material["ca"])
+    servers = []
+
+    def start(handle, cert="server"):
+        server = TLSServer(handle, tls_material[cert])
+        servers.append(server)
+        return server
+
+    yield start
+    for server in servers:
+        server.close()
+
+
+def _listing_body(conn):
+    body = json.dumps({"data": [{"id": "b"}, {"id": "a"}]}).encode()
+    conn.sendall(b"HTTP/1.1 200 OK\r\n" + f"Content-Length: {len(body)}\r\n\r\n".encode() + body)
+
+
+def test_tls_lists_models(tls_server):
+    server = tls_server(_listing_body)
+    raw = _fetch(server, budget=3.0)
+    assert json.loads(raw) == {"data": [{"id": "b"}, {"id": "a"}]}
+    assert f"Authorization: Bearer {SECRET}\r\n" in server.requests[0]
+
+
+def test_tls_handshake_that_never_answers_is_cut(raw_server, tls_material, monkeypatch):
+    monkeypatch.setattr(models_list, "CA_CERTS", tls_material["ca"])
+    server = raw_server(lambda conn: None)  # takes the ClientHello and says nothing
+    server.url = f"https://localhost:{server.port}"
+    elapsed = _timed_refusal(server, "provider_unreachable", budget=1.0)
+    print(f"silent TLS handshake refused after {elapsed:.2f}s")
+    assert elapsed < 1.5
+
+
+def test_tls_certificate_from_an_untrusted_ca_is_unreachable(tls_server):
+    server = tls_server(_listing_body, cert="stranger")
+    _timed_refusal(server, "provider_unreachable", budget=3.0)
+    assert server.requests == []
+
+
+def test_tls_hostname_mismatch_is_unreachable(tls_server):
+    server = tls_server(_listing_body)
+    server.url = f"https://127.0.0.1:{server.port}"  # the certificate names localhost only
+    _timed_refusal(server, "provider_unreachable", budget=3.0)
+    assert server.requests == []
+
+
+def test_tls_trickled_body_is_cut_at_the_deadline(tls_server):
+    body = b'{"data": [' + b" " * 200 + b"]}"
+
+    def handle(conn):
+        conn.sendall(b"HTTP/1.1 200 OK\r\n" + f"Content-Length: {len(body)}\r\n\r\n".encode())
+        for byte in body:
+            conn.sendall(bytes([byte]))
+            time.sleep(0.3)
+
+    server = tls_server(handle)
+    elapsed = _timed_refusal(server, "provider_unreachable", budget=1.0)
+    print(f"trickled TLS body refused after {elapsed:.2f}s")
+    assert elapsed < 1.5

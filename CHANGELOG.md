@@ -8,6 +8,62 @@ While the version is 0.x, minor releases may contain breaking changes.
 
 ## [Unreleased]
 
+## [0.19.0] - 2026-11-24
+
+### Added
+
+- `POST /api/llm/models` lists the chat models an OpenAI-compatible provider
+  offers (#25), for checking a key before saving it and picking a model from a
+  list. The body is required: `{base_url, api_key}`, a key that is never
+  stored, or `{use_saved_key: true}`. Returns `{models: [{id, name?}]}` sorted
+  by id; `name` is left out when it equals the id.
+  - Which models: on OpenRouter, only models whose `output_modalities` (or
+    `modality` string) say they output text; a model with no such metadata is
+    left out. Elsewhere, every id that doesn't name embed, whisper, tts (as a
+    whole token), dall-e, image, audio, moderation, realtime or transcribe.
+    Both `{data: [...]}` and a bare top-level list (Together) are read; blank
+    ids are dropped, and so is any model whose id contains the key, or the
+    name of one whose name does.
+  - Checking the key: OpenRouter lists its models to any key, so
+    `GET {base_url}/key` is asked first and a 401/403 there is `key_rejected`.
+    `api.anthropic.com` gets the key as `Authorization: Bearer` only (no
+    `x-api-key`), with `anthropic-version: 2023-06-01` and `?limit=1000`.
+  - Inputs: the key must be printable ASCII with no whitespace, at most 512
+    characters (`invalid_request`, "The API key has characters an API key
+    can't contain."); a saved key that isn't is `saved_key_unreadable`. The
+    base URL passes `validate_byok_url` on every call, and one that is
+    malformed or has a query or fragment is `base_url_refused`.
+  - Transport: urllib3 on a single connection, not requests. No redirect is
+    followed or read; `Accept-Encoding: identity` is sent and any other
+    `Content-Encoding` is refused unread, so nothing is ever decompressed;
+    bodies are read in bounded amounts against a 2 MB cap. One wall-clock
+    budget of `max(1, min(LLM_TIMEOUT_SECONDS, 15))` seconds covers each
+    connection attempt (at most 5 s each, tried address by address over the
+    address families urllib3 itself would use, so an IPv6 address the host
+    can't open falls through to IPv4), the TLS
+    handshake, the headers and the body, enforced by a watchdog that cuts the
+    socket, so a provider trickling bytes can't hold the request open. The
+    DNS lookup is not covered: it is left to the system resolver, and bounding
+    it (with DNS pinning) is a tracked follow-up.
+  - urllib3's "Failed to parse headers" log, which can carry header text a
+    provider echoed back, is dropped for the listing's own thread while it
+    runs; other users of urllib3 log as before. A crafted `Content-Length`
+    (`²`, thousands of digits) is refused or ignored, never a 500. A base URL
+    host with a trailing dot (`openrouter.ai.`) gets the same provider
+    handling as without it.
+  - Refusals carry a `code`: `key_rejected` (401, 403, or a 400 whose first
+    8 KB say "API key", as Gemini answers a bad key), `provider_unreachable`
+    (502: network errors, the deadline, 408, 5xx, and 429 with "The provider is
+    limiting requests. Try again in a moment."), `listing_unsupported` (any
+    other status, a redirect, a compressed, oversized or unreadable body, or
+    a non-empty list without one model id; an empty list, or one the chat
+    filter empties, is still a 200 with no models),
+    `no_saved_key`, `saved_key_unreadable`, `base_url_refused` and
+    `invalid_request`. A refusal never carries the library exception (which
+    can hold the request headers) as its context. No rate limit: the host owns
+    that policy.
+- `urllib3>=2,<3` is now a direct dependency (it already came with requests).
+
 ## [0.18.0] - 2026-11-23
 
 ### Fixed
@@ -622,7 +678,8 @@ version was not tagged; it corresponds to commit `02c5b61`.
 - Worker foreign-key resolution and the missing `psycopg2` dependency.
 - Model/task compatibility checks, live progress and failure reasons.
 
-[Unreleased]: https://github.com/shashankmc/legal-ml-core/compare/v0.18.0...HEAD
+[Unreleased]: https://github.com/shashankmc/legal-ml-core/compare/v0.19.0...HEAD
+[0.19.0]: https://github.com/shashankmc/legal-ml-core/compare/v0.18.0...v0.19.0
 [0.18.0]: https://github.com/shashankmc/legal-ml-core/compare/v0.17.0...v0.18.0
 [0.17.0]: https://github.com/shashankmc/legal-ml-core/compare/v0.16.0...v0.17.0
 [0.16.0]: https://github.com/shashankmc/legal-ml-core/compare/v0.15.0...v0.16.0
