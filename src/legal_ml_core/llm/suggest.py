@@ -48,18 +48,39 @@ def current_prompt(dataset):
 
 
 def confirmed_examples(dataset):
-    tasks = (
-        AnnotationTask.query.filter(
-            AnnotationTask.dataset_id == dataset.id,
-            AnnotationTask.status == "annotated",
-            AnnotationTask.label_source.in_(CONFIRMED_SOURCES),
-            AnnotationTask.is_holdout.is_(False),
-        )
+    """Up to ``MAX_EXAMPLES`` confirmed, non-held-out items, balanced across labels.
+
+    Each label gets one example before any label gets a second, in the order the
+    Dataset names its labels (labels it no longer names come last). Within a
+    label the earliest items come first, and the result keeps item order.
+    """
+    confirmed = AnnotationTask.query.filter(
+        AnnotationTask.dataset_id == dataset.id,
+        AnnotationTask.status == "annotated",
+        AnnotationTask.label_source.in_(CONFIRMED_SOURCES),
+        AnnotationTask.is_holdout.is_(False),
+    )
+    used = {
+        label
+        for (label,) in confirmed.with_entities(AnnotationTask.annotation_label).distinct()
+        if label is not None
+    }
+    named = [label for label in (dataset.labels or []) if label in used]
+    labels = named + sorted(used - set(named))
+    per_label = [
+        confirmed.filter(AnnotationTask.annotation_label == label)
         .order_by(AnnotationTask.item_index)
         .limit(MAX_EXAMPLES)
         .all()
-    )
-    return [(task.text, task.annotation_label) for task in tasks]
+        for label in labels
+    ]
+    picked = []
+    for rank in range(MAX_EXAMPLES):
+        for tasks in per_label:
+            if rank < len(tasks) and len(picked) < MAX_EXAMPLES:
+                picked.append(tasks[rank])
+    picked.sort(key=lambda task: task.item_index)
+    return [(task.text, task.annotation_label) for task in picked]
 
 
 def remaining_tokens(owner_id):
