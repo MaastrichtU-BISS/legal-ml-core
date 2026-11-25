@@ -72,7 +72,7 @@ def confirmed_examples(dataset):
         .order_by(AnnotationTask.item_index)
         .limit(MAX_EXAMPLES)
         .all()
-        for label in labels
+        for label in labels[:MAX_EXAMPLES]  # only the first MAX_EXAMPLES labels can be picked
     ]
     picked = []
     for rank in range(MAX_EXAMPLES):
