@@ -273,9 +273,11 @@ paths:
         "Use at most 50 labels.", "Label names can't be empty.",
         "Keep each label name to 100 characters or fewer.",
         "Two labels have the same name.",
-        "'<label>' is already used on labelled items, so it can't be renamed
-        or removed." and "Labels can only be set for single-label tasks such
-        as Text Classification."
+        "'<label>' is already used on labelled items, so it can't be renamed or removed."
+        and "Labels can only be set for single-label tasks such as Text
+        Classification." Fix typos in typed labels with
+        `PUT /datasets/{dataset_id}/labels` first: once named, they can't be
+        corrected there.
       operationId: setDatasetLabelSet
       requestBody:
         required: true
@@ -290,7 +292,7 @@ paths:
                   type: array
                   minItems: 2
                   maxItems: 50
-                  items: { type: string, pattern: '\S' }
+                  items: { type: string, pattern: '\S', maxLength: 100 }
                   example: [Obligation, Permission, Prohibition]
       responses:
         "200":

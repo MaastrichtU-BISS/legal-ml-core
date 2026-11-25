@@ -155,7 +155,11 @@ the list may be replaced; after that it must keep every label an annotated task
 has, from any source, and may only add labels or change unused ones. Other task
 types, and any other body, get a 400 with a plain message. The LLM prompt and
 active-learning state are left alone; label definitions are saved through
-`PUT /api/llm/datasets/<id>/prompt`.
+`PUT /api/llm/datasets/<id>/prompt`. Bulk accept skips any pending LLM
+suggestion for a label the Dataset no longer names. Once a Dataset names its
+labels, typed labels can no longer be corrected with `PUT /datasets/<id>/labels`,
+so fix typos in typed labels before naming them; every used label is kept
+exactly as saved (case and surrounding spaces included).
 
 ### Exchanging annotations as kit JSON
 

@@ -70,7 +70,7 @@ def test_replaces_the_list_freely_before_anything_is_labelled(client, auth_heade
     dataset_id = _dataset(
         app,
         labels=["Obligation", "Permission"],
-        tasks=[(None, "pending", None), ("Obligation", "skipped", "human"), ("Permission", "pending", "llm_bulk")],
+        tasks=[(None, "pending", None), ("Obligation", "skipped", "human"), ("Permission", "pending", None)],
     )
 
     response = _put(client, auth_headers, dataset_id, {"labels": ["Duty", "Right"]})

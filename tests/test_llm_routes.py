@@ -768,6 +768,22 @@ def test_bulk_accept_is_locked_by_poor_agreement(client, app, gated, provider):
     assert agreement["unlocked"] is False
 
 
+def test_bulk_accept_skips_suggestions_for_a_label_no_longer_named(client, app, gated, provider):
+    dataset_id, task_ids = _check_items(client, app, gated, total=32, checked=30, wrong=3)
+    dropped = LLMSuggestion.query.filter_by(task_id=task_ids[-1]).one()
+    dropped.label = "Removed label"
+    db.session.commit()
+
+    resp = client.post(f"/api/llm/datasets/{dataset_id}/bulk-accept", headers=gated)
+
+    assert resp.status_code == 200
+    assert resp.get_json()["accepted"] == 1
+    task = db.session.get(AnnotationTask, task_ids[-1])
+    assert task.status == "pending"
+    assert task.annotation_label is None
+    assert db.session.get(LLMSuggestion, dropped.id).status == "pending"
+
+
 def test_bulk_accept_marks_provenance(client, app, gated, provider):
     dataset_id, task_ids = _check_items(client, app, gated, total=32, checked=30, wrong=3)
     resp = client.post(f"/api/llm/datasets/{dataset_id}/bulk-accept", headers=gated)

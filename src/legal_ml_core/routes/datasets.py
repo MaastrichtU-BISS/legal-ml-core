@@ -8,7 +8,6 @@ from ..models import AnnotationTask, Dataset
 from ..annotation_format import label_from_assignment, stored_payload
 from ..annotation_queue import LABEL_COLUMNS, create_annotation_tasks
 from ..kit_exchange import ExchangeError, rows_from_task_data, task_data_from_dataset
-from .llm import SUPPORTED_TASK_TYPES
 from ..text_terms import (
     LABEL_COL_NAMES,
     TEXT_COL_NAMES,
@@ -21,6 +20,7 @@ import pandas as pd
 import os
 import uuid
 import json
+from .llm import SUPPORTED_TASK_TYPES
 
 datasets_bp = Blueprint("datasets", __name__)
 

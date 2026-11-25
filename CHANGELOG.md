@@ -23,6 +23,8 @@ While the version is 0.x, minor releases may contain breaking changes.
   `judgment_prediction` Datasets accept it. Returns `{dataset}` like `GET`;
   refusals are 400 with a plain `error`, and someone else's Dataset is 404.
   The LLM prompt and active-learning state are unchanged.
+- Bulk accept skips pending LLM suggestions for a label the Dataset no
+  longer names, so a removed label is never written back as a label.
 - `PATCH /api/llm/key` changes the saved key's model without the key (#27),
   so a host can offer "Change model" after listing models with
   `{use_saved_key: true}`. The body is exactly `{model}`, a non-empty string of
