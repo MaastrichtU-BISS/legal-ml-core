@@ -8,6 +8,18 @@ While the version is 0.x, minor releases may contain breaking changes.
 
 ## [Unreleased]
 
+## [0.21.0] - 2026-11-25
+
+### Changed
+
+- The worked examples in an LLM suggestion prompt are balanced across labels
+  (BAIGLE #195): every label with a confirmed item gets one example before any
+  label gets a second, in the order the Dataset names its labels, up to the
+  existing 5. They are still drawn only from confirmed (`human`,
+  `llm_confirmed`), non-held-out items, earliest items first, and are listed in
+  item order. Before, the first 5 confirmed items were sent, so a label
+  labelled later could be missing from every prompt.
+
 ## [0.20.0] - 2026-11-25
 
 ### Added
@@ -704,7 +716,8 @@ version was not tagged; it corresponds to commit `02c5b61`.
 - Worker foreign-key resolution and the missing `psycopg2` dependency.
 - Model/task compatibility checks, live progress and failure reasons.
 
-[Unreleased]: https://github.com/shashankmc/legal-ml-core/compare/v0.20.0...HEAD
+[Unreleased]: https://github.com/shashankmc/legal-ml-core/compare/v0.21.0...HEAD
+[0.21.0]: https://github.com/shashankmc/legal-ml-core/compare/v0.20.0...v0.21.0
 [0.20.0]: https://github.com/shashankmc/legal-ml-core/compare/v0.19.0...v0.20.0
 [0.19.0]: https://github.com/shashankmc/legal-ml-core/compare/v0.18.0...v0.19.0
 [0.18.0]: https://github.com/shashankmc/legal-ml-core/compare/v0.17.0...v0.18.0
