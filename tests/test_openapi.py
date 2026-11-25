@@ -80,3 +80,17 @@ def test_spec_refs_resolve():
 
 def test_spec_describes_the_refused_field():
     assert "field" in _load_spec()["components"]["schemas"]["Error"]["properties"]
+
+
+def test_spec_patch_llm_key_takes_only_a_model():
+    op = _load_spec()["paths"]["/api/llm/key"]["patch"]
+    schema = op["requestBody"]["content"]["application/json"]["schema"]
+    assert schema["required"] == ["model"]
+    assert schema["additionalProperties"] is False
+    assert set(schema["properties"]) == {"model"}
+    model = schema["properties"]["model"]
+    # The server trims, then limits: a raw maxLength/minLength would disagree with it.
+    assert "maxLength" not in model and "minLength" not in model
+    assert model["pattern"] == "\\S"
+    assert "after trimming" in model["description"]
+    assert {"200", "400", "401", "404"} <= set(op["responses"])

@@ -27,6 +27,7 @@ from legal_ml_core import (
 from legal_ml_core.llm import access, client as llm_client, models_list
 from legal_ml_core.llm.prompts import DEFAULT_TEMPLATE
 from legal_ml_core.llm.suggest import METER_DOWN_MESSAGE, process_llm_annotation_task
+from legal_ml_core.routes import llm as llm_routes
 from tests.conftest import TEST_USER_ID
 
 monotonic = time.monotonic
@@ -250,6 +251,223 @@ def test_key_can_be_deleted(client, outsider):
     assert client.delete("/api/llm/key", headers=outsider).status_code == 200
     assert LLMCredential.query.count() == 0
     assert client.get("/api/llm/status", headers=outsider).get_json()["mode"] == "none"
+
+
+def _change_model(client, headers, body):
+    return client.patch("/api/llm/key", json=body, headers=headers)
+
+
+def test_changing_the_model_keeps_the_saved_key(client, app, outsider, monkeypatch):
+    _save_key(client, outsider)
+    before = LLMCredential.query.one()
+    ciphertext, base_url = before.encrypted_key, before.base_url
+
+    def no_decrypt(*args, **kwargs):
+        raise AssertionError("the key must not be decrypted")
+
+    monkeypatch.setattr(access, "decrypt_key", no_decrypt)
+    monkeypatch.setattr(llm_routes, "decrypt_key", no_decrypt)
+    resp = _change_model(client, outsider, {"model": "  other-model  "})
+    assert resp.status_code == 200
+    assert resp.get_json() == {"base_url": base_url, "model": "other-model"}
+    assert SECRET not in resp.get_data(as_text=True)
+    db.session.expire_all()
+    row = LLMCredential.query.one()
+    assert row.encrypted_key == ciphertext
+    assert row.base_url == base_url
+    assert row.model == "other-model"
+
+
+def test_changing_the_model_without_a_saved_key_is_404(client, outsider):
+    resp = _change_model(client, outsider, {"model": "other-model"})
+    assert resp.status_code == 404
+    assert resp.get_json()["code"] == "no_saved_key"
+    assert LLMCredential.query.count() == 0
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {},
+        {"model": ""},
+        {"model": "   "},
+        {"model": "m" * 256},
+        {"model": 42},
+        {"model": None},
+        {"model": ["my-model"]},
+        {"model": "other-model", "api_key": SECRET},
+        {"model": "other-model", "base_url": "https://evil.example.org/v1"},
+        {"model": "other-model", "use_saved_key": True},
+    ],
+)
+def test_changing_the_model_refuses_any_other_body(client, outsider, body):
+    _save_key(client, outsider)
+    resp = _change_model(client, outsider, body)
+    assert resp.status_code == 400
+    assert resp.get_json()["code"] == "invalid_request"
+    row = LLMCredential.query.one()
+    assert (row.base_url, row.model) == ("https://api.example.org/v1", "my-model")
+
+
+def test_changing_the_model_refuses_a_non_object_body(client, outsider):
+    _save_key(client, outsider)
+    for data in ('"other-model"', '["other-model"]', "not json"):
+        resp = client.patch(
+            "/api/llm/key", data=data, content_type="application/json", headers=outsider
+        )
+        assert resp.status_code == 400
+        assert resp.get_json()["code"] == "invalid_request"
+
+
+def test_a_model_of_255_characters_after_trimming_is_accepted(client, outsider):
+    _save_key(client, outsider)
+    resp = _change_model(client, outsider, {"model": " " + "m" * 255 + " "})
+    assert resp.status_code == 200
+    assert resp.get_json()["model"] == "m" * 255
+
+
+def test_changing_the_model_needs_a_login(client, outsider):
+    _save_key(client, outsider)
+    assert client.patch("/api/llm/key", json={"model": "other-model"}).status_code == 401
+    assert LLMCredential.query.one().model == "my-model"
+
+
+def test_changing_the_model_touches_only_the_owners_key(client, outsider):
+    _save_key(client, outsider)
+    other = {"Authorization": "Bearer test-token::" + json.dumps({"sub": "someone-else"})}
+    resp = _change_model(client, other, {"model": "other-model"})
+    assert resp.status_code == 404
+    assert resp.get_json()["code"] == "no_saved_key"
+    assert LLMCredential.query.one().model == "my-model"
+
+
+def test_changing_the_model_with_two_saved_keys_writes_only_the_callers(client, outsider):
+    other = {"Authorization": "Bearer test-token::" + json.dumps({"sub": "someone-else"})}
+    _save_key(client, outsider)
+    _save_key(client, other)
+    resp = _change_model(client, other, {"model": "their-model"})
+    assert resp.status_code == 200
+    db.session.expire_all()
+    models = {row.owner_id: row.model for row in LLMCredential.query.all()}
+    assert sorted(models.values()) == ["my-model", "their-model"]
+    assert models["someone-else"] == "their-model"
+
+
+def test_a_model_with_a_lone_surrogate_is_refused_not_stored(client, outsider):
+    _save_key(client, outsider)
+    # "\\ud800" in JSON decodes to a lone surrogate, which no database can store as UTF-8.
+    resp = client.patch(
+        "/api/llm/key", data='{"model": "m\\ud800"}', content_type="application/json", headers=outsider
+    )
+    assert resp.status_code == 400
+    assert resp.get_json()["code"] == "invalid_request"
+    assert LLMCredential.query.one().model == "my-model"
+
+
+def test_a_repeated_model_member_is_refused(client, outsider):
+    _save_key(client, outsider)
+    # The JSON decoder would keep the last one; the first, a number, must not slip through.
+    resp = client.patch(
+        "/api/llm/key", data='{"model": 1, "model": "x"}', content_type="application/json", headers=outsider
+    )
+    assert resp.status_code == 400
+    assert resp.get_json()["code"] == "invalid_request"
+    assert LLMCredential.query.one().model == "my-model"
+
+
+def test_a_model_with_a_nul_is_refused_not_stored(client, outsider):
+    _save_key(client, outsider)
+    # Postgres refuses NUL in a string, so it must never reach the update.
+    resp = client.patch(
+        "/api/llm/key", data='{"model": "a\\u0000b"}', content_type="application/json", headers=outsider
+    )
+    assert resp.status_code == 400
+    assert resp.get_json()["code"] == "invalid_request"
+    assert LLMCredential.query.one().model == "my-model"
+
+
+@pytest.mark.parametrize("content_type", ["text/plain", "application/x-www-form-urlencoded", None])
+def test_a_json_body_not_sent_as_json_is_refused(client, outsider, content_type):
+    _save_key(client, outsider)
+    kwargs = {"content_type": content_type} if content_type else {}
+    resp = client.patch("/api/llm/key", data='{"model": "other-model"}', headers=outsider, **kwargs)
+    assert resp.status_code == 400
+    assert resp.get_json()["code"] == "invalid_request"
+    assert LLMCredential.query.one().model == "my-model"
+
+
+def test_a_deeply_nested_body_is_a_400_not_a_500(client, outsider):
+    _save_key(client, outsider)
+    resp = client.patch(
+        "/api/llm/key", data='{"model": ' + "[" * 100000 + "]" * 100000 + "}",
+        content_type="application/json", headers=outsider,
+    )
+    assert resp.status_code == 400
+    assert resp.get_json()["code"] == "invalid_request"
+
+
+def test_the_answer_names_the_base_url_of_the_row_that_changed(client, outsider, monkeypatch):
+    """A PUT from another tab that lands after the lookup must not leave a stale URL in the answer."""
+    _save_key(client, outsider)
+    # Unbound, so a column query like db.session.query(LLMCredential.base_url) stays one.
+    real_filter_by = type(LLMCredential.query).filter_by
+    calls = []
+
+    class ProviderChangedAfterTheRead:
+        def __init__(self, query):
+            self.query = query
+
+        def first(self):
+            row = self.query.first()
+            LLMCredential.query.filter_by(owner_id=row.owner_id).update(
+                {"base_url": "https://api.mistral.ai/v1"}, synchronize_session=False
+            )
+            return row
+
+        def __getattr__(self, name):
+            return getattr(self.query, name)
+
+    def filter_by(self, **kwargs):
+        calls.append(kwargs)
+        query = real_filter_by(self, **kwargs)
+        return ProviderChangedAfterTheRead(query) if len(calls) == 1 else query
+
+    monkeypatch.setattr(type(LLMCredential.query), "filter_by", filter_by)
+    resp = _change_model(client, outsider, {"model": "mistral-small-latest"})
+    assert resp.status_code == 200
+    assert resp.get_json() == {"base_url": "https://api.mistral.ai/v1", "model": "mistral-small-latest"}
+
+
+def test_a_key_removed_while_the_model_changes_is_404_not_a_500(client, outsider, monkeypatch):
+    _save_key(client, outsider)
+    # Unbound, so a column query like db.session.query(LLMCredential.base_url) stays one.
+    real_filter_by = type(LLMCredential.query).filter_by
+
+    class RemovedAfterTheRead:
+        """The first lookup finds the row, then another tab's DELETE lands."""
+
+        def __init__(self, query):
+            self.query = query
+
+        def first(self):
+            row = self.query.first()
+            LLMCredential.query.filter_by(owner_id=row.owner_id).delete(synchronize_session=False)
+            return row
+
+        def __getattr__(self, name):
+            return getattr(self.query, name)
+
+    calls = []
+
+    def filter_by(self, **kwargs):
+        calls.append(kwargs)
+        query = real_filter_by(self, **kwargs)
+        return RemovedAfterTheRead(query) if len(calls) == 1 else query
+
+    monkeypatch.setattr(type(LLMCredential.query), "filter_by", filter_by)
+    resp = _change_model(client, outsider, {"model": "other-model"})
+    assert resp.status_code == 404
+    assert resp.get_json()["code"] == "no_saved_key"
 
 
 def test_saving_a_key_without_encryption_configured_fails(client, app, outsider):

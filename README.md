@@ -208,6 +208,13 @@ app.config["LLM_ENCRYPTION_KEY"] = os.environ["LLM_ENCRYPTION_KEY"]  # Fernet ke
   `listing_unsupported`, `no_saved_key`, `saved_key_unreadable`,
   `base_url_refused`, `invalid_request`). It is not rate limited here; the
   host should limit it.
+- `PATCH /api/llm/key` with exactly `{model}` changes a saved key's model
+  without sending the key again, for a host whose browser never holds it.
+  Only the model changes; the key is not decrypted or returned. It answers
+  `{base_url, model}` like `PUT`, 400 `invalid_request` for any other body
+  (a blank model, one over 255 characters after trimming, one with a NUL,
+  extra or repeated fields, or a body not sent as `application/json`), and 404 `no_saved_key` when there is no saved key, or it was
+  removed meanwhile.
 - Call `purge_owner_llm_data(owner_id)` from account erasure.
 - `LLM_AUDIT_HOOK`, a callable `(event, owner_id, **fields)`, receives each new
   acknowledgement for the host's audit log.

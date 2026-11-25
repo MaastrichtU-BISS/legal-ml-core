@@ -245,6 +245,75 @@ def save_key():
     return jsonify({"base_url": row.base_url, "model": row.model}), 200
 
 
+@llm_bp.route("/key", methods=["PATCH"])
+@jwt_required()
+def change_key_model():
+    """Change only the saved key's model; the key is never decrypted or returned."""
+    data = _strict_object_body()
+    model = data.get("model") if data is not None else None
+    trimmed = model.strip() if isinstance(model, str) else ""
+    if data is None or set(data) != {"model"} or not _storable_text(trimmed, 255):
+        raise ApiError(
+            400,
+            "Send only model, a non-empty string of at most 255 characters.",
+            code="invalid_request",
+        )
+    owner_id = _owner()
+    row = LLMCredential.query.filter_by(owner_id=owner_id).first()
+    if row is None:
+        raise ApiError(404, "There is no saved API key.", code="no_saved_key")
+    # Update by statement: a DELETE in another tab before it means 0 rows,
+    # answered as 404, not a 500. The base URL is read back after the update, in
+    # the same transaction: the update's row lock holds off a concurrent PUT, so
+    # the answer describes the row that changed.
+    changed = LLMCredential.query.filter_by(owner_id=owner_id).update(
+        {"model": trimmed}, synchronize_session=False
+    )
+    base_url = (
+        db.session.query(LLMCredential.base_url).filter_by(owner_id=owner_id).scalar()
+        if changed
+        else None
+    )
+    db.session.commit()
+    if not changed or base_url is None:
+        raise ApiError(404, "There is no saved API key.", code="no_saved_key")
+    return jsonify({"base_url": base_url, "model": trimmed}), 200
+
+
+def _strict_object_body():
+    """The JSON object sent, or None if the body isn't one or repeats a key.
+
+    ``request.get_json`` keeps the last of two same-named members, so a body
+    ``{"model": 1, "model": "x"}`` would pass a check of the first one's type.
+    """
+
+    def no_repeats(pairs):
+        keys = [key for key, _ in pairs]
+        if len(keys) != len(set(keys)):
+            raise ValueError("repeated member")
+        return dict(pairs)
+
+    if not request.is_json:  # as get_json would: a JSON body sent as text/plain isn't one
+        return None
+    try:
+        data = json.loads(request.get_data(as_text=False) or b"null", object_pairs_hook=no_repeats)
+    except (ValueError, RecursionError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _storable_text(value, limit):
+    """Non-empty, at most ``limit`` characters, with no NUL (Postgres refuses it), and
+    encodable as UTF-8 (no lone surrogates)."""
+    if not value or len(value) > limit or "\x00" in value:
+        return False
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
 # Printable ASCII with no spaces: anything else can't go in a header as typed.
 API_KEY_PATTERN = re.compile(r"[!-~]{1,512}")
 BASE_URL_PATTERN = re.compile(r"[!-~]+")
