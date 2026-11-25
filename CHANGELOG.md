@@ -8,8 +8,21 @@ While the version is 0.x, minor releases may contain breaking changes.
 
 ## [Unreleased]
 
+## [0.20.0] - 2026-11-25
+
 ### Added
 
+- `PUT /api/datasets/<id>/label-set` names a single-label Dataset's labels
+  after upload (BAIGLE #193), so a Dataset uploaded without a label list, or
+  imported from a library, can use LLM labelling. The body is exactly
+  `{labels: [string]}`: names are trimmed, 2 to 50 of them, 1 to 100
+  characters each, none equal ignoring case. Until an item is labelled the
+  list may be replaced freely; after that it must keep every label an
+  annotated task has (from any source) and may only add labels or change
+  unused ones. Only `classification`, `document_classification` and
+  `judgment_prediction` Datasets accept it. Returns `{dataset}` like `GET`;
+  refusals are 400 with a plain `error`, and someone else's Dataset is 404.
+  The LLM prompt and active-learning state are unchanged.
 - `PATCH /api/llm/key` changes the saved key's model without the key (#27),
   so a host can offer "Change model" after listing models with
   `{use_saved_key: true}`. The body is exactly `{model}`, a non-empty string of
@@ -689,7 +702,8 @@ version was not tagged; it corresponds to commit `02c5b61`.
 - Worker foreign-key resolution and the missing `psycopg2` dependency.
 - Model/task compatibility checks, live progress and failure reasons.
 
-[Unreleased]: https://github.com/shashankmc/legal-ml-core/compare/v0.19.0...HEAD
+[Unreleased]: https://github.com/shashankmc/legal-ml-core/compare/v0.20.0...HEAD
+[0.20.0]: https://github.com/shashankmc/legal-ml-core/compare/v0.19.0...v0.20.0
 [0.19.0]: https://github.com/shashankmc/legal-ml-core/compare/v0.18.0...v0.19.0
 [0.18.0]: https://github.com/shashankmc/legal-ml-core/compare/v0.17.0...v0.18.0
 [0.17.0]: https://github.com/shashankmc/legal-ml-core/compare/v0.16.0...v0.17.0
