@@ -650,6 +650,9 @@ def bulk_accept(dataset_id):
             LLMSuggestion.status == "pending",
             LLMSuggestion.model == check["model"],
             LLMSuggestion.prompt_version == check["prompt_version"],
+            # A suggestion for a label the Dataset no longer names (removed with
+            # PUT /datasets/<id>/label-set) is never written as a label.
+            LLMSuggestion.label.in_(dataset.labels or []),
         )
         .all()
     )
