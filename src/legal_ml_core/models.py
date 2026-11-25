@@ -49,6 +49,9 @@ class Dataset(MLBase):
     labels = db.Column(
         db.JSON
     )  # Custom labels for annotation (e.g., ['Positive', 'Negative', 'Neutral'])
+    # The Dataset this one is a practice copy of; None for an original. No
+    # foreign key: the copy keeps the id after the original is deleted.
+    origin_dataset_id = db.Column(db.String(36))
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     updated_at = db.Column(
         db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow
@@ -101,6 +104,7 @@ class Dataset(MLBase):
             "text_column": self.text_column,
             "label_column": self.label_column,
             "labels": self.labels,
+            "origin_dataset_id": self.origin_dataset_id,
             "created_at": self.created_at.isoformat(),
             "updated_at": self.updated_at.isoformat(),
         }

@@ -4,9 +4,10 @@ from werkzeug.exceptions import RequestEntityTooLarge
 from werkzeug.utils import secure_filename
 from ..db import db
 from ..dataset_creation import DatasetInvalid, create_dataset
-from ..models import AnnotationTask, Dataset
+from ..models import AnnotationTask, Dataset, LLMPrompt
 from ..annotation_format import label_from_assignment, stored_payload
-from ..annotation_queue import LABEL_COLUMNS, create_annotation_tasks
+from ..annotation_queue import LABEL_COLUMNS, create_annotation_tasks, file_labels, read_rows
+from ..llm.suggest import current_prompt
 from ..kit_exchange import ExchangeError, rows_from_task_data, task_data_from_dataset
 from ..text_terms import (
     LABEL_COL_NAMES,
@@ -542,6 +543,90 @@ def set_label_set(dataset_id):
     dataset.labels = names
     db.session.commit()
     return jsonify({"dataset": dataset.to_dict()}), 200
+
+
+PRACTICE_SUFFIX = " (practice)"
+
+
+def _practice_name(name):
+    """``"<name> (practice)"``, cutting ``name`` so the whole fits the column."""
+    room = Dataset.name.type.length - len(PRACTICE_SUFFIX)
+    return name[:room].rstrip() + PRACTICE_SUFFIX
+
+
+def _practice_labels(dataset, df):
+    """The copy's label list: the original's, or, when it names fewer than two,
+    the labels its items have (from the file or a person), in first-seen order."""
+    if isinstance(dataset.labels, list) and len(dataset.labels) >= 2:
+        return list(dataset.labels)
+    seen = [str(label) for label in file_labels(df, dataset).tolist()]
+    seen += sorted(_used_labels(dataset.id))
+    return list(dict.fromkeys(seen)) or dataset.labels
+
+
+@datasets_bp.route("/<dataset_id>/practice-copy", methods=["POST"])
+@jwt_required()
+def make_practice_copy(dataset_id):
+    """An unlabelled copy of a labelled single-label Dataset, to practise labelling
+    on without touching the original's labels. The copy has the same text, owner,
+    project and label list, the original's current prompt as its first prompt
+    version, and no labels anywhere: not in its file, not on its tasks."""
+    owner_id = get_jwt_identity()
+    original = Dataset.query.filter_by(id=dataset_id, owner_id=owner_id).first()
+    if not original:
+        return jsonify({"error": "Dataset not found"}), 404
+    if original.task_type not in SUPPORTED_TASK_TYPES:
+        return (
+            jsonify({"error": "Practice copies can only be made of single-label tasks such as Text Classification."}),
+            400,
+        )
+    try:
+        df = read_rows(original.file_path)
+    except Exception:
+        return jsonify({"error": "This dataset's file can't be read, so it can't be copied."}), 400
+    text_column = find_column(df, [(original.text_column or "text").lower()])
+    if text_column is None:
+        return jsonify({"error": "This dataset has no text column to copy."}), 400
+    if file_labels(df, original).empty and not _used_labels(original.id):
+        return jsonify({"error": "This dataset has no labels yet. Label it directly instead."}), 400
+
+    # The text column and a blank label column only: any other column could
+    # carry the labels under another name.
+    label_name = LABEL_COLUMNS[original.task_type]
+    file_path = os.path.join(current_app.config["UPLOAD_FOLDER"], f"{uuid.uuid4()}_practice.csv")
+    pd.DataFrame({"text": df[text_column].to_numpy(), label_name: ""}).to_csv(file_path, index=False)
+    try:
+        copy = create_dataset(
+            owner_id=owner_id,
+            file_path=file_path,
+            name=_practice_name(original.name),
+            description=original.description or "",
+            task_type=original.task_type,
+            annotation_mode=True,
+            labels=_practice_labels(original, df),
+        )
+        copy.project_id = original.project_id
+        copy.origin_dataset_id = original.id
+        version, template, definitions = current_prompt(original)
+        if version > 0:
+            db.session.add(
+                LLMPrompt(dataset_id=copy.id, version=1, template=template, definitions=dict(definitions))
+            )
+        create_annotation_tasks(copy)
+        db.session.commit()
+    except DatasetInvalid as refused:
+        db.session.rollback()
+        os.remove(file_path)
+        return jsonify({"error": str(refused)}), 400
+    except Exception:
+        # create_dataset has already committed the copy; leave nothing half made.
+        db.session.rollback()
+        Dataset.query.filter_by(owner_id=owner_id, file_path=file_path).delete()
+        db.session.commit()
+        if os.path.exists(file_path):
+            os.remove(file_path)
+        raise
+    return jsonify({"dataset": copy.to_dict()}), 201
 
 
 @datasets_bp.route("/task-types", methods=["GET"])

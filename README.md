@@ -161,6 +161,15 @@ labels, typed labels can no longer be corrected with `PUT /datasets/<id>/labels`
 so fix typos in typed labels before naming them; every used label is kept
 exactly as saved (case and surrounding spaces included).
 
+`POST /api/datasets/<id>/practice-copy` makes an unlabelled copy of a labelled
+single-label Dataset, to practise labelling on while the original keeps its
+labels. The copy, returned as `{dataset}` with status 201, has the same owner,
+project, text and label list, is named "<original> (practice)", records the
+original as `origin_dataset_id`, and gets the original's current prompt as its
+prompt version 1. Its file has only the text and a blank label column, and every
+row is a pending task. Other task types, and a Dataset with no labels yet, get a
+400 with a plain message.
+
 ### Exchanging annotations as kit JSON
 
 `GET /api/datasets/<id>/annotations/export` downloads a Dataset's annotation
