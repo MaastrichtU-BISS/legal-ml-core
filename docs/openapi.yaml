@@ -252,6 +252,58 @@ paths:
         "400": { $ref: "#/components/responses/BadRequest" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "404": { $ref: "#/components/responses/NotFound" }
+  /api/datasets/{dataset_id}/label-set:
+    parameters:
+      - $ref: "#/components/parameters/DatasetId"
+    put:
+      tags: [datasets]
+      summary: Name a single-label Dataset's labels, or change them
+      description: |
+        Sets `labels` on a Dataset whose task type is `classification`,
+        `document_classification` or `judgment_prediction`, so LLM labelling
+        and the annotate UI can use them. Names are trimmed; the list needs 2
+        to 50 names of 1 to 100 characters, with no two equal ignoring case.
+        Until an item is labelled the list may be replaced freely. A label is
+        used once an annotated task has it, from any source; after that the
+        list must keep every used label exactly, and may add labels and drop
+        or rename unused ones. The LLM prompt and active-learning state are
+        not changed. Refusals are 400 with one of these messages:
+        "Send labels as a list of names." (any body other than exactly
+        `{labels: [string]}` sent as JSON), "Use at least two labels.",
+        "Use at most 50 labels.", "Label names can't be empty.",
+        "Keep each label name to 100 characters or fewer.",
+        "Two labels have the same name.",
+        "'<label>' is already used on labelled items, so it can't be renamed
+        or removed." and "Labels can only be set for single-label tasks such
+        as Text Classification."
+      operationId: setDatasetLabelSet
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [labels]
+              additionalProperties: false
+              properties:
+                labels:
+                  type: array
+                  minItems: 2
+                  maxItems: 50
+                  items: { type: string, pattern: '\S' }
+                  example: [Obligation, Permission, Prohibition]
+      responses:
+        "200":
+          description: The Dataset, as GET returns it, with the new labels
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  dataset: { $ref: "#/components/schemas/Dataset" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
   /api/datasets/{dataset_id}/preview:
     parameters:
       - $ref: "#/components/parameters/DatasetId"

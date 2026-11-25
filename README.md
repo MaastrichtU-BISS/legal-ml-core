@@ -146,6 +146,17 @@ plain `/save`, confirming an LLM suggestion) replaces the Assignment, which is
 then rebuilt from the label when opened, as it is for tasks saved before the
 payload existed; correcting a typed label renames it inside the Assignment.
 
+`PUT /api/datasets/<id>/label-set` with `{"labels": [...]}` names a
+single-label Dataset's labels after upload, for example one uploaded without a
+label list or imported from a library, so LLM labelling can run on it. It
+returns `{dataset}` as `GET` does. Names are trimmed; it needs 2 to 50 of them,
+each 1 to 100 characters, none equal ignoring case. Until an item is labelled
+the list may be replaced; after that it must keep every label an annotated task
+has, from any source, and may only add labels or change unused ones. Other task
+types, and any other body, get a 400 with a plain message. The LLM prompt and
+active-learning state are left alone; label definitions are saved through
+`PUT /api/llm/datasets/<id>/prompt`.
+
 ### Exchanging annotations as kit JSON
 
 `GET /api/datasets/<id>/annotations/export` downloads a Dataset's annotation

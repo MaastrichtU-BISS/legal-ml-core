@@ -8,6 +8,7 @@ from ..models import AnnotationTask, Dataset
 from ..annotation_format import label_from_assignment, stored_payload
 from ..annotation_queue import LABEL_COLUMNS, create_annotation_tasks
 from ..kit_exchange import ExchangeError, rows_from_task_data, task_data_from_dataset
+from .llm import SUPPORTED_TASK_TYPES
 from ..text_terms import (
     LABEL_COL_NAMES,
     TEXT_COL_NAMES,
@@ -466,6 +467,81 @@ def _parse_labels(labels_str):
         except ValueError:
             pass
     return [label.strip() for label in labels_str.split(",") if label.strip()]
+
+
+# A label list a person types: kept small so a request stays small.
+MAX_LABELS = 50
+MAX_LABEL_LENGTH = 100
+
+
+class _LabelSetRefused(Exception):
+    pass
+
+
+def _label_set_from(body):
+    """The names in a `{"labels": [...]}` body, trimmed and checked."""
+    if not isinstance(body, dict) or set(body) != {"labels"}:
+        raise _LabelSetRefused("Send labels as a list of names.")
+    names = body["labels"]
+    if not isinstance(names, list) or not all(isinstance(name, str) for name in names):
+        raise _LabelSetRefused("Send labels as a list of names.")
+    if len(names) > MAX_LABELS:
+        raise _LabelSetRefused(f"Use at most {MAX_LABELS} labels.")
+    names = [name.strip() for name in names]
+    if any(not name for name in names):
+        raise _LabelSetRefused("Label names can't be empty.")
+    if any(len(name) > MAX_LABEL_LENGTH for name in names):
+        raise _LabelSetRefused(f"Keep each label name to {MAX_LABEL_LENGTH} characters or fewer.")
+    if len({name.casefold() for name in names}) < len(names):
+        raise _LabelSetRefused("Two labels have the same name.")
+    if len(names) < 2:
+        raise _LabelSetRefused("Use at least two labels.")
+    return names
+
+
+def _used_labels(dataset_id):
+    """Every label a labelled item of the Dataset has, from any source."""
+    rows = (
+        db.session.query(AnnotationTask.annotation_label)
+        .filter(
+            AnnotationTask.dataset_id == dataset_id,
+            AnnotationTask.status == "annotated",
+            AnnotationTask.annotation_label.isnot(None),
+        )
+        .distinct()
+        .all()
+    )
+    return {label for (label,) in rows}
+
+
+@datasets_bp.route("/<dataset_id>/label-set", methods=["PUT"])
+@jwt_required()
+def set_label_set(dataset_id):
+    """Name a single-label Dataset's labels, or change them. Free until an item
+    is labelled; after that the list keeps every label in use and may only add
+    to it or change unused ones. The LLM prompt and active-learning state are
+    left alone: both read `dataset.labels` when they run."""
+    dataset = Dataset.query.filter_by(id=dataset_id, owner_id=get_jwt_identity()).first()
+    if not dataset:
+        return jsonify({"error": "Dataset not found"}), 404
+    if dataset.task_type not in SUPPORTED_TASK_TYPES:
+        return (
+            jsonify({"error": "Labels can only be set for single-label tasks such as Text Classification."}),
+            400,
+        )
+    try:
+        names = _label_set_from(request.get_json(silent=True))
+    except _LabelSetRefused as refusal:
+        return jsonify({"error": str(refusal)}), 400
+    missing = sorted(_used_labels(dataset.id) - set(names))
+    if missing:
+        return (
+            jsonify({"error": f"'{missing[0]}' is already used on labelled items, so it can't be renamed or removed."}),
+            400,
+        )
+    dataset.labels = names
+    db.session.commit()
+    return jsonify({"dataset": dataset.to_dict()}), 200
 
 
 @datasets_bp.route("/task-types", methods=["GET"])
