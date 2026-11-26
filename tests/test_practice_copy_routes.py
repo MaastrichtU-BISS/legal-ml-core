@@ -7,6 +7,7 @@ import pandas as pd
 import pytest
 
 from legal_ml_core import AnnotationTask, Dataset, db
+from legal_ml_core.annotation_queue import create_annotation_tasks
 from legal_ml_core.models import LLMPrompt
 from tests.conftest import TEST_USER_ID
 
@@ -180,6 +181,52 @@ def test_copy_without_a_named_list_takes_the_labels_its_items_have(client, auth_
     copy = _copy(client, auth_headers, dataset_id)
 
     assert copy["labels"] == LABELS
+
+
+def test_numeric_labels_with_a_blank_cell_are_listed_once_each(client, auth_headers, app):
+    # A 0/1 column with a blank cell is read as floats; the tasks store "1" and "0".
+    frame = pd.DataFrame({"text": ["Appeal one.", "Appeal two.", "Appeal three.", "Appeal four."], "judgment": [1, 0, None, 1]})
+    with app.app_context():
+        dataset = Dataset(
+            owner_id=TEST_USER_ID, name="Judgments", description="", file_path=_write(app, frame, "judgments.csv"),
+            row_count=4, columns=[], task_type="judgment_prediction", labels=None, project_id="proj-1",
+        )
+        db.session.add(dataset)
+        db.session.commit()
+        create_annotation_tasks(dataset)
+        db.session.commit()
+        dataset_id = dataset.id
+
+    copy = _copy(client, auth_headers, dataset_id)
+
+    assert sorted(copy["labels"]) == ["0", "1"]
+
+
+def test_a_custom_text_and_label_column_are_read_and_no_other_column_carries_labels(client, auth_headers, app):
+    frame = pd.DataFrame(
+        {
+            "body": ["The provider shall keep records.", "The provider may appoint an agent."],
+            "text": ["unrelated", "unrelated"],
+            "category": ["Obligation", "Permission"],
+            "label": ["Obligation", "Permission"],
+        }
+    )
+    with app.app_context():
+        dataset = Dataset(
+            owner_id=TEST_USER_ID, name="Custom", description="", file_path=_write(app, frame, "custom.csv"),
+            row_count=2, columns=[], task_type="classification", labels=["Obligation", "Permission"],
+            project_id="proj-1", text_column="body", label_column="category",
+        )
+        db.session.add(dataset)
+        db.session.commit()
+        dataset_id = dataset.id
+
+    copy = _copy(client, auth_headers, dataset_id)
+
+    with app.app_context():
+        written = pd.read_csv(db.session.get(Dataset, copy["id"]).file_path, keep_default_na=False)
+    assert list(written["text"]) == ["The provider shall keep records.", "The provider may appoint an agent."]
+    assert {value for column in written.columns if column != "text" for value in written[column]} <= {""}
 
 
 def test_copy_gets_the_current_prompt_definitions_as_a_new_version(client, auth_headers, app):
