@@ -255,7 +255,7 @@ class MLModelTrainer:
             # A row with no label teaches nothing. The worker drops them before
             # this (apply_saved_annotations); a direct caller may not.
             labelled = labels.notna()
-            texts, labels = texts[labelled], labels[labelled]
+            texts, labels = texts[labelled].reset_index(drop=True), labels[labelled].reset_index(drop=True)
             if labels.empty:
                 raise ValueError("Classification datasets need at least one labelled row")
 

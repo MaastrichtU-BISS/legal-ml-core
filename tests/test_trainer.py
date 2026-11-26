@@ -173,6 +173,9 @@ def test_rows_without_a_label_are_left_out(fake_redis, classification_df):
     assert sorted(names) == ["a", "b"]
     assert len(texts) == len(labels) == 8
     assert trainer.label_encoder.classes_.tolist() == ["a", "b"]
+    # Trains on what is left, so texts and labels stay aligned across the gaps.
+    metrics = trainer.train_classification_model(texts, labels, "naive_bayes", {"model_id": "gaps"})
+    assert metrics["confusion_matrix_labels"] == ["a", "b"]
 
 
 def test_a_file_with_no_labels_is_refused(fake_redis, classification_df):

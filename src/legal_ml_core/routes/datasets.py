@@ -5,8 +5,7 @@ from werkzeug.utils import secure_filename
 from ..db import db
 from ..dataset_creation import DatasetInvalid, create_dataset
 from ..models import AnnotationTask, Dataset, LLMPrompt
-from ..annotation_format import label_from_assignment, stored_payload
-from ..annotation_format import label_text
+from ..annotation_format import label_from_assignment, label_text, stored_payload
 from ..annotation_queue import LABEL_COLUMNS, create_annotation_tasks, file_labels, read_rows
 from ..llm.suggest import current_prompt
 from ..kit_exchange import ExchangeError, rows_from_task_data, task_data_from_dataset
