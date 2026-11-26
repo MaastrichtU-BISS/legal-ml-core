@@ -8,6 +8,23 @@ While the version is 0.x, minor releases may contain breaking changes.
 
 ## [Unreleased]
 
+## [0.22.0] - 2026-11-26
+
+### Added
+
+- `POST /api/datasets/<id>/practice-copy` makes an unlabelled practice copy of
+  a labelled single-label Dataset (BAIGLE #197), so a student can practise LLM
+  labelling without losing their labels. The copy is owned by the same user, in
+  the same project, named "<original> (practice)", with the same text and label
+  list and no labels: its file keeps only the text and a blank label column,
+  and every row is a pending task. The original's current prompt template and
+  definitions become the copy's prompt version 1. The original is unchanged.
+  Other task types, and a Dataset with no labels yet, are refused with a 400.
+- `Dataset.origin_dataset_id` records the Dataset a practice copy was made
+  from, and `GET /api/datasets/<id>` returns it (null for an original).
+  Migration `lmc_0009_dataset_origin` adds the nullable column; hosts that
+  chain their own migrations onto the package need a merge revision with it.
+
 ## [0.21.0] - 2026-11-25
 
 ### Changed
@@ -716,7 +733,8 @@ version was not tagged; it corresponds to commit `02c5b61`.
 - Worker foreign-key resolution and the missing `psycopg2` dependency.
 - Model/task compatibility checks, live progress and failure reasons.
 
-[Unreleased]: https://github.com/shashankmc/legal-ml-core/compare/v0.21.0...HEAD
+[Unreleased]: https://github.com/shashankmc/legal-ml-core/compare/v0.22.0...HEAD
+[0.22.0]: https://github.com/shashankmc/legal-ml-core/compare/v0.21.0...v0.22.0
 [0.21.0]: https://github.com/shashankmc/legal-ml-core/compare/v0.20.0...v0.21.0
 [0.20.0]: https://github.com/shashankmc/legal-ml-core/compare/v0.19.0...v0.20.0
 [0.19.0]: https://github.com/shashankmc/legal-ml-core/compare/v0.18.0...v0.19.0

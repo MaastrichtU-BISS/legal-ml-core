@@ -306,6 +306,45 @@ paths:
         "400": { $ref: "#/components/responses/BadRequest" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "404": { $ref: "#/components/responses/NotFound" }
+  /api/datasets/{dataset_id}/practice-copy:
+    parameters:
+      - $ref: "#/components/parameters/DatasetId"
+    post:
+      tags: [datasets]
+      summary: Make an unlabelled practice copy of a labelled single-label Dataset
+      description: |
+        Makes a new Dataset to practise labelling on, leaving the original
+        unchanged. The copy has the same owner and `project_id`, is named
+        "<original> (practice)" (the original's name is cut so the whole fits
+        255 characters), and records the original's id as
+        `origin_dataset_id`. Its file holds the original's text column as
+        `text` and a blank label column (`label`, or `judgment` for
+        `judgment_prediction`); no other column is copied, and every row
+        becomes a pending annotation task with no label. It keeps the label
+        list (when the original names fewer than two labels, the labels its
+        items have, from the file or a person, in first-seen order). When the
+        original has a saved prompt, its current template and definitions
+        become the copy's prompt version 1; otherwise the copy uses the
+        default prompt too. Refusals are 400 with one of these messages:
+        "Practice copies can only be made of single-label tasks such as Text
+        Classification." (any task type but `classification`,
+        `document_classification` and `judgment_prediction`), "This dataset
+        has no labels yet. Label it directly instead.", "This dataset has no
+        text column to copy." and "This dataset's file can't be read, so it
+        can't be copied."
+      operationId: makePracticeCopy
+      responses:
+        "201":
+          description: The copy, as GET returns it
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  dataset: { $ref: "#/components/schemas/Dataset" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
   /api/datasets/{dataset_id}/preview:
     parameters:
       - $ref: "#/components/parameters/DatasetId"
@@ -2151,6 +2190,9 @@ components:
         text_column: { type: [string, "null"] }
         label_column: { type: [string, "null"] }
         labels: { type: [array, "null"], items: { type: string } }
+        origin_dataset_id:
+          type: [string, "null"]
+          description: The Dataset this one is a practice copy of; null for an original.
         created_at: { type: string, format: date-time }
         updated_at: { type: string, format: date-time }
     Model:
