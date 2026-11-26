@@ -32,6 +32,7 @@ from sklearn.svm import SVC
 from sklearn.tree import DecisionTreeClassifier
 from transformers import TrainerCallback
 
+from ..annotation_queue import _label_text
 from ..monitoring import effective_monitoring
 from ..system_metrics import log_system_readings
 from .preprocessing import TextPreprocessor
@@ -245,7 +246,12 @@ class MLModelTrainer:
                 raise ValueError("Classification datasets must have at least 2 columns")
 
             label_column = df.columns[1]
-            labels = df[label_column]
+            # Labels are text from here on: a Hugging Face ClassLabel or a 0/1/2
+            # CSV column arrives as integers, a column with a blank as floats
+            # (1.0), and a saved annotation as "1". One type keeps them one
+            # class, and the metrics, the saved encoder and predictions read
+            # them as text (BAIGLE #218).
+            labels = df[label_column].map(_label_text)
 
             # Encode labels
             self.label_encoder = LabelEncoder()

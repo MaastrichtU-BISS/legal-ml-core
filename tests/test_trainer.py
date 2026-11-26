@@ -111,3 +111,41 @@ def test_labels_with_a_single_row_still_train(fake_redis, classification_df, mod
     metrics = trainer.train_classification_model(texts, labels, model_type, {"model_id": "rare-1"})
 
     assert 0.0 <= metrics["accuracy"] <= 1.0
+
+
+@pytest.fixture
+def integer_label_df(classification_df):
+    """Hugging Face ClassLabel columns and plain 0/1/2 CSVs arrive as integers
+    (BAIGLE #218)."""
+    df = classification_df.copy()
+    df["label"] = pd.Series([0, 1, 2] * 8, dtype="int64")
+    return df
+
+
+@pytest.mark.parametrize(
+    "model_type",
+    ["svm", "decision_tree", "random_forest", "naive_bayes", "logistic_regression"],
+)
+def test_integer_labels_train_and_read_as_text(fake_redis, integer_label_df, model_type):
+    trainer = MLModelTrainer(redis_client=fake_redis)
+    texts, labels, _ = trainer.preprocess_data(integer_label_df, "classification", {})
+
+    metrics = trainer.train_classification_model(
+        texts, labels, model_type, {"model_id": "int-labels"}
+    )
+
+    assert metrics["confusion_matrix_labels"] == ["0", "1", "2"]
+    assert len(metrics["confusion_matrix"]) == 3
+    assert trainer.label_encoder.classes_.tolist() == ["0", "1", "2"]
+
+
+def test_csv_floats_and_saved_text_labels_are_one_class(fake_redis, classification_df):
+    """A CSV column with a blank reads as floats (1.0); saved annotations are
+    text ("1"). Both are the label 1."""
+    df = classification_df.copy()
+    df["label"] = pd.Series([0.0, 1.0] * 6 + ["0", "1"] * 6, dtype=object)
+    trainer = MLModelTrainer(redis_client=fake_redis)
+
+    trainer.preprocess_data(df, "classification", {})
+
+    assert trainer.label_encoder.classes_.tolist() == ["0", "1"]

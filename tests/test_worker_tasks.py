@@ -215,3 +215,90 @@ def test_failed_training_persists_error_message(app, fake_redis):
         saved = TrainingJob.query.get(job_id)
         assert saved.status == "failed"
         assert saved.error_message
+
+
+def _job_for(dataset_path, model_type="logistic_regression"):
+    dataset = Dataset(
+        owner_id=TEST_USER_ID,
+        name="Integer labels",
+        file_path=dataset_path,
+        row_count=12,
+        columns=[],
+        task_type="classification",
+    )
+    db.session.add(dataset)
+    db.session.flush()
+    model = Model(
+        owner_id=TEST_USER_ID,
+        dataset_id=dataset.id,
+        name="M1",
+        model_type=model_type,
+        parameters={},
+        status="training",
+    )
+    db.session.add(model)
+    db.session.flush()
+    job = TrainingJob(owner_id=TEST_USER_ID, model_id=model.id, status="pending")
+    db.session.add(job)
+    db.session.commit()
+    return {
+        "job_id": job.id,
+        "model_id": model.id,
+        "dataset_id": dataset.id,
+        "model_type": model_type,
+        "parameters": {},
+        "dataset_path": dataset_path,
+        "task_type": "classification",
+        "preprocessing_options": {},
+    }
+
+
+def test_integer_labelled_dataset_trains_and_predicts_text(app, fake_redis, tmp_path):
+    """A 0/1/2 label column, as a Hugging Face import or a CSV upload stores it,
+    trains, and its results and predictions read the labels as text (BAIGLE #218)."""
+    path = tmp_path / "ints.csv"
+    pd.DataFrame(
+        {
+            "text": [
+                "the court ruled for the plaintiff",
+                "the defendant was found liable",
+                "judgment entered against appellant",
+                "the parties settled the dispute",
+            ]
+            * 6,
+            "label": [0, 1, 2] * 8,
+        }
+    ).to_csv(path, index=False)
+
+    with app.app_context():
+        task_info = _job_for(str(path))
+        process_training_task(task_info, fake_redis, app.config["MODEL_FOLDER"])
+
+        job = TrainingJob.query.get(task_info["job_id"])
+        assert job.status == "completed", job.error_message
+        assert job.metrics["confusion_matrix_labels"] == ["0", "1", "2"]
+
+        result = process_prediction_task(
+            {
+                "prediction_id": "p-int",
+                "model_id": task_info["model_id"],
+                "model_type": "logistic_regression",
+                "texts": ["the court ruled for the plaintiff"],
+                "owner_id": TEST_USER_ID,
+            },
+            app.config["MODEL_FOLDER"],
+        )
+        prediction = result["predictions"][0]
+        assert prediction["prediction"] in ("0", "1", "2")
+        assert set(prediction["all_confidences"]) == {"0", "1", "2"}
+
+
+def test_failed_training_logs_its_traceback(app, fake_redis, caplog):
+    """The worker log names where a training job failed, not just why (BAIGLE #218)."""
+    with app.app_context():
+        task_info = _job_for("/nonexistent/path.csv", model_type="naive_bayes")
+        with caplog.at_level("WARNING", logger="legal_ml_core.compute.tasks"):
+            process_training_task(task_info, fake_redis, app.config["MODEL_FOLDER"])
+
+    failed = [r for r in caplog.records if "failed" in r.getMessage()]
+    assert failed and failed[0].exc_info is not None
