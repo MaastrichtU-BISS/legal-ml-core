@@ -1,3 +1,4 @@
+import json
 import pandas as pd
 import pytest
 
@@ -288,6 +289,8 @@ def test_integer_labelled_dataset_trains_and_predicts_text(app, fake_redis, tmp_
             },
             app.config["MODEL_FOLDER"],
         )
+        # The worker sends this as JSON: the labels must be plain text.
+        json.dumps(result)
         prediction = result["predictions"][0]
         assert prediction["prediction"] in ("0", "1", "2")
         assert set(prediction["all_confidences"]) == {"0", "1", "2"}

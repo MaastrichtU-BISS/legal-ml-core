@@ -5,7 +5,7 @@ import logging
 import pandas as pd
 from sqlalchemy.exc import IntegrityError
 
-from .annotation_format import SPAN_TYPES, _stored_entities
+from .annotation_format import SPAN_TYPES, _stored_entities, label_text
 from .db import db
 from .models import AnnotationTask, Dataset
 
@@ -132,7 +132,8 @@ def holdout_examples(df, dataset):
         if task.is_holdout and task.status == "annotated" and task.label_source not in LLM_LABEL_SOURCES:
             labels[task.item_index] = task.annotation_label
     rows = [row for row in holdout if row in labels]
-    return [texts_by_row.iloc[row] for row in rows], [str(labels[row]) for row in rows]
+    # Read as the trainer reads them, so a file's 1.0 grades against the class "1".
+    return [texts_by_row.iloc[row] for row in rows], [label_text(labels[row]) for row in rows]
 
 
 def record_rows_to_label(dataset, df):
@@ -160,18 +161,6 @@ def _mark_all_rows_queued(dataset):
         {**column, ALL_ROWS_QUEUED: True} if str(column["name"]).lower() == text_name else column
         for column in dataset.columns or []
     ]
-
-
-def _label_text(value):
-    """A file's label as text, or None when blank; 1.0 read from a CSV reads as 1.
-    A JSON file's span list arrives as a list and is kept as JSON."""
-    if isinstance(value, (list, tuple)):
-        return json.dumps(list(value))
-    if value is None or (isinstance(value, float) and pd.isna(value)) or not str(value).strip():
-        return None
-    if isinstance(value, float) and value.is_integer():
-        return str(int(value))
-    return str(value)
 
 
 def _file_spans(value, text):
@@ -387,7 +376,7 @@ def create_annotation_tasks(dataset):
         if position in existing:
             continue
         text = str(df[text_column].iloc[position])
-        file_label = _label_text(df[label_column].iloc[position]) if label_column is not None else None
+        file_label = label_text(df[label_column].iloc[position]) if label_column is not None else None
         spans = _checked_spans(file_label, text, dataset, position) if spans_rows else None
         label = json.dumps(spans) if spans is not None else (file_label if labels_rows else None)
         labelled = label is not None
@@ -460,6 +449,7 @@ def apply_saved_annotations(df, dataset):
     keep = ~_is_blank(df[label_column]) & ~df.index.isin(_holdout_of(dataset))
     df = df.loc[keep, [text_column, label_column]]
     if dataset.al_config is not None:
-        labels = df[label_column].astype(str)
+        # Counted as the trainer reads them: 1, 1.0 and "1" are one class.
+        labels = df[label_column].map(label_text)
         df = df[labels.map(labels.value_counts()) >= MIN_TO_SPLIT]
     return df.reset_index(drop=True)

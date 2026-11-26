@@ -20,7 +20,7 @@ from ..annotation_queue import (
     read_rows,
     rows_with_text,
 )
-from ..annotation_format import rename_tag
+from ..annotation_format import label_text, rename_tag
 from ..db import db
 from ..job_state import ACTIVE_JOB_STATUSES, COULD_NOT_START_MESSAGE, sweep_lost_job, sweep_stale_job
 from ..models import ALConfig, ALRound, AnnotationTask, LLMSuggestion, Model, TrainingJob
@@ -154,7 +154,7 @@ def _rows_the_llm_touched(dataset_id):
 
 def _labels_so_far(df, dataset):
     """Row position to label, for every row with a label from the file or saved."""
-    labels = {int(row): str(value) for row, value in file_labels(df, dataset).items()}
+    labels = {int(row): label_text(value) for row, value in file_labels(df, dataset).items()}
     saved = AnnotationTask.query.filter_by(dataset_id=dataset.id, status="annotated")
     labels.update({task.item_index: task.annotation_label for task in saved})
     return labels
@@ -208,7 +208,7 @@ def _file_label_counts(df, dataset, rows, held_back):
     labels = file_labels(df, dataset)
     with_task = {task.item_index for task in AnnotationTask.query.filter_by(dataset_id=dataset.id)}
     labels = labels[(labels.index.isin(rows) == held_back) & ~labels.index.isin(with_task)]
-    return {str(k): int(v) for k, v in labels.value_counts().items()}
+    return {str(k): int(v) for k, v in labels.map(label_text).value_counts().items()}
 
 
 def _shuffle_pool(tasks, seed):

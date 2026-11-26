@@ -32,7 +32,7 @@ from sklearn.svm import SVC
 from sklearn.tree import DecisionTreeClassifier
 from transformers import TrainerCallback
 
-from ..annotation_queue import _label_text
+from ..annotation_format import label_text
 from ..monitoring import effective_monitoring
 from ..system_metrics import log_system_readings
 from .preprocessing import TextPreprocessor
@@ -251,7 +251,13 @@ class MLModelTrainer:
             # (1.0), and a saved annotation as "1". One type keeps them one
             # class, and the metrics, the saved encoder and predictions read
             # them as text (BAIGLE #218).
-            labels = df[label_column].map(_label_text)
+            labels = df[label_column].map(label_text)
+            # A row with no label teaches nothing. The worker drops them before
+            # this (apply_saved_annotations); a direct caller may not.
+            labelled = labels.notna()
+            texts, labels = texts[labelled], labels[labelled]
+            if labels.empty:
+                raise ValueError("Classification datasets need at least one labelled row")
 
             # Encode labels
             self.label_encoder = LabelEncoder()

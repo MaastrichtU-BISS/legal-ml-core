@@ -8,7 +8,7 @@ from ..annotation_queue import (
     has_ner_examples,
     has_summarization_examples,
 )
-from ..annotation_format import SPAN_TYPES
+from ..annotation_format import SPAN_TYPES, label_text
 from ..models import ALRound, Model, Dataset, TrainingJob
 from ..db_utils import project_belongs_to_owner
 from ..monitoring import monitoring_refusal, run_monitoring
@@ -852,7 +852,8 @@ def _label_count(dataset):
         rows = apply_saved_annotations(pd.read_csv(dataset.file_path), dataset)
     except (OSError, ValueError):
         return None
-    return rows.iloc[:, 1].nunique() if rows.shape[1] > 1 else None
+    # Counted as the trainer reads them: 1, 1.0 and "1" are one label.
+    return rows.iloc[:, 1].map(label_text).nunique() if rows.shape[1] > 1 else None
 
 
 def _rule_holds(rule, chosen, dataset):

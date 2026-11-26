@@ -19,6 +19,12 @@ While the version is 0.x, minor releases may contain breaking changes.
   saved "1" are one class. Metrics, the confusion matrix, the saved label
   encoder and predictions show the labels as text. Datasets with text labels
   are unchanged.
+- Active learning reads labels the same way: the one-example class filter and
+  the held-out rows that grade a model count a file's 1.0 as the class "1", so
+  a held-out row is no longer graded wrong for being a float. True/False labels
+  train as "True"/"False".
+- With ten or more integer classes, results list them in text order ("0",
+  "1", "10", "2", ...).
 - A failed training job's worker log carries its traceback, not just the
   message.
 
