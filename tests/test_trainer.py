@@ -111,3 +111,75 @@ def test_labels_with_a_single_row_still_train(fake_redis, classification_df, mod
     metrics = trainer.train_classification_model(texts, labels, model_type, {"model_id": "rare-1"})
 
     assert 0.0 <= metrics["accuracy"] <= 1.0
+
+
+@pytest.fixture
+def integer_label_df(classification_df):
+    """Hugging Face ClassLabel columns and plain 0/1/2 CSVs arrive as integers
+    (BAIGLE #218)."""
+    df = classification_df.copy()
+    df["label"] = pd.Series([0, 1, 2] * 8, dtype="int64")
+    return df
+
+
+@pytest.mark.parametrize(
+    "model_type",
+    ["svm", "decision_tree", "random_forest", "naive_bayes", "logistic_regression"],
+)
+def test_integer_labels_train_and_read_as_text(fake_redis, integer_label_df, model_type):
+    trainer = MLModelTrainer(redis_client=fake_redis)
+    texts, labels, _ = trainer.preprocess_data(integer_label_df, "classification", {})
+
+    metrics = trainer.train_classification_model(
+        texts, labels, model_type, {"model_id": "int-labels"}
+    )
+
+    assert metrics["confusion_matrix_labels"] == ["0", "1", "2"]
+    assert len(metrics["confusion_matrix"]) == 3
+    assert trainer.label_encoder.classes_.tolist() == ["0", "1", "2"]
+
+
+def test_csv_floats_and_saved_text_labels_are_one_class(fake_redis, classification_df):
+    """A CSV column with a blank reads as floats (1.0); saved annotations are
+    text ("1"). Both are the label 1."""
+    df = classification_df.copy()
+    df["label"] = pd.Series([0.0, 1.0] * 6 + ["0", "1"] * 6, dtype=object)
+    trainer = MLModelTrainer(redis_client=fake_redis)
+
+    trainer.preprocess_data(df, "classification", {})
+
+    assert trainer.label_encoder.classes_.tolist() == ["0", "1"]
+
+
+def test_true_false_labels_train_as_text(fake_redis, classification_df):
+    df = classification_df.copy()
+    df["label"] = pd.Series([True, False] * 12, dtype=bool)
+    trainer = MLModelTrainer(redis_client=fake_redis)
+    texts, labels, _ = trainer.preprocess_data(df, "classification", {})
+
+    metrics = trainer.train_classification_model(texts, labels, "logistic_regression", {"model_id": "bool"})
+
+    assert metrics["confusion_matrix_labels"] == ["False", "True"]
+
+
+def test_rows_without_a_label_are_left_out(fake_redis, classification_df):
+    """A direct caller's blank labels (NaN, "", whitespace) never become a class."""
+    df = classification_df.copy()
+    df["label"] = pd.Series(["a", "b", None, "", "   ", float("nan")] * 4, dtype=object)
+    trainer = MLModelTrainer(redis_client=fake_redis)
+
+    texts, labels, names = trainer.preprocess_data(df, "classification", {})
+
+    assert sorted(names) == ["a", "b"]
+    assert len(texts) == len(labels) == 8
+    assert trainer.label_encoder.classes_.tolist() == ["a", "b"]
+    # Trains on what is left, so texts and labels stay aligned across the gaps.
+    metrics = trainer.train_classification_model(texts, labels, "naive_bayes", {"model_id": "gaps"})
+    assert metrics["confusion_matrix_labels"] == ["a", "b"]
+
+
+def test_a_file_with_no_labels_is_refused(fake_redis, classification_df):
+    df = classification_df.copy()
+    df["label"] = None
+    with pytest.raises(ValueError, match="at least one labelled row"):
+        MLModelTrainer(redis_client=fake_redis).preprocess_data(df, "classification", {})

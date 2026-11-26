@@ -10,6 +10,9 @@ Assignment when it is opened.
 
 import json
 
+import numpy as np
+import pandas as pd
+
 SINGLE_LABEL_TYPES = {"classification", "document_classification", "judgment_prediction"}
 SPAN_TYPES = {"ner", "named_entity_recognition"}
 
@@ -164,3 +167,21 @@ def _stored_entities(label):
         e for e in entities
         if isinstance(e, dict) and isinstance(e.get("start"), int) and isinstance(e.get("end"), int) and e.get("type")
     ]
+
+
+def label_text(value):
+    """A label as text, or None when blank; 1.0 read from a CSV reads as 1.
+    Every reader of training labels uses it, so 1, 1.0 and "1" are one class.
+    A JSON file's span list arrives as a list and is kept as JSON."""
+    if isinstance(value, np.ndarray):
+        # An in-memory frame (a Hugging Face to_pandas()) can hold arrays.
+        value = value.tolist()
+    if isinstance(value, (list, tuple)):
+        return json.dumps(list(value))
+    # pd.isna also catches pd.NA and NaT, which str() would turn into "<NA>".
+    if value is None or pd.isna(value) or not str(value).strip():
+        return None
+    # numpy floats too: a float32 1.0 is not a Python float.
+    if isinstance(value, (float, np.floating)) and float(value).is_integer():
+        return str(int(value))
+    return str(value)

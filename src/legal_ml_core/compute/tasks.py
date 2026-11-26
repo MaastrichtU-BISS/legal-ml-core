@@ -490,7 +490,7 @@ def process_training_task(
             # Persist the reason so the UI can explain the failure instead of
             # showing a generic "Training failed".
             error_message = str(e)
-            logger.warning("training job %s failed: %s", job_id, e)
+            logger.warning("training job %s failed: %s", job_id, e, exc_info=True)
         # Guarded like the success write: a job that went terminal meanwhile
         # (e.g. cancelled by /stop) keeps its state.
         if transition(

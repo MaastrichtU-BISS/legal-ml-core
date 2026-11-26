@@ -5,8 +5,8 @@ from werkzeug.utils import secure_filename
 from ..db import db
 from ..dataset_creation import DatasetInvalid, create_dataset
 from ..models import AnnotationTask, Dataset, LLMPrompt
-from ..annotation_format import label_from_assignment, stored_payload
-from ..annotation_queue import LABEL_COLUMNS, _label_text, create_annotation_tasks, file_labels, read_rows
+from ..annotation_format import label_from_assignment, label_text, stored_payload
+from ..annotation_queue import LABEL_COLUMNS, create_annotation_tasks, file_labels, read_rows
 from ..llm.suggest import current_prompt
 from ..kit_exchange import ExchangeError, rows_from_task_data, task_data_from_dataset
 from ..text_terms import (
@@ -560,7 +560,7 @@ def _practice_labels(dataset, df):
     if isinstance(dataset.labels, list) and len(dataset.labels) >= 2:
         return list(dataset.labels)
     # As the tasks store them: a 0/1 column read as floats gives "1", not "1.0".
-    seen = [text for text in map(_label_text, file_labels(df, dataset).tolist()) if text]
+    seen = [text for text in map(label_text, file_labels(df, dataset).tolist()) if text]
     seen += sorted(_used_labels(dataset.id))
     return list(dict.fromkeys(seen)) or dataset.labels
 
