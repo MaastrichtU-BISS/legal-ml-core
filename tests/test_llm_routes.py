@@ -4,6 +4,7 @@ import http.client
 import io
 import json
 import logging
+import re
 import socket
 import ssl
 import threading
@@ -902,6 +903,101 @@ def test_definition_for_an_unknown_label_is_refused(client, app, gated, provider
         headers=gated,
     )
     assert resp.status_code == 400
+
+
+# Worked examples
+
+
+def _label_items(app, task_ids, labels, holdout=(), source="human"):
+    """Confirm ``labels[i]`` on ``task_ids[i]``; ``None`` leaves an item pending."""
+    with app.app_context():
+        for index, (task_id, label) in enumerate(zip(task_ids, labels)):
+            task = db.session.get(AnnotationTask, task_id)
+            task.is_holdout = index in holdout
+            if label is not None:
+                task.status = "annotated"
+                task.annotation_label = label
+                task.label_source = source
+        db.session.commit()
+
+
+def _examples_sent(client, dataset_id, task_id, headers, provider):
+    """The ``(text, label)`` worked examples in the prompt for ``task_id``."""
+    _suggest(client, dataset_id, [task_id], headers)
+    user = provider.calls[-1]["body"]["messages"][1]["content"]
+    examples = user.split("Examples:\n", 1)[1].split("\n\nText to label:", 1)[0]
+    return re.findall(r"<document>\n(.*?)\n</document>\nLabel: (.*)", examples)
+
+
+def test_worked_examples_include_every_label_even_when_one_label_comes_first(
+    client, app, gated, provider
+):
+    dataset_id, task_ids = _dataset(app, tasks=9)
+    labels = ["obligation"] * 6 + ["permission", "permission", None]
+    _label_items(app, task_ids, labels)
+    _ack(client, dataset_id, gated)
+
+    examples = _examples_sent(client, dataset_id, task_ids[-1], gated, provider)
+
+    assert len(examples) == 5
+    assert {label for _, label in examples} == {"obligation", "permission"}
+    assert examples.count(("clause 6", "permission")) == 1
+    assert examples.count(("clause 7", "permission")) == 1
+
+
+def test_worked_examples_take_one_per_label_before_a_second_of_any(
+    client, app, gated, provider
+):
+    dataset_id, task_ids = _dataset(app, tasks=8)
+    with app.app_context():
+        dataset = db.session.get(Dataset, dataset_id)
+        dataset.labels = ["a", "b", "c", "d", "e", "f"]
+        db.session.commit()
+    _label_items(app, task_ids, ["a", "a", "b", "c", "d", "e", "f", None])
+    _ack(client, dataset_id, gated)
+
+    examples = _examples_sent(client, dataset_id, task_ids[-1], gated, provider)
+
+    assert [label for _, label in examples] == ["a", "b", "c", "d", "e"]
+
+
+def test_worked_examples_stop_at_five(client, app, gated, provider):
+    dataset_id, task_ids = _dataset(app, tasks=13)
+    _label_items(app, task_ids, ["obligation", "permission"] * 6 + [None])
+    _ack(client, dataset_id, gated)
+
+    examples = _examples_sent(client, dataset_id, task_ids[-1], gated, provider)
+
+    assert len(examples) == 5
+    assert {label for _, label in examples} == {"obligation", "permission"}
+
+
+def test_worked_examples_never_include_held_out_or_unconfirmed_items(
+    client, app, gated, provider
+):
+    dataset_id, task_ids = _dataset(app, tasks=5)
+    _label_items(
+        app, task_ids, ["obligation", "permission", "obligation", None, None], holdout={1}
+    )
+    with app.app_context():
+        suggested = db.session.get(AnnotationTask, task_ids[3])
+        suggested.status = "annotated"
+        suggested.annotation_label = "permission"
+        suggested.label_source = "llm_bulk"
+        db.session.commit()
+    _ack(client, dataset_id, gated)
+
+    examples = _examples_sent(client, dataset_id, task_ids[-1], gated, provider)
+
+    assert examples == [("clause 0", "obligation"), ("clause 2", "obligation")]
+
+
+def test_with_nothing_confirmed_the_prompt_has_no_worked_examples(client, app, gated, provider):
+    dataset_id, task_ids = _dataset(app, tasks=1)
+    _ack(client, dataset_id, gated)
+    _suggest(client, dataset_id, task_ids, gated)
+    user = provider.calls[-1]["body"]["messages"][1]["content"]
+    assert "Examples:\n(none)" in user
 
 
 # Metering
