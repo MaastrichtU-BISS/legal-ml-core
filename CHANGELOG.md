@@ -8,6 +8,20 @@ While the version is 0.x, minor releases may contain breaking changes.
 
 ## [Unreleased]
 
+## [0.22.1] - 2026-11-26
+
+### Fixed
+
+- Training a Dataset whose label column holds integers (a Hugging Face
+  `ClassLabel` without names, or a CSV of 0/1/2) no longer fails with "object
+  of type 'int' has no len()" (BAIGLE #218). The trainer reads every label as
+  text, as the annotation queue does: 1, 1.0 (a CSV column with a blank) and a
+  saved "1" are one class. Metrics, the confusion matrix, the saved label
+  encoder and predictions show the labels as text. Datasets with text labels
+  are unchanged.
+- A failed training job's worker log carries its traceback, not just the
+  message.
+
 ## [0.22.0] - 2026-11-26
 
 ### Added
@@ -733,7 +747,8 @@ version was not tagged; it corresponds to commit `02c5b61`.
 - Worker foreign-key resolution and the missing `psycopg2` dependency.
 - Model/task compatibility checks, live progress and failure reasons.
 
-[Unreleased]: https://github.com/shashankmc/legal-ml-core/compare/v0.22.0...HEAD
+[Unreleased]: https://github.com/shashankmc/legal-ml-core/compare/v0.22.1...HEAD
+[0.22.1]: https://github.com/shashankmc/legal-ml-core/compare/v0.22.0...v0.22.1
 [0.22.0]: https://github.com/shashankmc/legal-ml-core/compare/v0.21.0...v0.22.0
 [0.21.0]: https://github.com/shashankmc/legal-ml-core/compare/v0.20.0...v0.21.0
 [0.20.0]: https://github.com/shashankmc/legal-ml-core/compare/v0.19.0...v0.20.0
