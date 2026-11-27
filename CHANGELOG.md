@@ -13,6 +13,9 @@ While the version is 0.x, minor releases may contain breaking changes.
 - A Dataset that names a label twice no longer gives that label's items twice
   among a suggestion's worked examples (BAIGLE #211): each label is taken once,
   in the order the Dataset first names it.
+- A practice copy that fails part-way leaves nothing behind (BAIGLE #214):
+  a half-written file is removed, the file goes even when the database is
+  gone, and the original error is the one raised.
 
 ## [0.22.1] - 2026-11-26
 

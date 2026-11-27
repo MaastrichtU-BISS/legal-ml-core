@@ -17,6 +17,7 @@ from ..text_terms import (
     text_values,
     texts_containing,
 )
+import logging
 import pandas as pd
 import os
 import uuid
@@ -24,6 +25,7 @@ import json
 from .llm import SUPPORTED_TASK_TYPES
 
 datasets_bp = Blueprint("datasets", __name__)
+logger = logging.getLogger(__name__)
 
 ALLOWED_EXTENSIONS = {"csv", "xlsx", "json"}
 # The row cap when the host sets none. Hosts set LEGAL_ML_MAX_ROWS to a whole
@@ -595,8 +597,9 @@ def make_practice_copy(dataset_id):
     # carry the labels under another name.
     label_name = LABEL_COLUMNS[original.task_type]
     file_path = os.path.join(current_app.config["UPLOAD_FOLDER"], f"{uuid.uuid4()}_practice.csv")
-    pd.DataFrame({"text": df[text_column].to_numpy(), label_name: ""}).to_csv(file_path, index=False)
+    copy_id = None
     try:
+        pd.DataFrame({"text": df[text_column].to_numpy(), label_name: ""}).to_csv(file_path, index=False)
         copy = create_dataset(
             owner_id=owner_id,
             file_path=file_path,
@@ -606,8 +609,9 @@ def make_practice_copy(dataset_id):
             annotation_mode=True,
             labels=_practice_labels(original, df),
         )
+        copy_id = copy.id
         copy.project_id = original.project_id
-        copy.origin_dataset_id = original.id
+        copy.origin_dataset_id = str(original.id)
         version, template, definitions = current_prompt(original)
         if version > 0:
             db.session.add(
@@ -616,18 +620,50 @@ def make_practice_copy(dataset_id):
         create_annotation_tasks(copy)
         db.session.commit()
     except DatasetInvalid as refused:
-        db.session.rollback()
-        os.remove(file_path)
+        _discard_practice_copy(copy_id, file_path)
         return jsonify({"error": str(refused)}), 400
     except Exception:
-        # create_dataset has already committed the copy; leave nothing half made.
-        db.session.rollback()
-        Dataset.query.filter_by(owner_id=owner_id, file_path=file_path).delete()
-        db.session.commit()
-        if os.path.exists(file_path):
-            os.remove(file_path)
+        # create_dataset may have committed the copy already; leave nothing half made.
+        _discard_practice_copy(copy_id, file_path)
         raise
     return jsonify({"dataset": copy.to_dict()}), 201
+
+
+def _discard_practice_copy(copy_id, file_path):
+    """Remove the file and Dataset a failed practice copy left behind.
+
+    Best effort, and it never raises: the caller re-raises the error that
+    matters. The file goes first, so a dead database connection cannot leave
+    it behind. The Dataset goes by id through the ORM, so its tasks go with it,
+    and only when create_dataset made one (as BAIGLE's sample project cleanup).
+    """
+    name = os.path.basename(file_path)
+    try:
+        if os.path.exists(file_path):
+            os.remove(file_path)
+    except OSError as exc:
+        logger.warning(
+            "practice_copy_cleanup_file_failed file=%s exception_type=%s", name, type(exc).__name__
+        )
+    try:
+        db.session.rollback()
+    except Exception:  # noqa: BLE001 - cleanup must not mask the real error
+        pass
+    if copy_id is None:
+        return
+    try:
+        orphan = db.session.get(Dataset, copy_id)
+        if orphan is not None:
+            db.session.delete(orphan)
+            db.session.commit()
+    except Exception as exc:  # noqa: BLE001 - cleanup must not mask the real error
+        try:
+            db.session.rollback()
+        except Exception:  # noqa: BLE001
+            pass
+        logger.warning(
+            "practice_copy_cleanup_dataset_failed file=%s exception_type=%s", name, type(exc).__name__
+        )
 
 
 @datasets_bp.route("/task-types", methods=["GET"])
