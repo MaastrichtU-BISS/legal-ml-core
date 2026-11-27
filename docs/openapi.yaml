@@ -1402,7 +1402,14 @@ paths:
     get:
       tags: [annotation]
       summary: Annotation progress counts
+      description: >-
+        The counts cover the whole project. With `dataset_id`, `label_counts`
+        adds that Dataset's confirmed labels per label, in one read: annotated
+        items not held back, with a label. A label with none is absent, and a
+        Dataset the caller doesn't own, or one off this project, counts nothing.
       operationId: annotationQueueStats
+      parameters:
+        - { name: dataset_id, in: query, description: Count this Dataset's labels in label_counts, schema: { type: string } }
       responses:
         "200":
           description: Counts
@@ -1420,6 +1427,10 @@ paths:
                       annotated: { type: integer }
                       skipped: { type: integer }
                       percentage_complete: { type: integer }
+                      label_counts:
+                        type: object
+                        description: Only with `dataset_id`. Label to count.
+                        additionalProperties: { type: integer }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "404": { $ref: "#/components/responses/NotFound" }
   /api/annotation/projects/{project_id}/tasks:

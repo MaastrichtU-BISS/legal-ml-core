@@ -131,13 +131,15 @@ def get_annotation_queue_stats(project_id):
     # does not own, or one off this project, counts nothing.
     dataset_id = request.args.get("dataset_id")
     if dataset_id:
-        stats["label_counts"] = confirmed_label_counts(
+        counts = confirmed_label_counts(
             tasks.filter(
                 AnnotationTask.dataset_id == dataset_id,
                 AnnotationTask.annotation_label.isnot(None),
                 db.func.trim(AnnotationTask.annotation_label) != "",
             )
         )
+        # SQL trim takes spaces only: a label of tabs or newlines is blank too.
+        stats["label_counts"] = {label: n for label, n in counts.items() if label.strip()}
 
     return jsonify({"success": True, "stats": stats}), 200
 

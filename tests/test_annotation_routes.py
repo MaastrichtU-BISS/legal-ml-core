@@ -219,6 +219,7 @@ def test_queue_stats_count_confirmed_labels_per_label_in_one_query(client, auth_
         ("skipped", "negative", False),
         ("annotated", "", False),
         ("annotated", "   ", False),
+        ("annotated", "\t\n", False),
         ("annotated", None, False),
     ])
     # Another of the caller's Datasets on the same project does not count.
@@ -242,8 +243,8 @@ def test_queue_stats_count_confirmed_labels_per_label_in_one_query(client, auth_
     grouped = [s for s in statements if "GROUP BY" in s.upper()]
     assert len(grouped) == 1
     # The project-wide counts keep their meaning: they are not scoped to the Dataset.
-    assert stats["total"] == 1 + 10 + 1 + 2
-    assert stats["annotated"] == 8 + 2
+    assert stats["total"] == 1 + 11 + 1 + 2
+    assert stats["annotated"] == 9 + 2
 
 
 def test_queue_stats_without_dataset_id_have_no_label_counts(client, auth_headers, app):
