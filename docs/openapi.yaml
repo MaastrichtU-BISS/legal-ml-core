@@ -1300,7 +1300,7 @@ paths:
         "201": {description: Started}
         "400": {description: "Not text classification, nothing to label, no named labels, or the estimate not confirmed"}
         "403": {description: "No LLM access: `code` no_llm_access, `byok_available` true"}
-        "409": {description: "Already started, or the project has not acknowledged the destination (`code` acknowledgement_required)"}
+        "409": {description: "Already started, the project has not acknowledged the destination (`code` acknowledgement_required), or an LLM job of yours is still queued or running (`code` job_running, its `job_id`)"}
         "429": {description: "The seed is larger than the remaining monthly limit (`code` budget_exhausted)"}
   /api/active-learning/datasets/{dataset_id}/seed-estimate:
     parameters:
@@ -1327,7 +1327,7 @@ paths:
                 properties:
                   tasks: {type: integer, description: Items the LLM would label}
                   estimated_tokens: {type: integer}
-                  remaining_tokens: {type: [integer, "null"], description: "null with the user's own key"}
+                  remaining_tokens: {type: [integer, "null"], description: "null with the user's own key, or a free model (its balance isn't read)"}
                   within_budget: {type: boolean}
                   destination: {type: string}
         "400": {description: "Not single-label classification, or no named labels"}
@@ -1625,11 +1625,29 @@ paths:
     get:
       tags: [llm]
       summary: Current LLM access, destination and remaining tokens
+      description: >-
+        `free_model` is true when the model this account would use is a free
+        one: an OpenRouter model whose id ends in `:free`. No other provider
+        says which models are free, so they always read false. A free shared
+        model is metered but not held to the monthly token limit.
       operationId: getLlmStatus
       parameters:
         - { name: dataset_id, in: query, schema: { type: string } }
       responses:
-        "200": { description: OK }
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  mode: { type: string, enum: [shared, byok, none] }
+                  destination: { type: [string, "null"] }
+                  model: { type: [string, "null"] }
+                  remaining_tokens:
+                    type: [integer, "null"]
+                    description: Null with the user's own key, or a free model (its balance isn't read).
+                  free_model: { type: boolean }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "404": { $ref: "#/components/responses/NotFound" }
         "502": { description: The LLM service failed }
@@ -1774,6 +1792,12 @@ paths:
                         name:
                           type: string
                           description: Left out when the provider gives none, or the same as the id
+                        free:
+                          type: boolean
+                          const: true
+                          description: >-
+                            There, and true, only for an OpenRouter model whose
+                            id ends in `:free`; left out otherwise.
         "400": { $ref: "#/components/responses/BadRequest" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "502":
@@ -1833,7 +1857,21 @@ paths:
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
         "409": { description: Acknowledgement required or destination changed }
-        "429": { description: Monthly limit reached }
+        "429":
+          description: >-
+            The monthly limit was reached (`budget_exhausted`), or the model's
+            provider is limiting requests (`provider_rate_limited`, with a
+            `Retry-After` header when the provider said when).
+          headers:
+            Retry-After:
+              description: Seconds to wait, when the provider said.
+              schema: { type: integer, minimum: 1 }
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - { $ref: "#/components/schemas/Error" }
+                  - { $ref: "#/components/schemas/LlmProviderRateLimited" }
         "502": { description: The LLM service failed }
   /api/llm/datasets/{dataset_id}/suggestions:
     parameters:
@@ -1867,7 +1905,21 @@ paths:
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
         "409": { description: Acknowledgement required or destination changed }
-        "429": { description: Monthly limit reached }
+        "429":
+          description: >-
+            The monthly limit was reached (`budget_exhausted`), or the model's
+            provider is limiting requests (`provider_rate_limited`, with a
+            `Retry-After` header when the provider said when).
+          headers:
+            Retry-After:
+              description: Seconds to wait, when the provider said.
+              schema: { type: integer, minimum: 1 }
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - { $ref: "#/components/schemas/Error" }
+                  - { $ref: "#/components/schemas/LlmProviderRateLimited" }
         "502": { description: The LLM service failed }
   /api/llm/suggestions/{suggestion_id}/confirm:
     parameters:
@@ -1937,7 +1989,11 @@ paths:
               properties:
                 task_ids: { type: array, items: { type: string } }
       responses:
-        "200": { description: OK }
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/LlmEstimate" }
         "400": { $ref: "#/components/responses/BadRequest" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
@@ -1959,13 +2015,35 @@ paths:
               properties:
                 task_ids: { type: array, items: { type: string } }
                 confirm_estimate: { type: boolean }
+      description: >-
+        Never refused for `over_provider_limit`: that only warns. A job on a
+        free model that goes past the provider's daily allowance stops with
+        status `provider_limited` and keeps the suggestions already made. The
+        provider isn't asked for its allowance again: the `estimate` here has
+        `provider_daily_limit` and `provider_daily_remaining` null and
+        `over_provider_limit` false. One LLM job per user at a time: while one
+        is queued or running another is refused with 409 `job_running`. On a
+        free OpenRouter model the kept `/key` answer is dropped, so the next
+        estimate reads the allowance afresh.
       responses:
-        "202": { description: Job queued }
+        "202":
+          description: Job queued
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  job_id: { type: string }
+                  estimate: { $ref: "#/components/schemas/LlmEstimate" }
         "400": { $ref: "#/components/responses/BadRequest" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
-        "409": { description: Acknowledgement required or destination changed }
+        "409":
+          description: >-
+            Acknowledgement required, destination changed, or an LLM job of
+            yours is still queued or running (`code` job_running, with that
+            job's `job_id`).
         "429": { description: Monthly limit reached }
         "502": { description: The LLM service failed }
   /api/llm/jobs/{job_id}:
@@ -1974,9 +2052,39 @@ paths:
     get:
       tags: [llm]
       summary: Status of a standalone annotation job
+      description: >-
+        On a provider's per-minute limit the worker waits (for its Retry-After,
+        else 20 s, and at most 3 times per item) and carries on;
+        `waiting_seconds` says how long while it waits and is null otherwise.
+        On the provider's daily allowance, a Retry-After over 120 s, after
+        the third wait, or when a wait would take the job past 600 s of waiting
+        in all, the job stops at once with `provider_limited`, keeping its work
+        and its counts. A key with no quota left ends the job `failed`, its
+        work kept.
       operationId: getLlmJob
       responses:
-        "200": { description: OK }
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    enum: [queued, running, completed, budget_exhausted, provider_limited, failed]
+                  total: { type: integer }
+                  done: { type: integer }
+                  created: { type: integer }
+                  invalid: { type: integer }
+                  error: { type: string }
+                  waiting_seconds: { type: [integer, "null"] }
+                  retry_after:
+                    type: [integer, "null"]
+                    description: With `provider_limited`, seconds until the provider allows more, when known.
+                  daily:
+                    type: boolean
+                    description: With `provider_limited`, true when the daily allowance is used up.
         "401": { $ref: "#/components/responses/Unauthorized" }
         "404": { $ref: "#/components/responses/NotFound" }
   # ----------------------------------------------------------- summarization
@@ -2131,6 +2239,73 @@ components:
         application/json:
           schema: { $ref: "#/components/schemas/Error" }
   schemas:
+    LlmProviderRateLimited:
+      type: object
+      required: [error, code, retry_after, daily]
+      properties:
+        error: { type: string, description: "Plain words, safe to show. The provider's body is never included." }
+        code: { type: string, const: provider_rate_limited }
+        retry_after:
+          type: [integer, "null"]
+          minimum: 1
+          maximum: 604800
+          description: >-
+            Seconds until the provider allows more, when it said (Retry-After,
+            else X-RateLimit-Reset), at most a week.
+        daily:
+          type: boolean
+          description: >-
+            True when the provider's daily allowance is used up: its message
+            names a `per-day` limit, or, for a free OpenRouter model, its
+            X-RateLimit-Limit is over the 20 a minute (unless the 429 is an
+            upstream provider's that OpenRouter relays, with `error.metadata.provider_code`
+            or a non-empty `error.metadata.provider_name`, or the request may reach a paid fallback, web search, plugins or tools).
+            Never judged from how far away the reset is. A provider's
+            `insufficient_quota` (in `error.code`, `error.type`,
+            `error.metadata.provider_code` or `error.metadata.error_type`) is not
+            a rate limit: it fails with 502
+            `llm_failed`, saying the key has no quota left.
+    LlmEstimate:
+      type: object
+      properties:
+        tasks: { type: integer }
+        estimated_tokens: { type: integer }
+        remaining_tokens:
+          type: [integer, "null"]
+          description: Null with the user's own key, or a free model (its balance isn't read).
+        within_budget:
+          type: boolean
+          description: Always true for a free model.
+        destination: { type: string }
+        free_model: { type: boolean }
+        provider_daily_limit:
+          type: [integer, "null"]
+          description: >-
+            For a free OpenRouter model, the requests a day OpenRouter allows
+            this key on free models, from `GET {base_url}/key`:
+            `free_model_daily_requests.limit` when given, else 50 when
+            `is_free_tier` is true, and 50 when that can't be asked. Null when
+            `is_free_tier` is false alone (an account that bought under $10 of
+            credit still has 50), for any other model, and in the 202 of
+            `POST .../annotate`, which doesn't ask again. Kept a minute per key.
+        provider_daily_remaining:
+          type: [integer, "null"]
+          description: >-
+            For a free OpenRouter model, the requests left today
+            (`free_model_daily_requests.remaining`), when the provider says.
+            Null otherwise, and in the 202 of `POST .../annotate`.
+        provider_allowance_shared:
+          type: boolean
+          description: >-
+            True on the platform's shared key: its daily allowance belongs to
+            the platform's account and is shared by every user.
+        over_provider_limit:
+          type: boolean
+          description: >-
+            For a free model, more tasks than `provider_daily_remaining` when
+            known, else than `provider_daily_limit` when known, else than 50
+            (the lower allowance). A warning only; nothing is refused on it.
+            Always false in the 202 of `POST .../annotate`.
     SummaryStatus:
       type: object
       properties:

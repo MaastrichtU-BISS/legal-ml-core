@@ -12,6 +12,8 @@ Queue names (Redis lists, `LPUSH`/`BRPOP`):
 Result keys (Redis strings/lists, `SETEX`/`LPUSH` + `GET`/`BLPOP`):
   job_status_{job_id}, prediction_result_{prediction_id}, explanation_{explanation_id},
   llm_job_status_{job_id},
+  llm_active_job:{owner_id} -- the owner's one queued or running LLM job; set
+  NX by the API when it queues one, deleted by the worker on a final status.
   summary_status_{request_id} -- written by the API when a summary is queued and by
   the worker as it runs; carries the owner_id, which the API strips on read.
 
@@ -27,7 +29,11 @@ Liveness keys (Redis strings with a TTL, written by the worker; see liveness.py)
   legal_ml_worker_alive -- rewritten while any worker process is up. Absent
   => queued jobs report that the training service isn't running.
 """
+import json
+import time
 from typing import Any, List, Optional, TypedDict
+
+from redis import exceptions as redis_exceptions
 
 # Long enough to outlive any queue wait + training run; the worker never deletes
 # it, so a late-delivered task for a stopped job still sees the flag.
@@ -85,6 +91,138 @@ def model_export_result_key(export_id):
 
 def llm_job_status_key(job_id):
     return f"llm_job_status_{job_id}"
+
+
+def llm_active_job_key(owner_id):
+    """The one LLM job this owner has queued or running (BAIGLE #225).
+
+    The LLM worker is a single consumer and a job may wait out a provider's
+    limit, so one owner's stack of jobs would hold up everyone else's.
+    """
+    return f"llm_active_job:{owner_id}"
+
+
+# A job in one of these won't run again; its owner may start another.
+LLM_JOB_FINAL_STATUSES = frozenset(
+    {"completed", "failed", "budget_exhausted", "provider_limited"}
+)
+
+
+# Statuses whose job still holds its owner's slot; anything else (a final
+# status, none, junk) doesn't.
+LLM_JOB_LIVE_STATUSES = frozenset({"queued", "running"})
+
+# The worker stamps ``updated_at`` on every status write, and a running job
+# writes at least once per item and around every provider wait (at most
+# ``MAX_WAIT_SECONDS``, 120 s, plus one call of ``LLM_TIMEOUT_SECONDS``). A
+# running job silent for longer died with its worker (BRPOP gives no redelivery).
+LLM_RUNNING_STALE_SECONDS = 15 * 60
+# The single LLM worker may be busy with others' jobs for a while; a job still
+# queued past this is taken to be lost.
+LLM_QUEUED_STALE_SECONDS = 60 * 60
+_STALE_AFTER = {"queued": LLM_QUEUED_STALE_SECONDS, "running": LLM_RUNNING_STALE_SECONDS}
+
+
+def _now():
+    return time.time()
+
+
+def _llm_job_is_live(redis_client, job_id):
+    """Whether this job still holds its owner's slot.
+
+    Only ``queued`` or ``running``, and only while its ``updated_at`` is within
+    that status's window. A status with no ``updated_at`` (written before it was
+    stamped) counts as live: its TTL still bounds it.
+    """
+    raw = redis_client.get(llm_job_status_key(job_id))
+    if not raw:
+        return False
+    try:
+        body = json.loads(raw)
+        status = body.get("status")
+    except (TypeError, ValueError, AttributeError):
+        return False
+    if status not in LLM_JOB_LIVE_STATUSES:
+        return False
+    updated_at = body.get("updated_at")
+    if isinstance(updated_at, bool) or not isinstance(updated_at, (int, float)):
+        return True
+    return _now() - updated_at <= _STALE_AFTER[status]
+
+
+def claim_llm_job(redis_client, owner_id, job_id, total):
+    """Write a queued job's status and make it the owner's active job.
+
+    Returns None when claimed, else the id of the owner's job still queued or
+    running (its queued status is then removed again). A key naming a job whose
+    status is gone or final is stale and taken over.
+    """
+    status_key = llm_job_status_key(job_id)
+    redis_client.setex(
+        status_key,
+        LLM_JOB_STATUS_TTL_SECONDS,
+        json.dumps(
+            {
+                "owner_id": owner_id,
+                "status": "queued",
+                "total": total,
+                "done": 0,
+                "updated_at": _now(),
+            }
+        ),
+    )
+    key = llm_active_job_key(owner_id)
+    for _ in range(5):
+        if redis_client.set(key, job_id, nx=True, ex=LLM_JOB_STATUS_TTL_SECONDS):
+            return None
+        with redis_client.pipeline() as pipe:
+            try:
+                pipe.watch(key)
+                active = pipe.get(key)
+                if active is None:
+                    continue
+                if _llm_job_is_live(redis_client, active):
+                    pipe.reset()
+                    redis_client.delete(status_key)
+                    return active
+                pipe.multi()
+                pipe.set(key, job_id, ex=LLM_JOB_STATUS_TTL_SECONDS)
+                pipe.execute()
+                return None
+            except redis_exceptions.WatchError:
+                continue
+    redis_client.delete(status_key)
+    return redis_client.get(key) or ""
+
+
+def refresh_llm_job(redis_client, owner_id, job_id):
+    """Renew the owner's active-job key's TTL, only if it still names this job."""
+    key = llm_active_job_key(owner_id)
+    with redis_client.pipeline() as pipe:
+        try:
+            pipe.watch(key)
+            if pipe.get(key) != job_id:
+                return
+            pipe.multi()
+            pipe.expire(key, LLM_JOB_STATUS_TTL_SECONDS)
+            pipe.execute()
+        except redis_exceptions.WatchError:
+            pass
+
+
+def release_llm_job(redis_client, owner_id, job_id):
+    """Clear the owner's active job, only if it is still this one."""
+    key = llm_active_job_key(owner_id)
+    with redis_client.pipeline() as pipe:
+        try:
+            pipe.watch(key)
+            if pipe.get(key) != job_id:
+                return
+            pipe.multi()
+            pipe.delete(key)
+            pipe.execute()
+        except redis_exceptions.WatchError:
+            pass
 
 
 SUMMARIZATION_QUEUE = "summarization_queue"
@@ -183,12 +321,16 @@ class LLMAnnotationTaskPayload(TypedDict):
 
 class LLMJobStatus(TypedDict, total=False):
     owner_id: str
-    status: str  # "queued" | "running" | "completed" | "failed" | "budget_exhausted"
+    # "queued" | "running" | "completed" | "failed" | "budget_exhausted" | "provider_limited"
+    status: str
     total: int
     done: int
     created: int
     invalid: int
     error: str
+    waiting_seconds: Optional[int]  # set while waiting out a provider's per-minute limit
+    retry_after: Optional[int]  # provider_limited: seconds until it may work again, if known
+    daily: bool  # provider_limited: the provider's daily allowance is used up
 
 
 class SummarizationTaskPayload(TypedDict):

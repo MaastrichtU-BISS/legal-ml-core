@@ -13,6 +13,9 @@ from ..db import db
 from ..models import LLMAcknowledgement, LLMCredential, LLMUsage
 from .client import OpenAICompatibleClient
 from .config import setting, shared_endpoint
+# free_without_paid_fallback lives with is_free_model; it is re-exported here
+# for the callers that import it from access.
+from .models_list import free_without_paid_fallback, is_free_model  # noqa: F401
 
 SHARED_KEY_FEATURE = "llm.shared_key"
 
@@ -140,6 +143,37 @@ def resolve_credential(owner_id, claims):
     if byok is not None:
         return _checked(byok)
     return _shared_credential() if shared_key_allowed(claims) else None
+
+
+def free_model_for(owner_id, claims):
+    """Whether the model ``resolve_credential`` would pick is a free one.
+
+    Reads the saved key's base URL and model, or the shared endpoint's, without
+    decrypting anything. The host's rate limiter calls this, so it never raises:
+    any failure answers False.
+    """
+    try:
+        row = LLMCredential.query.filter_by(owner_id=owner_id).first()
+        if row is not None:
+            return is_free_model(row.base_url, row.model)
+        if not shared_key_allowed(claims):
+            return False
+        endpoint = shared_endpoint()
+        if endpoint is None:
+            return False
+        return free_without_paid_fallback(
+            endpoint["base_url"], endpoint["model"], endpoint.get("extra_body")
+        )
+    except Exception:
+        try:
+            db.session.rollback()
+        except Exception:
+            pass
+        try:
+            current_app.logger.exception("free_model_for failed; treating the model as paid")
+        except Exception:
+            pass
+        return False
 
 
 def credential_for_mode(owner_id, mode):

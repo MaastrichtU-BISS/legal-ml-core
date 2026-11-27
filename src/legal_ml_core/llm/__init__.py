@@ -5,7 +5,14 @@ The package holds the capability only. Policy stays with the host, which injects
 tokens are counted). See docs/adr/0002 and 0003 in the BAIGLE repo.
 """
 
-from .access import purge_owner_llm_data
+from .access import free_model_for, purge_owner_llm_data
+from .models_list import is_free_model
 from .metering import DBUsageMeter, UsageMeter
 
-__all__ = ["DBUsageMeter", "UsageMeter", "purge_owner_llm_data"]
+__all__ = [
+    "DBUsageMeter",
+    "UsageMeter",
+    "free_model_for",
+    "is_free_model",
+    "purge_owner_llm_data",
+]

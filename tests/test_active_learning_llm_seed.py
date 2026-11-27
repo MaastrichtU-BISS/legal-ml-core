@@ -132,6 +132,51 @@ def test_an_llm_seed_needs_the_acknowledgement(client, headers, dataset_id, fake
     assert _queued(fake_redis) == []
 
 
+def test_an_llm_seed_waits_for_the_owners_running_job(client, headers, dataset_id, fake_redis):
+    from legal_ml_core.queue_contract import llm_active_job_key, llm_job_status_key
+
+    fake_redis.set(llm_active_job_key(TEST_USER_ID), "busy")
+    fake_redis.set(llm_job_status_key("busy"), json.dumps({"status": "running"}))
+    _ack(client, headers, dataset_id)
+
+    resp = _start_llm_seed(client, headers, dataset_id)
+
+    assert resp.status_code == 409
+    body = resp.get_json()
+    assert (body["success"], body["code"], body["job_id"]) == (False, "job_running", "busy")
+    assert state(client, headers, dataset_id)["active"] is False
+    assert _queued(fake_redis) == []
+    assert fake_redis.keys("llm_job_status_*") == [llm_job_status_key("busy")]
+
+
+def test_an_llm_seed_becomes_the_owners_active_job_until_it_ends(
+    client, headers, dataset_id, fake_redis, provider
+):
+    from legal_ml_core.queue_contract import llm_active_job_key
+
+    _ack(client, headers, dataset_id)
+    assert _start_llm_seed(client, headers, dataset_id).status_code == 201
+    [job] = _queued(fake_redis)
+    assert fake_redis.get(llm_active_job_key(TEST_USER_ID)) == job["job_id"]
+    _run_seed_job(fake_redis)
+    assert fake_redis.get(llm_active_job_key(TEST_USER_ID)) is None
+
+
+def test_a_failed_commit_frees_the_claimed_seed(client, headers, dataset_id, fake_redis, monkeypatch):
+    from legal_ml_core.queue_contract import llm_active_job_key
+
+    _ack(client, headers, dataset_id)
+
+    def boom():
+        raise RuntimeError("db down")
+
+    monkeypatch.setattr(db.session, "commit", boom)
+    with pytest.raises(RuntimeError):
+        _start_llm_seed(client, headers, dataset_id)
+    assert fake_redis.get(llm_active_job_key(TEST_USER_ID)) is None
+    assert fake_redis.keys("llm_job_status_*") == []
+
+
 def _run_seed_job(fake_redis):
     [raw] = fake_redis.lrange("llm_queue", 0, -1)
     fake_redis.delete("llm_queue")
@@ -224,3 +269,114 @@ def test_a_dataset_without_named_labels_cannot_have_an_llm_seed(client, app, hea
 
     assert resp.status_code == 400
     assert "labels" in resp.get_json()["error"]
+
+
+def test_an_llm_seed_on_a_free_model_never_asks_for_the_providers_allowance(
+    client, app, headers, dataset_id, fake_redis, monkeypatch
+):
+    # The seed only needs within_budget; seed-estimate's response is unchanged.
+    from legal_ml_core.routes import llm as llm_routes
+
+    asked = []
+    monkeypatch.setattr(
+        llm_routes, "openrouter_free_allowance", lambda *a: asked.append(a) or (50, None)
+    )
+    app.config["LLM_SHARED_ENDPOINT"] = {
+        **app.config["LLM_SHARED_ENDPOINT"],
+        "base_url": "https://openrouter.ai/api/v1",
+        "model": "meta-llama/llama-3.3-70b-instruct:free",
+    }
+    _ack(client, headers, dataset_id)
+
+    resp = _start_llm_seed(client, headers, dataset_id)
+
+    assert resp.status_code == 201, resp.get_json()
+    assert len(_queued(fake_redis)) == 1
+    assert asked == []
+
+
+def test_an_llm_seed_on_a_free_shared_model_never_reads_the_balance(
+    client, app, headers, dataset_id, fake_redis
+):
+    class BalanceUnread:
+        reads = 0
+
+        def remaining(self, owner_id):
+            BalanceUnread.reads += 1
+            raise ConnectionError("down")
+
+        def record(self, owner_id, tokens, key):
+            pass
+
+    app.config["USAGE_METER"] = BalanceUnread()
+    app.config["LLM_SHARED_ENDPOINT"] = {
+        **app.config["LLM_SHARED_ENDPOINT"],
+        "base_url": "https://openrouter.ai/api/v1",
+        "model": "meta-llama/llama-3.3-70b-instruct:free",
+    }
+    _ack(client, headers, dataset_id)
+
+    resp = _estimate(client, headers, dataset_id)
+    assert resp.status_code == 200, resp.get_json()
+    assert (resp.get_json()["remaining_tokens"], resp.get_json()["within_budget"]) == (None, True)
+    assert _start_llm_seed(client, headers, dataset_id).status_code == 201
+    assert BalanceUnread.reads == 0
+
+
+def test_a_failed_seed_enqueue_frees_the_owner(client, headers, dataset_id, fake_redis, monkeypatch):
+    from legal_ml_core.queue_contract import llm_active_job_key
+
+    _ack(client, headers, dataset_id)
+
+    def down(*args, **kwargs):
+        raise ConnectionError("redis went away")
+
+    monkeypatch.setattr(fake_redis, "lpush", down)
+    with pytest.raises(ConnectionError):
+        _start_llm_seed(client, headers, dataset_id)
+    assert fake_redis.get(llm_active_job_key(TEST_USER_ID)) is None
+    assert fake_redis.keys("llm_job_status_*") == []
+    assert fake_redis.keys("al_seed_job_*") == []
+
+
+def test_a_failed_seed_enqueue_leaves_the_owner_free_to_start_again(
+    client, headers, dataset_id, fake_redis, monkeypatch
+):
+    from legal_ml_core.queue_contract import claim_llm_job
+
+    _ack(client, headers, dataset_id)
+    monkeypatch.setattr(fake_redis, "lpush", lambda *a, **k: (_ for _ in ()).throw(ConnectionError("down")))
+    with pytest.raises(ConnectionError):
+        _start_llm_seed(client, headers, dataset_id)
+    assert claim_llm_job(fake_redis, TEST_USER_ID, "next", 1) is None
+
+
+def test_an_llm_seed_on_a_free_model_forgets_the_kept_allowance(
+    client, app, headers, dataset_id, fake_redis, monkeypatch
+):
+    from legal_ml_core.routes import active_learning as al_routes
+
+    forgotten = []
+    monkeypatch.setattr(al_routes, "forget_openrouter_allowance", lambda *a: forgotten.append(a))
+    app.config["LLM_SHARED_ENDPOINT"] = {
+        **app.config["LLM_SHARED_ENDPOINT"],
+        "base_url": "https://openrouter.ai/api/v1",
+        "model": "meta-llama/llama-3.3-70b-instruct:free",
+    }
+    _ack(client, headers, dataset_id)
+
+    assert _start_llm_seed(client, headers, dataset_id).status_code == 201
+    assert forgotten == [("https://openrouter.ai/api/v1", "shared-key")]
+
+
+def test_an_llm_seed_on_a_paid_model_keeps_the_allowance(
+    client, headers, dataset_id, fake_redis, monkeypatch
+):
+    from legal_ml_core.routes import active_learning as al_routes
+
+    forgotten = []
+    monkeypatch.setattr(al_routes, "forget_openrouter_allowance", lambda *a: forgotten.append(a))
+    _ack(client, headers, dataset_id)
+
+    assert _start_llm_seed(client, headers, dataset_id).status_code == 201
+    assert forgotten == []

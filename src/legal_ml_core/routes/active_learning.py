@@ -1,5 +1,6 @@
 """Active learning API: start a dataset's loop, read its state, retrain."""
 import json
+import logging
 import uuid
 
 from flask import Blueprint, current_app, jsonify, request
@@ -18,10 +19,12 @@ from ..active_learning.loop import (
 )
 from ..auth import get_jwt_identity, jwt_required
 from ..db import db
+from ..llm.models_list import forget_openrouter_allowance
 from ..models import Dataset
-from ..queue_contract import LLM_JOB_STATUS_TTL_SECONDS, llm_job_status_key, llm_seed_job_key
+from ..queue_contract import LLM_JOB_STATUS_TTL_SECONDS, llm_seed_job_key
 
 active_learning_bp = Blueprint("active_learning", __name__)
+logger = logging.getLogger(__name__)
 
 
 def _owned_dataset(dataset_id):
@@ -70,7 +73,12 @@ def start(dataset_id):
     except ApiError as error:
         db.session.rollback()
         return jsonify({"success": False, **error.body}), error.status
-    db.session.commit()
+    try:
+        db.session.commit()
+    except Exception:
+        if seed_job:
+            _drop_llm_seed(seed_job)
+        raise
     if seed_job:
         _queue_llm_seed(dataset, seed_job)
     return jsonify({"success": True, **loop_state(dataset)}), 201
@@ -82,8 +90,8 @@ def seed_estimate(dataset_id):
     """What an LLM-suggested first batch would send and cost, before starting."""
     from types import SimpleNamespace
 
-    from ..llm.suggest import estimate_job_tokens, remaining_tokens
-    from .llm import ApiError, _credential, _labelable_dataset
+    from ..llm.suggest import estimate_job_tokens, is_free_credential
+    from .llm import ApiError, _credential, _labelable_dataset, _shared_remaining
 
     dataset = _owned_dataset(dataset_id)
     if not dataset:
@@ -97,13 +105,15 @@ def seed_estimate(dataset_id):
     except ApiError as error:
         return jsonify({"success": False, **error.body}), error.status
     estimated = estimate_job_tokens(dataset, [SimpleNamespace(text=text) for text in texts])
-    remaining = remaining_tokens(str(get_jwt_identity())) if credential.mode == "shared" else None
+    free = is_free_credential(credential)
+    remaining = _shared_remaining(credential, free)
     return jsonify(
         {
             "tasks": len(texts),
             "estimated_tokens": estimated,
             "remaining_tokens": remaining,
-            "within_budget": remaining is None or estimated <= remaining,
+            # A free shared model is metered but not held to the monthly limit.
+            "within_budget": free or remaining is None or estimated <= remaining,
             "destination": credential.destination,
         }
     ), 200
@@ -121,12 +131,18 @@ def _llm_seed_credential(dataset, options):
 
 def _llm_seed_job(dataset, credential):
     """The worker message for the seed, refused when over the monthly limit."""
-    from .llm import ApiError, _estimate
+    from .llm import ApiError, _estimate, refuse_if_job_running
 
     # start_loop adds the config without the dataset seeing it yet.
     db.session.flush()
     db.session.refresh(dataset)
-    tasks, estimate = _estimate(dataset, credential, [task.id for task in llm_seed_sample(dataset)])
+    # Only within_budget is used here, so the provider isn't asked for its allowance.
+    tasks, estimate = _estimate(
+        dataset,
+        credential,
+        [task.id for task in llm_seed_sample(dataset)],
+        provider_allowance=False,
+    )
     if not estimate["within_budget"]:
         raise ApiError(
             429,
@@ -135,7 +151,7 @@ def _llm_seed_job(dataset, credential):
             byok_available=True,
             estimate=estimate,
         )
-    return {
+    job = {
         "job_id": str(uuid.uuid4()),
         "dataset_id": dataset.id,
         "owner_id": str(get_jwt_identity()),
@@ -143,17 +159,35 @@ def _llm_seed_job(dataset, credential):
         "task_ids": [task.id for task in tasks],
         "seed_batch_size": dataset.al_config.batch_size,
     }
+    # One LLM job per owner on the shared worker; last, so a refusal above claims nothing.
+    refuse_if_job_running(current_app.redis_client, job["owner_id"], job["job_id"], len(tasks))
+    if estimate["free_model"]:
+        # The seed uses up the free allowance; the next estimate reads it again.
+        forget_openrouter_allowance(credential.base_url, credential.api_key)
+    return job
+
+
+def _drop_llm_seed(job):
+    """The claimed seed job never reaches the queue, so free the owner."""
+    from .llm import drop_claimed_job
+
+    drop_claimed_job(current_app.redis_client, job["owner_id"], job["job_id"])
 
 
 def _queue_llm_seed(dataset, job):
     redis_client = current_app.redis_client
-    redis_client.setex(
-        llm_job_status_key(job["job_id"]),
-        LLM_JOB_STATUS_TTL_SECONDS,
-        json.dumps({"owner_id": job["owner_id"], "status": "queued", "total": len(job["task_ids"]), "done": 0}),
-    )
-    redis_client.setex(llm_seed_job_key(dataset.id), LLM_JOB_STATUS_TTL_SECONDS, job["job_id"])
-    redis_client.lpush("llm_queue", json.dumps(job))
+    seed_key = llm_seed_job_key(dataset.id)
+    try:
+        redis_client.setex(seed_key, LLM_JOB_STATUS_TTL_SECONDS, job["job_id"])
+        redis_client.lpush("llm_queue", json.dumps(job))
+    except Exception:
+        _drop_llm_seed(job)
+        try:
+            if redis_client.get(seed_key) == job["job_id"]:
+                redis_client.delete(seed_key)
+        except Exception:
+            logger.warning("Could not clear the seed job of dataset %s", dataset.id, exc_info=True)
+        raise
 
 
 @active_learning_bp.route("/datasets/<dataset_id>/strategy", methods=["PUT"])

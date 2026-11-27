@@ -1,5 +1,6 @@
 """LLM assistance API: access, keys, prompts, suggestions and standalone jobs."""
 import json
+import logging
 import re
 import uuid
 from datetime import datetime
@@ -18,9 +19,16 @@ from ..llm.access import (
     shared_key_allowed,
     validate_byok_url,
 )
-from ..llm.client import LLMError
+from ..llm.client import LLMError, ProviderRateLimited
 from ..llm.config import float_setting, int_setting, shared_endpoint
-from ..llm.models_list import MESSAGES as LISTING_MESSAGES, ModelListError, list_chat_models
+from ..llm.models_list import (
+    FREE_TIER_DAILY_REQUESTS,
+    MESSAGES as LISTING_MESSAGES,
+    ModelListError,
+    forget_openrouter_allowance,
+    list_chat_models,
+    openrouter_free_allowance,
+)
 from ..llm.prompts import (
     PromptRejected,
     check_template,
@@ -34,6 +42,7 @@ from ..llm.suggest import (
     call_metered,
     current_prompt,
     estimate_job_tokens,
+    is_free_credential,
     remaining_tokens,
     suggest_tasks,
 )
@@ -45,9 +54,10 @@ from ..models import (
     LLMPrompt,
     LLMSuggestion,
 )
-from ..queue_contract import LLM_JOB_STATUS_TTL_SECONDS, llm_job_status_key
+from ..queue_contract import claim_llm_job, llm_job_status_key, release_llm_job
 
 llm_bp = Blueprint("llm", __name__)
+logger = logging.getLogger(__name__)
 
 # Single-label only for now: these are the tasks that train a classifier.
 SUPPORTED_TASK_TYPES = {
@@ -77,6 +87,22 @@ def _credential_error(error):
 @llm_bp.errorhandler(LLMError)
 def _llm_error(error):
     return jsonify({"error": str(error), "code": "llm_failed"}), 502
+
+
+@llm_bp.errorhandler(ProviderRateLimited)
+def _provider_rate_limited(error):
+    # Registered for the subclass, so it wins over the LLMError handler above.
+    response = jsonify(
+        {
+            "error": str(error),
+            "code": "provider_rate_limited",
+            "retry_after": error.retry_after,
+            "daily": error.daily,
+        }
+    )
+    if error.retry_after is not None:
+        response.headers["Retry-After"] = str(error.retry_after)
+    return response, 429
 
 
 @llm_bp.errorhandler(BudgetExhausted)
@@ -197,11 +223,22 @@ def status():
         # Anything that would spend the key keeps failing closed.
         "shared_key_available": True,
         "shared_key_unavailable_reason": None,
+        # A free model (OpenRouter's ``:free``) isn't held to the shared key's
+        # monthly limit, and the host may relax its own limits for it.
+        "free_model": is_free_credential(credential),
     }
-    if credential and credential.mode == "shared":
+    # A free shared model isn't capped, so its balance isn't read at all: it
+    # stays null, and a meter that is down doesn't stop it.
+    if credential and credential.mode == "shared" and not body["free_model"]:
         try:
             body["remaining_tokens"] = remaining_tokens(owner_id)
         except LLMError:
+            # The failed meter read may leave the session needing a rollback
+            # before the dataset lookup below.
+            try:
+                db.session.rollback()
+            except Exception:
+                current_app.logger.exception("rollback after a failed meter read failed")
             body["shared_key_available"] = False
             body["shared_key_unavailable_reason"] = METER_DOWN_MESSAGE
 
@@ -669,16 +706,77 @@ def bulk_accept(dataset_id):
     return jsonify({"accepted": len(suggestions), "agreement": check}), 200
 
 
-def _estimate(dataset, credential, task_ids):
+JOB_RUNNING_MESSAGE = (
+    "A labelling job is already running for you. Wait for it to finish, then start another."
+)
+
+
+def refuse_if_job_running(redis_client, owner_id, job_id, total):
+    """Queue this job's status as the owner's one active job, or refuse with 409.
+
+    The LLM worker runs one job at a time and a job may wait out a provider's
+    limit, so one owner's jobs queued back to back would hold up everyone's.
+    """
+    active = claim_llm_job(redis_client, owner_id, job_id, total)
+    if active is not None:
+        raise ApiError(409, JOB_RUNNING_MESSAGE, code="job_running", job_id=active)
+
+
+def drop_claimed_job(redis_client, owner_id, job_id):
+    """A claimed job that never reached the queue: free the owner, best effort."""
+    try:
+        release_llm_job(redis_client, owner_id, job_id)
+        redis_client.delete(llm_job_status_key(job_id))
+    except Exception:
+        logger.warning("Could not free LLM job %s after a failed enqueue", job_id, exc_info=True)
+
+
+def _shared_remaining(credential, free):
+    """Tokens left on the shared key, or None. A free model's balance isn't read."""
+    if credential.mode != "shared" or free:
+        return None
+    return remaining_tokens(_owner())
+
+
+def _estimate(dataset, credential, task_ids, provider_allowance=True):
+    """The job's size and cost. ``over_provider_limit`` only warns: nothing refuses on it.
+
+    ``provider_allowance`` False skips asking the provider for a free model's
+    daily allowance (the seed only needs ``within_budget``, and Start follows
+    the estimate the user already saw); the provider fields are then null and
+    ``over_provider_limit`` false.
+    """
     tasks = _pending_tasks(dataset, task_ids)
     estimated = estimate_job_tokens(dataset, tasks)
-    remaining = remaining_tokens(_owner()) if credential.mode == "shared" else None
+    free = is_free_credential(credential)
+    remaining = _shared_remaining(credential, free)
+    daily_limit = daily_remaining = None
+    if free and provider_allowance:
+        daily_limit, daily_remaining = openrouter_free_allowance(
+            credential.base_url, credential.api_key
+        )
+    over = False
+    if free and provider_allowance:
+        # Warn-only: by what is left today, else the allowance, else the lower
+        # allowance (50) when the provider didn't say which applies.
+        if daily_remaining is not None:
+            over = len(tasks) > daily_remaining
+        elif daily_limit is not None:
+            over = len(tasks) > daily_limit
+        else:
+            over = len(tasks) > FREE_TIER_DAILY_REQUESTS
     return tasks, {
         "tasks": len(tasks),
         "estimated_tokens": estimated,
         "remaining_tokens": remaining,
-        "within_budget": remaining is None or estimated <= remaining,
+        "within_budget": free or remaining is None or estimated <= remaining,
         "destination": credential.destination,
+        "free_model": free,
+        "provider_daily_limit": daily_limit,
+        "provider_daily_remaining": daily_remaining,
+        # The shared key's allowance is the platform's, shared by every user.
+        "provider_allowance_shared": credential.mode == "shared",
+        "over_provider_limit": over,
     }
 
 
@@ -700,7 +798,10 @@ def start_annotation(dataset_id):
         raise ApiError(400, "Review the estimate, then send confirm_estimate: true.")
 
     credential = _ready_credential(dataset)
-    tasks, estimate = _estimate(dataset, credential, data.get("task_ids"))
+    # The user saw the provider's allowance in the estimate; Start doesn't ask again.
+    tasks, estimate = _estimate(
+        dataset, credential, data.get("task_ids"), provider_allowance=False
+    )
     if not tasks:
         raise ApiError(400, "There are no pending items to annotate.")
     if not estimate["within_budget"]:
@@ -715,25 +816,26 @@ def start_annotation(dataset_id):
     job_id = str(uuid.uuid4())
     owner_id = _owner()
     redis_client = current_app.redis_client
-    redis_client.setex(
-        llm_job_status_key(job_id),
-        LLM_JOB_STATUS_TTL_SECONDS,
-        json.dumps(
-            {"owner_id": owner_id, "status": "queued", "total": len(tasks), "done": 0}
-        ),
-    )
-    redis_client.lpush(
-        "llm_queue",
-        json.dumps(
-            {
-                "job_id": job_id,
-                "dataset_id": dataset.id,
-                "owner_id": owner_id,
-                "mode": credential.mode,
-                "task_ids": [task.id for task in tasks],
-            }
-        ),
-    )
+    refuse_if_job_running(redis_client, owner_id, job_id, len(tasks))
+    try:
+        if estimate["free_model"]:
+            # Start uses up the free allowance; the next estimate reads it again.
+            forget_openrouter_allowance(credential.base_url, credential.api_key)
+        redis_client.lpush(
+            "llm_queue",
+            json.dumps(
+                {
+                    "job_id": job_id,
+                    "dataset_id": dataset.id,
+                    "owner_id": owner_id,
+                    "mode": credential.mode,
+                    "task_ids": [task.id for task in tasks],
+                }
+            ),
+        )
+    except Exception:
+        drop_claimed_job(redis_client, owner_id, job_id)
+        raise
     return jsonify({"job_id": job_id, "estimate": estimate}), 202
 
 
@@ -745,4 +847,5 @@ def job_status(job_id):
     if status_body is None or status_body.get("owner_id") != _owner():
         raise ApiError(404, "Job not found")
     status_body.pop("owner_id")
+    status_body.pop("updated_at", None)  # the lock's liveness stamp, not the job's state
     return jsonify(status_body), 200

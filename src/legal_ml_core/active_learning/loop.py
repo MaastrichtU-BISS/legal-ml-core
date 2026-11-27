@@ -524,6 +524,7 @@ def _llm_seed_state(dataset):
         return {"status": "unknown"}
     status = json.loads(raw)
     status.pop("owner_id", None)
+    status.pop("updated_at", None)  # the lock's liveness stamp, not the job's state
     return {"job_id": job_id, **status}
 
 

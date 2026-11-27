@@ -8,6 +8,104 @@ While the version is 0.x, minor releases may contain breaking changes.
 
 ## [Unreleased]
 
+## [0.24.0] - 2026-11-27
+
+### Added
+
+- Free models (BAIGLE #225). `is_free_model(base_url, model)` is true only for
+  an OpenRouter model, over https with no user info in the URL, whose id ends
+  in `:free`; every other provider counts as paid. A shared endpoint whose
+  `extra_body` has a `route`, `plugins`, `tools`, a `preset` or
+  `web_search_options`, or `models` naming any id that isn't free, isn't free
+  either, since OpenRouter may then bill a paid fallback, web search or a
+  plugin (`free_without_paid_fallback`, in `llm.models_list`).
+  `free_model_for(owner_id, claims)` answers the same for the model
+  `resolve_credential` would pick, from the saved key's row or the shared
+  endpoint, without decrypting the key, and never raises (False on any
+  error, after rolling the session back), for the host's rate limiter. Both
+  are exported from `legal_ml_core`.
+- `POST /api/llm/models` marks a free model with `"free": true`.
+- `GET /api/llm/status` adds `free_model`.
+- `POST .../annotate/estimate`, and the `estimate` in the 202 of
+  `POST .../annotate` (where the provider fields are null and
+  `over_provider_limit` false: Start doesn't ask again), add `free_model`, `provider_daily_limit`,
+  `provider_daily_remaining`, `provider_allowance_shared` (true on the shared
+  key, whose allowance all users share) and `over_provider_limit`. For a free
+  OpenRouter model `GET {base_url}/key` is asked with the credential's key,
+  and only of an https OpenRouter URL: `free_model_daily_requests.limit` and
+  `.remaining` when given, else `is_free_tier` true means 50 requests a day;
+  `is_free_tier` false alone is unknown (null), since an account that bought
+  under $10 of credit still has 50; a failed lookup is 50. An answer is kept
+  in process for 60 s per base URL and key (by the key's SHA-256, never the
+  key); a failure isn't kept. Other models get null and `/key` is not asked;
+  neither does the LLM seed, which only needs `within_budget`.
+  `over_provider_limit` compares the tasks with the remaining requests when
+  known, else the limit when known, else 50, and only warns: no job is
+  refused on it.
+- `LLMJobStatus` in `queue_contract` adds `waiting_seconds`, `retry_after` and
+  `daily`, and the `provider_limited` status.
+- A provider's 429 raises `ProviderRateLimited(retry_after, daily)`, read from
+  `Retry-After` (seconds or an HTTP date, UTC when it has no zone), then
+  `X-RateLimit-Reset` (a delta in seconds below 1e9, epoch milliseconds from
+  1e12, epoch seconds between), then the same keys in the body's
+  `error.metadata.headers`, as OpenRouter sends them. A value that can't be
+  read, is negative or names no wait is absent; `retry_after` is at most a
+  week. It is daily when the message names a `per-day` limit, or, for a free
+  model with no paid extras, when `X-RateLimit-Limit` is over 20 (the
+  per-minute allowance), unless the 429 is an upstream provider's relayed by
+  OpenRouter (a non-blank `error.metadata.provider_code` or
+  `error.metadata.provider_name`); never from how far away the reset is. An
+  `insufficient_quota` 429 (in `error.code`, `error.type`,
+  `error.metadata.provider_code`, where OpenRouter relays an upstream's own
+  code, or `error.metadata.error_type`) is not a rate limit: it is an `LLMError`
+  saying the key has no quota left, and a job ends `failed`. The LLM
+  routes answer it with 429, `code: provider_rate_limited`, `retry_after`,
+  `daily` and a `Retry-After` header when known, in plain words; the
+  provider's body is never shown.
+- The annotation worker waits out a per-minute limit (Retry-After, else 20 s,
+  at most 3 times per item), showing `waiting_seconds` in the job status, and
+  retries the item. On a daily limit, a Retry-After over 120 s (a retry
+  before then would fail and spend the free daily allowance), after the
+  third wait, or when a wait would take the job's waiting past 600 s in all
+  (`MAX_WAIT_SECONDS_PER_JOB`: the worker is the only LLM consumer), the job
+  stops at once with status `provider_limited`, its `error`,
+  `retry_after` and `daily`, keeping the suggestions and counts made so far.
+  `suggest_tasks` takes `wait_on_rate_limit` (off for API requests, which
+  never sleep).
+- One LLM job per user at a time, since the worker runs one job at a time and
+  a job may wait out a provider's limit. `POST .../annotate` and an LLM seed
+  in `POST /api/active-learning/datasets/<id>/start` answer 409 `job_running`
+  with the active `job_id` while that user has one queued or running. The
+  active job is `llm_active_job:{owner_id}` (`llm_active_job_key` in
+  `queue_contract`), set NX with the job status's TTL when the job is queued
+  (`claim_llm_job`) and deleted by the worker on any final status, only while
+  it still names that job (`release_llm_job`); every other status write renews
+  its TTL while it names that job (`refresh_llm_job`). Only a `queued` or
+  `running` status holds it, and only while fresh: the claim and every worker
+  status write stamp `updated_at` (epoch seconds, not shown by the job
+  status), and a `running` job silent past `LLM_RUNNING_STALE_SECONDS` (15
+  minutes) or a `queued` one past `LLM_QUEUED_STALE_SECONDS` (1 hour) is
+  stale, so a worker that died mid-job doesn't lock its owner out for a day.
+  A status with no `updated_at` (an older writer's) counts as live. A key
+  naming a stale job, or one whose status is gone, final or any other, is
+  taken over. A seed whose loop fails to commit, or a job or seed that fails
+  to reach the queue, frees it and drops its status (and the seed's
+  `al_seed_job_` key).
+- Starting a job, or an LLM seed, on a free OpenRouter model drops that key's kept `/key`
+  answer (`forget_openrouter_allowance`), so the next estimate reads the
+  requests left afresh.
+
+### Changed
+
+- A free shared model is metered but not capped: `call_metered` records its
+  tokens without checking the remaining monthly budget, and a meter that
+  cannot record is logged, and the session rolled back, without failing the
+  call. Its balance is never read: `GET /api/llm/status`, the estimates and
+  the seed report `remaining_tokens: null`. The estimates, including
+  `POST .../seed-estimate`, are always `within_budget` for a free model.
+- `GET /api/llm/status` rolls the session back after a failed balance read,
+  before it looks up the dataset.
+
 ## [0.23.0] - 2026-11-27
 
 ### Added

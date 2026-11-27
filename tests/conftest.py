@@ -80,6 +80,16 @@ def _fake_oidc(monkeypatch):
     monkeypatch.setattr(auth, "verify_bearer_token", verify)
 
 
+@pytest.fixture(autouse=True)
+def _fresh_allowance_cache():
+    """OpenRouter's /key answers are kept a minute in process; no test sees another's."""
+    from legal_ml_core.llm.models_list import clear_allowance_cache
+
+    clear_allowance_cache()
+    yield
+    clear_allowance_cache()
+
+
 @pytest.fixture
 def auth_headers():
     return {"Authorization": f"Bearer test-token::{json.dumps(_TEST_CLAIMS)}"}
