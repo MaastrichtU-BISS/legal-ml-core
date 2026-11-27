@@ -8,6 +8,18 @@ While the version is 0.x, minor releases may contain breaking changes.
 
 ## [Unreleased]
 
+### Added
+
+- `GET /annotation/projects/<id>/queue/stats?dataset_id=<id>` adds
+  `label_counts`: each label's confirmed items in that Dataset (annotated, not
+  held out, label not blank), from one grouped query (BAIGLE #224). The
+  labelling guide reads every label's count in one request instead of one per
+  label, which used up the 200 per hour limit after about 30 labels. A Dataset
+  the caller does not own, or one off the project, gives `{}`. Without
+  `dataset_id` the response is unchanged, and the other counts stay
+  project-wide. Active learning counts its confirmed labels through the same
+  query.
+
 ### Fixed
 
 - A Dataset that names a label twice no longer gives that label's items twice

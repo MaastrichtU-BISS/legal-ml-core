@@ -401,6 +401,20 @@ def create_annotation_tasks(dataset):
     _mark_all_rows_queued(dataset)
 
 
+def confirmed_label_counts(tasks):
+    """Per label, how many of ``tasks`` (a query over AnnotationTask) hold a
+    confirmed label training would use: annotated and not held out. One grouped
+    query; labels with no items are absent.
+    """
+    rows = (
+        tasks.filter(AnnotationTask.status == "annotated", AnnotationTask.is_holdout.is_(False))
+        .with_entities(AnnotationTask.annotation_label, db.func.count())
+        .group_by(AnnotationTask.annotation_label)
+        .all()
+    )
+    return dict(rows)
+
+
 def ensure_project_tasks(project_id, owner_id):
     """Create the missing tasks of ``owner_id``'s datasets on ``project_id``.
 
