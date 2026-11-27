@@ -705,7 +705,7 @@ def bulk_accept(dataset_id):
 
 
 JOB_RUNNING_MESSAGE = (
-    "A labelling job is already running for you. Wait for it to finish, or stop it first."
+    "A labelling job is already running for you. Wait for it to finish, then start another."
 )
 
 

@@ -1000,7 +1000,7 @@ def test_a_second_start_while_a_job_is_queued_is_refused(client, app, gated, fak
     resp = _start(client, dataset_id, gated)
     assert resp.status_code == 409
     assert resp.get_json() == {
-        "error": "A labelling job is already running for you. Wait for it to finish, or stop it first.",
+        "error": "A labelling job is already running for you. Wait for it to finish, then start another.",
         "code": "job_running",
         "job_id": first,
     }
