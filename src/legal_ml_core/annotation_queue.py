@@ -193,6 +193,11 @@ def _file_spans(value, text):
         start, end, kind = span.get("start"), span.get("end"), span.get("type")
         if isinstance(start, bool) or isinstance(end, bool):
             return None
+        # An in-memory frame's cells can hold numpy integers.
+        if isinstance(start, np.integer):
+            start = int(start)
+        if isinstance(end, np.integer):
+            end = int(end)
         if not isinstance(start, int) or not isinstance(end, int):
             return None
         if not 0 <= start < end <= len(text):

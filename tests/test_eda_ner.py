@@ -327,3 +327,221 @@ def test_rows_entity_filter_without_an_entities_column_is_a_400(
 
     assert resp.status_code == 400
     assert "no entities column" in resp.get_json()["error"]
+
+
+# --- council round 1 --------------------------------------------------------
+
+
+def _generic_rows():
+    """WikiANN rows with a numeric ``page`` column and one blank ``source``."""
+    rows = _wikiann_rows()
+    return [
+        {
+            "text": text,
+            "entities": spans if spans is not None else "",
+            "page": i + 1,
+            "source": "" if i == 2 else "wiki",
+        }
+        for i, (text, spans) in enumerate(rows)
+    ]
+
+
+def _generic_dataset(app, tmp_path, suffix):
+    records = _generic_rows()
+    path = tmp_path / f"generic{suffix}"
+    if suffix == ".csv":
+        frame = pd.DataFrame(records)
+        frame["entities"] = [
+            json.dumps(cell) if isinstance(cell, list) else cell for cell in frame["entities"]
+        ]
+        frame.to_csv(path, index=False)
+    else:
+        path.write_text(json.dumps(records))
+    return _add_dataset(app, path)
+
+
+@pytest.mark.parametrize("suffix", [".csv", ".json"])
+def test_generic_eda_of_an_ner_file_keeps_nulls_numbers_and_quality(
+    client, auth_headers, app, tmp_path, suffix
+):
+    """The generic sections read the file with pandas' usual types, and only
+    the span work reads it as written (perform_eda_analysis' exact_df)."""
+    dataset_id = _generic_dataset(app, tmp_path, suffix)
+
+    resp = client.get(f"/api/datasets/{dataset_id}/eda", headers=auth_headers)
+    assert resp.status_code == 200
+    analysis = resp.get_json()
+
+    assert analysis["data_quality"]["overall_quality_score"] > 0
+    assert analysis["column_analysis"]
+    if suffix == ".csv":
+        # A blank cell is a null in the generic sections (pd.read_json reads
+        # "" as text, as it always has).
+        assert analysis["column_analysis"]["source"]["null_count"] == 1
+    assert "page" in analysis["statistical_summary"]["numeric_summary"]
+    _wikiann_expectations(analysis["task_specific_analysis"])
+
+    resp = client.get(f"/api/datasets/{dataset_id}/eda/visualizations", headers=auth_headers)
+    assert resp.status_code == 200
+    charts = resp.get_json()
+    assert "numeric_distributions" in charts
+    assert "missing_data" in charts
+    assert list(json.loads(charts["entities_per_type"])["data"][0]["x"]) == ["LOC", "PER", "ORG"]
+
+
+def test_exact_df_defaults_to_df_for_in_memory_callers():
+    from legal_ml_core.routes.eda import generate_visualizations, perform_eda_analysis
+
+    df = pd.DataFrame(
+        {"text": [t for t, _ in _wikiann_rows()], "entities": [s for _, s in _wikiann_rows()]}
+    )
+    df["entities"] = [json.dumps(s) if s is not None else "" for s in df["entities"]]
+
+    _wikiann_expectations(perform_eda_analysis(df, "ner")["task_specific_analysis"])
+    assert "entities_per_type" in generate_visualizations(df, "ner")
+
+
+def test_the_entities_column_is_not_a_categorical_column(client, auth_headers, app, tmp_path):
+    path = tmp_path / "sparse.csv"
+    text = "Paris ."
+    cells = ["[]"] * 8 + ["", json.dumps([_span(text, "Paris", "LOC")])]
+    pd.DataFrame({"text": [f"Row {i} ." for i in range(9)] + [text], "entities": cells}).to_csv(
+        path, index=False
+    )
+    dataset_id = _add_dataset(app, path)
+
+    resp = client.get(f"/api/datasets/{dataset_id}/eda", headers=auth_headers)
+
+    assert resp.status_code == 200
+    assert "entities" not in resp.get_json()["statistical_summary"]["categorical_summary"]
+
+
+def test_rows_without_entities_percent_leaves_out_unreadable_rows(
+    client, auth_headers, app, tmp_path
+):
+    text = "Paris ."
+    rows = [
+        (text, [_span(text, "Paris", "LOC")]),
+        (text, []),
+        (text, "[not json"),
+        (text, "[not json either"),
+    ]
+    dataset_id = _csv_dataset(app, tmp_path, rows)
+
+    stats = _ner_stats(client, auth_headers, dataset_id)
+
+    assert stats["rows_without_entities"] == {"count": 1, "percent": 50.0}
+
+
+def test_a_column_of_type_lists_says_the_entities_cannot_be_counted(
+    client, auth_headers, app, tmp_path
+):
+    rows = [("Merkel visited Paris .", "PER, LOC"), ("Siemens .", "ORG"), ("Blank .", None)]
+    dataset_id = _csv_dataset(app, tmp_path, rows)
+
+    stats = _ner_stats(client, auth_headers, dataset_id)
+
+    assert stats["total_entities"] == 0
+    assert stats["unreadable_rows"] == 0
+    assert "names entity types but not where" in stats["entity_message"]
+    assert "cannot be counted" in stats["entity_message"]
+
+
+def test_empty_rows_and_one_malformed_row_do_not_say_nothing_could_be_read(
+    client, auth_headers, app, tmp_path
+):
+    rows = [(f"Row {i} .", []) for i in range(9)] + [("Bad .", "[not json")]
+    dataset_id = _csv_dataset(app, tmp_path, rows)
+
+    stats = _ner_stats(client, auth_headers, dataset_id)
+
+    assert stats["unreadable_rows"] == 1
+    assert stats["entity_message"] == (
+        "No readable row has any entities; 1 row could not be read."
+    )
+
+
+def test_rows_of_an_ner_dataset_show_and_search_cells_verbatim(
+    client, auth_headers, app, tmp_path
+):
+    text = "NA filed case 00123 ."
+    path = tmp_path / "verbatim.csv"
+    pd.DataFrame(
+        {
+            "text": [text, "Other ."],
+            "entities": [json.dumps([_span(text, "00123", "MISC")]), "[]"],
+            "code": ["NA", "00123"],
+        }
+    ).to_csv(path, index=False)
+    dataset_id = _add_dataset(app, path)
+
+    body = client.get(f"/api/datasets/{dataset_id}/rows", headers=auth_headers).get_json()
+    assert [row["code"] for row in body["rows"]] == ["NA", "00123"]
+
+    found = client.get(
+        f"/api/datasets/{dataset_id}/rows",
+        query_string={"term": "00123", "entity": "00123"},
+        headers=auth_headers,
+    ).get_json()
+    assert found["total_rows"] == 1
+    assert found["rows"][0]["text"] == text
+
+
+def test_rows_entity_filter_keeps_the_right_rows_of_a_labelled_json_index(
+    client, auth_headers, app, tmp_path
+):
+    first, second = "Paris is big .", "Rome is old ."
+    path = tmp_path / "labelled.json"
+    path.write_text(
+        json.dumps(
+            {
+                "text": {"a": first, "b": second},
+                "entities": {
+                    "a": [_span(first, "Paris", "LOC")],
+                    "b": [_span(second, "Rome", "LOC")],
+                },
+            }
+        )
+    )
+    dataset_id = _add_dataset(app, path)
+
+    body = client.get(
+        f"/api/datasets/{dataset_id}/rows",
+        query_string={"entity": "Rome"},
+        headers=auth_headers,
+    ).get_json()
+
+    assert body["total_rows"] == 1
+    assert body["rows"][0]["text"] == second
+
+
+def test_rows_entity_filter_without_a_text_column_is_a_clear_400(
+    client, auth_headers, app, tmp_path
+):
+    path = tmp_path / "no_text.csv"
+    pd.DataFrame({"body": ["Paris ."], "entities": ["[]"]}).to_csv(path, index=False)
+    dataset_id = _add_dataset(app, path)
+
+    resp = client.get(
+        f"/api/datasets/{dataset_id}/rows",
+        query_string={"entity_type": "LOC"},
+        headers=auth_headers,
+    )
+
+    assert resp.status_code == 400
+    assert "no text column" in resp.get_json()["error"]
+
+
+def test_numpy_integer_offsets_are_read_as_spans():
+    import numpy as np
+
+    from legal_ml_core.annotation_queue import read_span_cell
+
+    text = "Paris is big ."
+    cell = [{"text": "Paris", "start": np.int64(0), "end": np.int64(5), "type": "LOC"}]
+
+    spans, unreadable = read_span_cell(cell, text)
+
+    assert unreadable is False
+    assert spans == [{"text": "Paris", "start": 0, "end": 5, "type": "LOC"}]
+    assert type(spans[0]["start"]) is int

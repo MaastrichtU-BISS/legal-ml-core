@@ -5,7 +5,7 @@ from werkzeug.utils import secure_filename
 from ..db import db
 from ..dataset_creation import DatasetInvalid, create_dataset
 from ..models import AnnotationTask, Dataset, LLMPrompt
-from ..annotation_format import label_from_assignment, label_text, stored_payload
+from ..annotation_format import SPAN_TYPES, label_from_assignment, label_text, stored_payload
 from ..annotation_queue import (
     LABEL_COLUMNS,
     create_annotation_tasks,
@@ -747,14 +747,15 @@ def paginated_dataset_rows(dataset_id):
         limit = request.args.get("limit", default=50, type=int)
         limit = min(max(1, limit), 200)
 
-        if dataset.file_path.endswith(".csv"):
-            df = pd.read_csv(dataset.file_path)
-        elif dataset.file_path.endswith(".xlsx"):
-            df = pd.read_excel(dataset.file_path)
-        elif dataset.file_path.endswith(".json"):
-            df = pd.read_json(dataset.file_path)
-        else:
+        if not dataset.file_path.endswith((".csv", ".xlsx", ".json")):
             return jsonify({"error": "Unsupported file format"}), 400
+        # An NER file is read once, as written, for the whole request: its
+        # spans' offsets point into the text exactly, and "NA" or "00123" then
+        # show and match as they are in the file.
+        if dataset.task_type in SPAN_TYPES:
+            df = read_rows_exact(dataset.file_path)
+        else:
+            df = read_rows(dataset.file_path)
 
         # Optional filters for opening a distinctive term from EDA. They match
         # the way EDA counts texts, so the filtered total equals `in_class`.
@@ -778,9 +779,13 @@ def paginated_dataset_rows(dataset_id):
         entity = request.args.get("entity", default=None, type=str)
         entity_type = request.args.get("entity_type", default=None, type=str)
         if entity is not None or entity_type is not None:
-            entity_col, entity_rows = file_entity_rows(read_rows_exact(dataset.file_path))
-            if entity_col is None:
+            if find_column(df, [LABEL_COLUMNS["ner"]]) is None:
                 return jsonify({"error": "This Dataset has no entities column to filter by"}), 400
+            if find_column(df, TEXT_COL_NAMES) is None:
+                return jsonify(
+                    {"error": "This Dataset has no text column, so its entities cannot be read"}
+                ), 400
+            _, entity_rows = file_entity_rows(df)
             keep = [
                 any(
                     (entity is None or span["text"] == entity)
@@ -789,9 +794,10 @@ def paginated_dataset_rows(dataset_id):
                 )
                 for spans, _ in entity_rows
             ]
-            # ``keep`` is by position in the whole file, which is still each
-            # row's index label after the earlier filters.
-            df = df[pd.Series(keep).reindex(df.index, fill_value=False).to_numpy()]
+            # ``keep`` follows ``df``'s rows, which the earlier filters may have
+            # narrowed. It takes ``df``'s own index, so a JSON file whose rows
+            # are labelled "a", "b" and so on keeps the right rows.
+            df = df[pd.Series(keep, index=df.index).to_numpy()]
 
         total = len(df)
         window = df.iloc[offset : offset + limit]

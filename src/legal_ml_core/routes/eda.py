@@ -7,7 +7,7 @@ from flask import Blueprint, jsonify
 from ..auth import jwt_required, get_jwt_identity
 from ..models import Dataset
 from ..annotation_format import SPAN_TYPES
-from ..annotation_queue import file_entity_rows, read_rows_exact
+from ..annotation_queue import LABEL_COLUMNS, file_entity_rows, read_rows, read_rows_exact
 from ..text_terms import (
     LABEL_COL_NAMES,
     TEXT_COL_NAMES,
@@ -24,7 +24,10 @@ _TEXT_COL_NAMES = {"text", "content", "document", "sentence", "summary", "abstra
 
 def _is_categorical(series, df_len):
     """True if an object-dtype column looks like a label/category, not free text."""
-    if series.name.lower() in _TEXT_COL_NAMES:
+    name = str(series.name).lower()
+    # An NER file's entities column holds span lists, free text like a text
+    # column, even when most of its cells are ``[]`` or blank.
+    if name in _TEXT_COL_NAMES or name == LABEL_COLUMNS["ner"]:
         return False
     if df_len > 0 and series.nunique() / df_len > 0.5:
         return False
@@ -51,21 +54,40 @@ def convert_numpy_types(obj):
 eda_bp = Blueprint("eda", __name__)
 
 
-def _read_frame(file_path, task_type):
-    """The dataset's rows, or ``None`` for a format EDA cannot read.
+def _json_cell(value):
+    """A list, dict or array cell as JSON text, so the generic sections can
+    hash it; any other cell as it is."""
+    if isinstance(value, np.ndarray):
+        value = value.tolist()
+    if isinstance(value, (list, dict)):
+        return json.dumps(value, default=str)
+    return value
 
-    An NER file is read as written (``read_rows_exact``): its spans' offsets
-    point into the text exactly, and pandas' type guesses would move them.
+
+def _read_frames(file_path, task_type):
+    """``(df, exact_df)`` for a dataset file, or ``(None, None)`` for a format
+    EDA cannot read.
+
+    ``df`` is read with pandas' usual types, for the generic sections and
+    charts: blank cells are null and numbers are numbers. A JSON file's list
+    and dict cells are JSON text in it. ``exact_df`` is an NER file read as
+    written (``read_rows_exact``), for the span work only, since its spans'
+    offsets point into the text exactly; it is ``None`` for other task types.
     """
-    if task_type in SPAN_TYPES and file_path.endswith((".csv", ".xlsx", ".json")):
-        return read_rows_exact(file_path)
-    if file_path.endswith(".csv"):
-        return pd.read_csv(file_path)
-    if file_path.endswith((".xlsx", ".xls")):
-        return pd.read_excel(file_path)
+    if file_path.endswith((".csv", ".xlsx", ".json")):
+        df = read_rows(file_path)
+    elif file_path.endswith(".xls"):
+        df = pd.read_excel(file_path)
+    else:
+        return None, None
     if file_path.endswith(".json"):
-        return pd.read_json(file_path)
-    return None
+        for col in df.columns:
+            if df[col].dtype == object:
+                df[col] = df[col].map(_json_cell)
+    exact_df = None
+    if task_type in SPAN_TYPES and file_path.endswith((".csv", ".xlsx", ".json")):
+        exact_df = read_rows_exact(file_path)
+    return df, exact_df
 
 
 @eda_bp.route("/datasets/<dataset_id>/eda", methods=["GET"])
@@ -83,12 +105,12 @@ def get_eda_analysis(dataset_id):
         if not os.path.exists(file_path):
             return jsonify({"error": "Dataset file not found"}), 404
 
-        df = _read_frame(file_path, dataset.task_type)
+        df, exact_df = _read_frames(file_path, dataset.task_type)
         if df is None:
             return jsonify({"error": "Unsupported file format"}), 400
 
         # Perform EDA analysis
-        eda_results = perform_eda_analysis(df, dataset.task_type)
+        eda_results = perform_eda_analysis(df, dataset.task_type, exact_df)
 
         # Convert numpy types to Python native types for JSON serialization
         eda_results = convert_numpy_types(eda_results)
@@ -118,12 +140,12 @@ def get_eda_visualizations(dataset_id):
         if not os.path.exists(file_path):
             return jsonify({"error": "Dataset file not found"}), 404
 
-        df = _read_frame(file_path, dataset.task_type)
+        df, exact_df = _read_frames(file_path, dataset.task_type)
         if df is None:
             return jsonify({"error": "Unsupported file format"}), 400
 
         # Generate visualizations
-        visualizations = generate_visualizations(df, dataset.task_type)
+        visualizations = generate_visualizations(df, dataset.task_type, exact_df)
 
         # Convert numpy types to Python native types for JSON serialization
         visualizations = convert_numpy_types(visualizations)
@@ -138,8 +160,11 @@ def get_eda_visualizations(dataset_id):
         return jsonify({"error": str(e), "traceback": traceback.format_exc()}), 500
 
 
-def perform_eda_analysis(df, task_type):
-    """Perform comprehensive EDA analysis on the dataset"""
+def perform_eda_analysis(df, task_type, exact_df=None):
+    """Perform comprehensive EDA analysis on the dataset.
+
+    ``exact_df`` is an NER file read as written, for the span work only; the
+    other sections read ``df``."""
 
     try:
         analysis = {}
@@ -176,7 +201,7 @@ def perform_eda_analysis(df, task_type):
 
         try:
             analysis["task_specific_analysis"] = get_task_specific_analysis(
-                df, task_type
+                df, task_type, exact_df
             )
         except Exception as e:
             print(f"Error in get_task_specific_analysis: {str(e)}")
@@ -392,14 +417,14 @@ def get_statistical_summary(df):
     return summary
 
 
-def get_task_specific_analysis(df, task_type):
+def get_task_specific_analysis(df, task_type, exact_df=None):
     """Perform task-specific analysis"""
     analysis = {}
 
     if task_type in ["classification", "document_classification"]:
         analysis = get_classification_analysis(df)
     elif task_type in ["ner", "named_entity_recognition"]:
-        analysis = get_ner_analysis(df)
+        analysis = get_ner_analysis(df, exact_df)
     elif task_type == "summarization":
         analysis = get_summarization_analysis(df)
     elif task_type in ["topic_modeling", "clustering"]:
@@ -525,9 +550,10 @@ RARE_ENTITY_SHARE = 0.05
 TOP_ENTITIES = 10
 
 
-def get_ner_analysis(df):
+def get_ner_analysis(df, exact_df=None):
     """Analyze NER dataset: text lengths, and the entities each row's
-    ``entities`` cell holds (``entity_statistics``)."""
+    ``entities`` cell holds (``entity_statistics`` over ``exact_df``, the file
+    as written, or ``df`` when it is not given)."""
     analysis = {}
 
     text_col = find_column(df, TEXT_COL_NAMES)
@@ -551,8 +577,51 @@ def get_ner_analysis(df):
             "max": word_counts.max(),
         }
 
-    analysis.update(entity_statistics(df))
+    analysis.update(entity_statistics(df if exact_df is None else exact_df))
     return analysis
+
+
+_SPAN_SHAPE = (
+    "Each entities cell should be a list of spans like "
+    "{\"text\", \"start\", \"end\", \"type\"} that fit the row's text."
+)
+
+
+def _is_blank_cell(value):
+    if value is None:
+        return True
+    if isinstance(value, float) and math.isnan(value):
+        return True
+    return isinstance(value, str) and not value.strip()
+
+
+def _rows(n):
+    return "1 row" if n == 1 else f"{n} rows"
+
+
+def _no_entities_message(cells, rows):
+    """Why an NER file shows no entities, in plain words: its rows have none,
+    its cells name types but no spans (``"PER, LOC"``), or they cannot be
+    read. ``rows`` are ``file_entity_rows``' pairs for ``cells``."""
+    unreadable = sum(1 for _, bad in rows if bad)
+    spans_read = sum(1 for spans, bad in rows if spans is not None and not bad)
+    not_spans = sum(
+        1
+        for cell, (spans, bad) in zip(cells, rows)
+        if spans is None and not bad and not _is_blank_cell(cell)
+    )
+    if spans_read:
+        if unreadable:
+            return f"No readable row has any entities; {_rows(unreadable)} could not be read."
+        return "No row has any entities."
+    if not_spans and not unreadable:
+        return (
+            "The entities column names entity types but not where each entity is in "
+            "the text, so the entities cannot be counted. " + _SPAN_SHAPE
+        )
+    if unreadable:
+        return "No row's entities could be read. " + _SPAN_SHAPE
+    return "No row has any entities."
 
 
 def entity_statistics(df):
@@ -577,7 +646,7 @@ def entity_statistics(df):
     }
     entity_col, rows = file_entity_rows(df)
     if entity_col is None:
-        if find_column(df, ["entities"]) is None:
+        if find_column(df, [LABEL_COLUMNS["ner"]]) is None:
             stats["entity_message"] = (
                 "This dataset has no entities column, so its entity types cannot be counted."
             )
@@ -601,7 +670,7 @@ def entity_statistics(df):
     without = sum(1 for n in per_row if n == 0)
     stats["rows_without_entities"] = {
         "count": without,
-        "percent": 100.0 * without / len(rows) if rows else 0.0,
+        "percent": 100.0 * without / len(per_row) if per_row else 0.0,
     }
 
     counts = Counter()
@@ -622,12 +691,7 @@ def entity_statistics(df):
     total = sum(counts.values())
     stats["total_entities"] = total
     if total == 0:
-        stats["entity_message"] = (
-            "No row's entities could be read. Each entities cell should be a list of "
-            "spans like {\"text\", \"start\", \"end\", \"type\"} that fit the row's text."
-            if unreadable
-            else "No row has any entities."
-        )
+        stats["entity_message"] = _no_entities_message(df[entity_col].tolist(), rows)
         return stats
     types = sorted(counts, key=lambda kind: (-counts[kind], kind))
     stats["entity_types"] = [
@@ -824,8 +888,9 @@ def generate_insights(df, task_type):
     return insights
 
 
-def generate_visualizations(df, task_type):
-    """Generate various visualizations for the dataset"""
+def generate_visualizations(df, task_type, exact_df=None):
+    """Generate various visualizations for the dataset. ``exact_df`` is an NER
+    file read as written, for the entity chart only."""
     visualizations = {}
 
     # Basic visualizations
@@ -851,7 +916,7 @@ def generate_visualizations(df, task_type):
     if task_type in ["classification", "document_classification"]:
         visualizations.update(create_classification_visualizations(df))
     elif task_type in ["ner", "named_entity_recognition"]:
-        visualizations.update(create_ner_visualizations(df))
+        visualizations.update(create_ner_visualizations(df, exact_df))
     elif task_type == "summarization":
         visualizations.update(create_summarization_visualizations(df))
 
@@ -1005,8 +1070,9 @@ def create_classification_visualizations(df):
     return visualizations
 
 
-def create_ner_visualizations(df):
-    """Create NER-specific visualizations"""
+def create_ner_visualizations(df, exact_df=None):
+    """Create NER-specific visualizations. The entity chart reads ``exact_df``,
+    the file as written, or ``df`` when it is not given."""
     visualizations = {}
 
     text_col = find_column(df, TEXT_COL_NAMES)
@@ -1045,7 +1111,7 @@ def create_ner_visualizations(df):
         )
 
     # Entities per type, most common first, as the analysis lists them.
-    entity_types = entity_statistics(df)["entity_types"]
+    entity_types = entity_statistics(df if exact_df is None else exact_df)["entity_types"]
     if entity_types:
         fig = go.Figure(
             data=[

@@ -383,9 +383,26 @@ paths:
           in: query
           description: Only rows in this class. 400 when the Dataset has no label column.
           schema: { type: string }
+        - name: entity
+          in: query
+          description: >-
+            NER only. Only rows whose entities cell holds a span with exactly this text (and of
+            `entity_type`, when given), read as EDA reads them, so the total equals a top entity's
+            `rows` in `/eda`. 400 when the Dataset has no entities column, or no text column to read
+            the spans against.
+          schema: { type: string }
+        - name: entity_type
+          in: query
+          description: >-
+            NER only. Only rows whose entities cell holds a span of this type, so the total equals
+            the type's `rows` in `/eda`. Same 400s as `entity`.
+          schema: { type: string }
       responses:
         "200":
-          description: A window of rows. With `term` or `label`, `total_rows` and `has_more` count the filtered rows.
+          description: >-
+            A window of rows. With `term`, `label`, `entity` or `entity_type`, `total_rows` and
+            `has_more` count the filtered rows. An NER Dataset's cells are returned as written in
+            the file, so "NA" and "00123" stay text.
           content:
             application/json:
               schema:
@@ -431,6 +448,13 @@ paths:
         For Text Classification, `task_specific_analysis.keywords_by_class` lists each class's distinctive
         terms and `keyword_stats` gives the same terms as `{term, in_class, overall, lift}`, where
         `in_class` and `overall` count texts.
+        For NER, `task_specific_analysis` also holds the entity statistics: `entity_column` (or null),
+        `total_entities`, `entity_types` as `[{type, count, share, rows, mean_length_words,
+        top_entities: [{text, count, rows}]}]` most common first, with at most 10 top entities each,
+        `rows_without_entities` as `{count, percent}` and `entities_per_row` as `{mean, median, max}`
+        over the readable rows, `rare_entity_types` (under 5% of all entities), `unreadable_rows`
+        (cells that look like spans but do not fit their text) and `entity_message`, a plain
+        sentence when no entities can be shown, else null. Every key is always present.
       operationId: getEda
       responses:
         "200": { $ref: "#/components/responses/AnyObject" }
@@ -442,6 +466,7 @@ paths:
     get:
       tags: [eda]
       summary: EDA charts (Plotly figure JSON strings keyed by chart name)
+      description: For NER, `entities_per_type` is a bar chart of entities per type when the Dataset has any.
       operationId: getEdaVisualizations
       responses:
         "200": { $ref: "#/components/responses/AnyObject" }
