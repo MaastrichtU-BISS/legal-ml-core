@@ -53,7 +53,7 @@ While the version is 0.x, minor releases may contain breaking changes.
   week. It is daily when the message names a `per-day` limit, or, for a free
   model with no paid extras, when `X-RateLimit-Limit` is over 20 (the
   per-minute allowance), unless the 429 is an upstream provider's relayed by
-  OpenRouter (`error.metadata.provider_code`, or a non-empty
+  OpenRouter (a non-blank `error.metadata.provider_code` or
   `error.metadata.provider_name`); never from how far away the reset is. An
   `insufficient_quota` 429 (in `error.code`, `error.type`,
   `error.metadata.provider_code`, where OpenRouter relays an upstream's own
@@ -79,9 +79,19 @@ While the version is 0.x, minor releases may contain breaking changes.
   active job is `llm_active_job:{owner_id}` (`llm_active_job_key` in
   `queue_contract`), set NX with the job status's TTL when the job is queued
   (`claim_llm_job`) and deleted by the worker on any final status, only while
-  it still names that job (`release_llm_job`). A key naming a job whose status
-  is gone or final is taken over. A seed whose loop fails to commit frees it.
-- Starting a job on a free OpenRouter model drops that key's kept `/key`
+  it still names that job (`release_llm_job`); every other status write renews
+  its TTL while it names that job (`refresh_llm_job`). Only a `queued` or
+  `running` status holds it, and only while fresh: the claim and every worker
+  status write stamp `updated_at` (epoch seconds, not shown by the job
+  status), and a `running` job silent past `LLM_RUNNING_STALE_SECONDS` (15
+  minutes) or a `queued` one past `LLM_QUEUED_STALE_SECONDS` (1 hour) is
+  stale, so a worker that died mid-job doesn't lock its owner out for a day.
+  A status with no `updated_at` (an older writer's) counts as live. A key
+  naming a stale job, or one whose status is gone, final or any other, is
+  taken over. A seed whose loop fails to commit, or a job or seed that fails
+  to reach the queue, frees it and drops its status (and the seed's
+  `al_seed_job_` key).
+- Starting a job, or an LLM seed, on a free OpenRouter model drops that key's kept `/key`
   answer (`forget_openrouter_allowance`), so the next estimate reads the
   requests left afresh.
 

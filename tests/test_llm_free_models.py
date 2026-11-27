@@ -1113,3 +1113,138 @@ def test_forgetting_one_keys_allowance_keeps_the_others():
     assert list(models_list._allowance_cache.values()) == [(1e18, (50, 2))]
     models_list.forget_openrouter_allowance(None, "b")  # never raises
     models_list.clear_allowance_cache()
+
+
+# A worker that dies mid-job (BRPOP: no redelivery) must not hold the owner's
+# slot until the 24 h TTL: a job silent past its status's window is stale.
+
+
+def _held_by(fake_redis, status, age=None):
+    import time
+
+    from legal_ml_core.queue_contract import llm_active_job_key as key
+
+    body = {"owner_id": TEST_USER_ID, "status": status}
+    if age is not None:
+        body["updated_at"] = time.time() - age
+    fake_redis.set(key(TEST_USER_ID), "old", ex=3600)
+    fake_redis.set(llm_job_status_key("old"), json.dumps(body))
+
+
+def test_the_liveness_windows_outlast_the_longest_silence():
+    from legal_ml_core.llm.config import int_setting
+    from legal_ml_core.queue_contract import LLM_QUEUED_STALE_SECONDS, LLM_RUNNING_STALE_SECONDS
+
+    assert LLM_RUNNING_STALE_SECONDS >= (
+        suggest.MAX_WAIT_SECONDS + int_setting("LLM_TIMEOUT_SECONDS") + 300
+    )
+    assert LLM_QUEUED_STALE_SECONDS >= LLM_RUNNING_STALE_SECONDS
+
+
+@pytest.mark.parametrize(
+    "status, age",
+    [("running", 15 * 60 + 5), ("queued", 60 * 60 + 5)],
+)
+def test_a_job_silent_past_its_window_is_taken_over(client, app, gated, fake_redis, status, age):
+    _held_by(fake_redis, status, age)
+    dataset_id, _ = _dataset(app, tasks=3)
+    _ack(client, dataset_id, gated)
+    job_id = _start_job(client, dataset_id, gated)
+    assert fake_redis.get(llm_active_job_key(TEST_USER_ID)) == job_id
+
+
+@pytest.mark.parametrize(
+    "status, age",
+    [("running", 60), ("running", None), ("queued", 30 * 60), ("queued", None)],
+)
+def test_a_job_within_its_window_still_refuses(client, app, gated, fake_redis, status, age):
+    # No updated_at (an older writer): live, bounded by the status's TTL.
+    _held_by(fake_redis, status, age)
+    dataset_id, _ = _dataset(app, tasks=3)
+    _ack(client, dataset_id, gated)
+    resp = _start(client, dataset_id, gated)
+    assert (resp.status_code, resp.get_json()["job_id"]) == (409, "old")
+
+
+def test_a_running_job_that_just_wrote_progress_refuses(client, app, gated, fake_redis):
+    dataset_id, _ = _dataset(app, tasks=3)
+    _ack(client, dataset_id, gated)
+    first = _start_job(client, dataset_id, gated)
+    suggest._set_status(fake_redis, first, status="running")
+    stamped = json.loads(fake_redis.get(llm_job_status_key(first)))["updated_at"]
+    assert isinstance(stamped, float)
+    assert _start(client, dataset_id, gated).status_code == 409
+
+
+def test_the_claim_stamps_the_queued_status(client, app, gated, fake_redis):
+    import time
+
+    dataset_id, _ = _dataset(app, tasks=3)
+    _ack(client, dataset_id, gated)
+    before = time.time()
+    first = _start_job(client, dataset_id, gated)
+    body = json.loads(fake_redis.get(llm_job_status_key(first)))
+    assert body["status"] == "queued" and body["updated_at"] >= before
+
+
+def test_the_liveness_stamp_is_not_shown(client, app, gated, fake_redis):
+    dataset_id, _ = _dataset(app, tasks=3)
+    _ack(client, dataset_id, gated)
+    first = _start_job(client, dataset_id, gated)
+    body = client.get(f"/api/llm/jobs/{first}", headers=gated).get_json()
+    assert "updated_at" not in body and body["status"] == "queued"
+
+
+@pytest.mark.parametrize("body", [{}, {"status": None}, {"status": "pending"}, []])
+def test_only_queued_or_running_holds_the_slot(client, app, gated, fake_redis, body):
+    fake_redis.set(llm_active_job_key(TEST_USER_ID), "odd")
+    fake_redis.set(llm_job_status_key("odd"), json.dumps(body))
+    dataset_id, _ = _dataset(app, tasks=3)
+    _ack(client, dataset_id, gated)
+    assert _start(client, dataset_id, gated).status_code == 202
+
+
+def test_progress_renews_the_owners_slot(client, app, gated, fake_redis):
+    dataset_id, _ = _dataset(app, tasks=3)
+    _ack(client, dataset_id, gated)
+    first = _start_job(client, dataset_id, gated)
+    key = llm_active_job_key(TEST_USER_ID)
+    fake_redis.expire(key, 10)
+    suggest._set_status(fake_redis, first, status="running", done=1)
+    assert fake_redis.ttl(key) > 10
+
+
+def test_an_old_jobs_progress_never_renews_a_newer_jobs_slot(fake_redis):
+    key = llm_active_job_key(TEST_USER_ID)
+    fake_redis.set(key, "new", ex=10)
+    fake_redis.set(llm_job_status_key("old"), json.dumps({"owner_id": TEST_USER_ID, "status": "running"}))
+    suggest._set_status(fake_redis, "old", done=2)
+    assert fake_redis.ttl(key) <= 10
+    assert fake_redis.get(key) == "new"
+
+
+def test_a_failed_enqueue_frees_the_owner(client, app, gated, fake_redis, monkeypatch):
+    dataset_id, _ = _dataset(app, tasks=3)
+    _ack(client, dataset_id, gated)
+
+    lpush, broken = fake_redis.lpush, [True]
+
+    def flaky(*args, **kwargs):
+        if broken[0]:
+            raise ConnectionError("redis went away")
+        return lpush(*args, **kwargs)
+
+    monkeypatch.setattr(fake_redis, "lpush", flaky)
+    with pytest.raises(ConnectionError):
+        _start(client, dataset_id, gated)
+    assert fake_redis.get(llm_active_job_key(TEST_USER_ID)) is None
+    assert fake_redis.keys("llm_job_status_*") == []
+    broken[0] = False
+    assert _start(client, dataset_id, gated).status_code == 202
+
+
+@pytest.mark.parametrize("provider_code", ["", "   "])
+def test_a_blank_provider_code_is_not_upstream(provider_code):
+    body = _openrouter_body(headers={"X-RateLimit-Limit": "60"})
+    body["error"]["metadata"]["provider_code"] = provider_code
+    assert parse_rate_limit(Limited(body=body), now=NOW, free=True).daily is True

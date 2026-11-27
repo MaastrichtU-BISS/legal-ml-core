@@ -15,6 +15,7 @@ from ..queue_contract import (
     LLM_JOB_FINAL_STATUSES,
     LLM_JOB_STATUS_TTL_SECONDS,
     llm_job_status_key,
+    refresh_llm_job,
     release_llm_job,
 )
 from .access import CredentialError, credential_for_mode, free_without_paid_fallback
@@ -261,10 +262,18 @@ def _set_status(redis_client, job_id, **fields):
     raw = redis_client.get(key)
     status = json.loads(raw) if raw else {}
     status.update(fields)
+    # When the job last showed life: a running job silent too long is stale.
+    status["updated_at"] = time.time()
     redis_client.setex(key, LLM_JOB_STATUS_TTL_SECONDS, json.dumps(status))
-    # A final status frees the owner to start another job.
-    if status.get("status") in LLM_JOB_FINAL_STATUSES and status.get("owner_id"):
-        release_llm_job(redis_client, status["owner_id"], job_id)
+    owner_id = status.get("owner_id")
+    if not owner_id:
+        return
+    # A final status frees the owner to start another job; any other keeps the
+    # owner's slot from expiring under a long job.
+    if status.get("status") in LLM_JOB_FINAL_STATUSES:
+        release_llm_job(redis_client, owner_id, job_id)
+    else:
+        refresh_llm_job(redis_client, owner_id, job_id)
 
 
 def process_llm_annotation_task(task_info, redis_client):

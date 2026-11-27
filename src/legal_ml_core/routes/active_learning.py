@@ -1,5 +1,6 @@
 """Active learning API: start a dataset's loop, read its state, retrain."""
 import json
+import logging
 import uuid
 
 from flask import Blueprint, current_app, jsonify, request
@@ -18,10 +19,12 @@ from ..active_learning.loop import (
 )
 from ..auth import get_jwt_identity, jwt_required
 from ..db import db
+from ..llm.models_list import forget_openrouter_allowance
 from ..models import Dataset
-from ..queue_contract import LLM_JOB_STATUS_TTL_SECONDS, llm_job_status_key, llm_seed_job_key, release_llm_job
+from ..queue_contract import LLM_JOB_STATUS_TTL_SECONDS, llm_seed_job_key
 
 active_learning_bp = Blueprint("active_learning", __name__)
+logger = logging.getLogger(__name__)
 
 
 def _owned_dataset(dataset_id):
@@ -158,20 +161,33 @@ def _llm_seed_job(dataset, credential):
     }
     # One LLM job per owner on the shared worker; last, so a refusal above claims nothing.
     refuse_if_job_running(current_app.redis_client, job["owner_id"], job["job_id"], len(tasks))
+    if estimate["free_model"]:
+        # The seed uses up the free allowance; the next estimate reads it again.
+        forget_openrouter_allowance(credential.base_url, credential.api_key)
     return job
 
 
 def _drop_llm_seed(job):
-    """The loop didn't start: the claimed job never runs, so free the owner."""
-    redis_client = current_app.redis_client
-    release_llm_job(redis_client, job["owner_id"], job["job_id"])
-    redis_client.delete(llm_job_status_key(job["job_id"]))
+    """The claimed seed job never reaches the queue, so free the owner."""
+    from .llm import drop_claimed_job
+
+    drop_claimed_job(current_app.redis_client, job["owner_id"], job["job_id"])
 
 
 def _queue_llm_seed(dataset, job):
     redis_client = current_app.redis_client
-    redis_client.setex(llm_seed_job_key(dataset.id), LLM_JOB_STATUS_TTL_SECONDS, job["job_id"])
-    redis_client.lpush("llm_queue", json.dumps(job))
+    seed_key = llm_seed_job_key(dataset.id)
+    try:
+        redis_client.setex(seed_key, LLM_JOB_STATUS_TTL_SECONDS, job["job_id"])
+        redis_client.lpush("llm_queue", json.dumps(job))
+    except Exception:
+        _drop_llm_seed(job)
+        try:
+            if redis_client.get(seed_key) == job["job_id"]:
+                redis_client.delete(seed_key)
+        except Exception:
+            logger.warning("Could not clear the seed job of dataset %s", dataset.id, exc_info=True)
+        raise
 
 
 @active_learning_bp.route("/datasets/<dataset_id>/strategy", methods=["PUT"])

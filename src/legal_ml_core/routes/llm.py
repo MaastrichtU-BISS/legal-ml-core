@@ -1,5 +1,6 @@
 """LLM assistance API: access, keys, prompts, suggestions and standalone jobs."""
 import json
+import logging
 import re
 import uuid
 from datetime import datetime
@@ -53,9 +54,10 @@ from ..models import (
     LLMPrompt,
     LLMSuggestion,
 )
-from ..queue_contract import claim_llm_job, llm_job_status_key
+from ..queue_contract import claim_llm_job, llm_job_status_key, release_llm_job
 
 llm_bp = Blueprint("llm", __name__)
+logger = logging.getLogger(__name__)
 
 # Single-label only for now: these are the tasks that train a classifier.
 SUPPORTED_TASK_TYPES = {
@@ -720,6 +722,15 @@ def refuse_if_job_running(redis_client, owner_id, job_id, total):
         raise ApiError(409, JOB_RUNNING_MESSAGE, code="job_running", job_id=active)
 
 
+def drop_claimed_job(redis_client, owner_id, job_id):
+    """A claimed job that never reached the queue: free the owner, best effort."""
+    try:
+        release_llm_job(redis_client, owner_id, job_id)
+        redis_client.delete(llm_job_status_key(job_id))
+    except Exception:
+        logger.warning("Could not free LLM job %s after a failed enqueue", job_id, exc_info=True)
+
+
 def _shared_remaining(credential, free):
     """Tokens left on the shared key, or None. A free model's balance isn't read."""
     if credential.mode != "shared" or free:
@@ -806,21 +817,25 @@ def start_annotation(dataset_id):
     owner_id = _owner()
     redis_client = current_app.redis_client
     refuse_if_job_running(redis_client, owner_id, job_id, len(tasks))
-    if estimate["free_model"]:
-        # Start uses up the free allowance; the next estimate reads it again.
-        forget_openrouter_allowance(credential.base_url, credential.api_key)
-    redis_client.lpush(
-        "llm_queue",
-        json.dumps(
-            {
-                "job_id": job_id,
-                "dataset_id": dataset.id,
-                "owner_id": owner_id,
-                "mode": credential.mode,
-                "task_ids": [task.id for task in tasks],
-            }
-        ),
-    )
+    try:
+        if estimate["free_model"]:
+            # Start uses up the free allowance; the next estimate reads it again.
+            forget_openrouter_allowance(credential.base_url, credential.api_key)
+        redis_client.lpush(
+            "llm_queue",
+            json.dumps(
+                {
+                    "job_id": job_id,
+                    "dataset_id": dataset.id,
+                    "owner_id": owner_id,
+                    "mode": credential.mode,
+                    "task_ids": [task.id for task in tasks],
+                }
+            ),
+        )
+    except Exception:
+        drop_claimed_job(redis_client, owner_id, job_id)
+        raise
     return jsonify({"job_id": job_id, "estimate": estimate}), 202
 
 
@@ -832,4 +847,5 @@ def job_status(job_id):
     if status_body is None or status_body.get("owner_id") != _owner():
         raise ApiError(404, "Job not found")
     status_body.pop("owner_id")
+    status_body.pop("updated_at", None)  # the lock's liveness stamp, not the job's state
     return jsonify(status_body), 200

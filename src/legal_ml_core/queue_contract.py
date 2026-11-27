@@ -30,6 +30,7 @@ Liveness keys (Redis strings with a TTL, written by the worker; see liveness.py)
   => queued jobs report that the training service isn't running.
 """
 import json
+import time
 from typing import Any, List, Optional, TypedDict
 
 from redis import exceptions as redis_exceptions
@@ -107,15 +108,46 @@ LLM_JOB_FINAL_STATUSES = frozenset(
 )
 
 
+# Statuses whose job still holds its owner's slot; anything else (a final
+# status, none, junk) doesn't.
+LLM_JOB_LIVE_STATUSES = frozenset({"queued", "running"})
+
+# The worker stamps ``updated_at`` on every status write, and a running job
+# writes at least once per item and around every provider wait (at most
+# ``MAX_WAIT_SECONDS``, 120 s, plus one call of ``LLM_TIMEOUT_SECONDS``). A
+# running job silent for longer died with its worker (BRPOP gives no redelivery).
+LLM_RUNNING_STALE_SECONDS = 15 * 60
+# The single LLM worker may be busy with others' jobs for a while; a job still
+# queued past this is taken to be lost.
+LLM_QUEUED_STALE_SECONDS = 60 * 60
+_STALE_AFTER = {"queued": LLM_QUEUED_STALE_SECONDS, "running": LLM_RUNNING_STALE_SECONDS}
+
+
+def _now():
+    return time.time()
+
+
 def _llm_job_is_live(redis_client, job_id):
+    """Whether this job still holds its owner's slot.
+
+    Only ``queued`` or ``running``, and only while its ``updated_at`` is within
+    that status's window. A status with no ``updated_at`` (written before it was
+    stamped) counts as live: its TTL still bounds it.
+    """
     raw = redis_client.get(llm_job_status_key(job_id))
     if not raw:
         return False
     try:
-        status = json.loads(raw).get("status")
+        body = json.loads(raw)
+        status = body.get("status")
     except (TypeError, ValueError, AttributeError):
         return False
-    return status not in LLM_JOB_FINAL_STATUSES
+    if status not in LLM_JOB_LIVE_STATUSES:
+        return False
+    updated_at = body.get("updated_at")
+    if isinstance(updated_at, bool) or not isinstance(updated_at, (int, float)):
+        return True
+    return _now() - updated_at <= _STALE_AFTER[status]
 
 
 def claim_llm_job(redis_client, owner_id, job_id, total):
@@ -129,7 +161,15 @@ def claim_llm_job(redis_client, owner_id, job_id, total):
     redis_client.setex(
         status_key,
         LLM_JOB_STATUS_TTL_SECONDS,
-        json.dumps({"owner_id": owner_id, "status": "queued", "total": total, "done": 0}),
+        json.dumps(
+            {
+                "owner_id": owner_id,
+                "status": "queued",
+                "total": total,
+                "done": 0,
+                "updated_at": _now(),
+            }
+        ),
     )
     key = llm_active_job_key(owner_id)
     for _ in range(5):
@@ -153,6 +193,21 @@ def claim_llm_job(redis_client, owner_id, job_id, total):
                 continue
     redis_client.delete(status_key)
     return redis_client.get(key) or ""
+
+
+def refresh_llm_job(redis_client, owner_id, job_id):
+    """Renew the owner's active-job key's TTL, only if it still names this job."""
+    key = llm_active_job_key(owner_id)
+    with redis_client.pipeline() as pipe:
+        try:
+            pipe.watch(key)
+            if pipe.get(key) != job_id:
+                return
+            pipe.multi()
+            pipe.expire(key, LLM_JOB_STATUS_TTL_SECONDS)
+            pipe.execute()
+        except redis_exceptions.WatchError:
+            pass
 
 
 def release_llm_job(redis_client, owner_id, job_id):

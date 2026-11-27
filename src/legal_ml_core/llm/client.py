@@ -189,13 +189,18 @@ def is_insufficient_quota(response):
     return any(isinstance(v, str) and v.lower() == "insufficient_quota" for v in values)
 
 
+def _present(value):
+    """Set: not None and, for a string, not blank."""
+    return value is not None and not (isinstance(value, str) and value.strip() == "")
+
+
 def parse_rate_limit(response, now=None, free=False):
     """A ``ProviderRateLimited`` for a 429 ``response``. The body is only read, never shown.
 
     Daily when the message names OpenRouter's ``...-per-day`` limit, or, for a
     free model (``free``), when ``X-RateLimit-Limit`` is over the per-minute
     allowance. Never by how far away the reset is. An upstream provider's 429
-    that OpenRouter relays (``error.metadata.provider_code``, or a non-empty
+    that OpenRouter relays (a non-blank ``error.metadata.provider_code`` or
     ``error.metadata.provider_name``) is daily only by the ``per-day`` name: its
     limit header is that provider's, not OpenRouter's.
     """
@@ -203,9 +208,8 @@ def parse_rate_limit(response, now=None, free=False):
     error = _error_of(response)
     message = error.get("message") if isinstance(error.get("message"), str) else ""
     metadata = _metadata_of(error)
-    provider_name = metadata.get("provider_name")
-    upstream = metadata.get("provider_code") is not None or (
-        isinstance(provider_name, str) and provider_name.strip() != ""
+    upstream = _present(metadata.get("provider_code")) or (
+        isinstance(metadata.get("provider_name"), str) and _present(metadata["provider_name"])
     )
     body_headers = metadata.get("headers") if isinstance(metadata.get("headers"), dict) else {}
     response_headers = getattr(response, "headers", None)
