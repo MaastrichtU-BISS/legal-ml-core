@@ -8,6 +8,32 @@ While the version is 0.x, minor releases may contain breaking changes.
 
 ## [Unreleased]
 
+## [0.23.0] - 2026-11-27
+
+### Added
+
+- Explore data counts an NER Dataset's entities (BAIGLE #179). For task types
+  `ner` and `named_entity_recognition`, `GET /datasets/<id>/eda` adds to
+  `task_specific_analysis`: `entity_column`, `total_entities`, `entity_types`
+  (each type's `count`, `share`, `rows` holding it, `mean_length_words` and up
+  to 10 `top_entities` with their `count` and `rows`, most common first),
+  `rows_without_entities`, `entities_per_row`, `rare_entity_types` (under 5%
+  of all entities), `unreadable_rows` and `entity_message`. Every key is there
+  even without an entities column, and a cell that cannot be read is counted,
+  never a 500. `GET /datasets/<id>/eda/visualizations` adds an
+  `entities_per_type` bar chart.
+- `GET /datasets/<id>/rows` takes `entity` and `entity_type`, alone or
+  together, keeping the rows whose entities cell holds such a span, so opening
+  a type or a top entity in Browse data shows as many rows as its `rows` count.
+  A Dataset without an entities column answers 400.
+
+### Changed
+
+- Explore data reads an NER file as written (`read_rows_exact`), so the spans'
+  offsets point into the same text the annotation queue checks them against,
+  and reads `.json` files, which gave 400 before. The entities cells are read
+  by one helper, `annotation_queue.read_span_cell`, which the queue uses too.
+
 ## [0.22.2] - 2026-11-27
 
 ### Added

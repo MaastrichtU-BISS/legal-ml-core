@@ -2,9 +2,12 @@ import math
 import pandas as pd
 import numpy as np
 import json
+from collections import Counter
 from flask import Blueprint, jsonify
 from ..auth import jwt_required, get_jwt_identity
 from ..models import Dataset
+from ..annotation_format import SPAN_TYPES
+from ..annotation_queue import file_entity_rows, read_rows_exact
 from ..text_terms import (
     LABEL_COL_NAMES,
     TEXT_COL_NAMES,
@@ -48,6 +51,23 @@ def convert_numpy_types(obj):
 eda_bp = Blueprint("eda", __name__)
 
 
+def _read_frame(file_path, task_type):
+    """The dataset's rows, or ``None`` for a format EDA cannot read.
+
+    An NER file is read as written (``read_rows_exact``): its spans' offsets
+    point into the text exactly, and pandas' type guesses would move them.
+    """
+    if task_type in SPAN_TYPES and file_path.endswith((".csv", ".xlsx", ".json")):
+        return read_rows_exact(file_path)
+    if file_path.endswith(".csv"):
+        return pd.read_csv(file_path)
+    if file_path.endswith((".xlsx", ".xls")):
+        return pd.read_excel(file_path)
+    if file_path.endswith(".json"):
+        return pd.read_json(file_path)
+    return None
+
+
 @eda_bp.route("/datasets/<dataset_id>/eda", methods=["GET"])
 @jwt_required()
 def get_eda_analysis(dataset_id):
@@ -63,12 +83,8 @@ def get_eda_analysis(dataset_id):
         if not os.path.exists(file_path):
             return jsonify({"error": "Dataset file not found"}), 404
 
-        # Read the dataset
-        if file_path.endswith(".csv"):
-            df = pd.read_csv(file_path)
-        elif file_path.endswith((".xlsx", ".xls")):
-            df = pd.read_excel(file_path)
-        else:
+        df = _read_frame(file_path, dataset.task_type)
+        if df is None:
             return jsonify({"error": "Unsupported file format"}), 400
 
         # Perform EDA analysis
@@ -102,12 +118,8 @@ def get_eda_visualizations(dataset_id):
         if not os.path.exists(file_path):
             return jsonify({"error": "Dataset file not found"}), 404
 
-        # Read the dataset
-        if file_path.endswith(".csv"):
-            df = pd.read_csv(file_path)
-        elif file_path.endswith((".xlsx", ".xls")):
-            df = pd.read_excel(file_path)
-        else:
+        df = _read_frame(file_path, dataset.task_type)
+        if df is None:
             return jsonify({"error": "Unsupported file format"}), 400
 
         # Generate visualizations
@@ -508,16 +520,17 @@ def _keyword_stats(df, text_col, label_col, top_n=10):
     return result
 
 
+# An entity type under this share of all entities is reported as rare.
+RARE_ENTITY_SHARE = 0.05
+TOP_ENTITIES = 10
+
+
 def get_ner_analysis(df):
-    """Analyze NER dataset"""
+    """Analyze NER dataset: text lengths, and the entities each row's
+    ``entities`` cell holds (``entity_statistics``)."""
     analysis = {}
 
-    # Find text column
-    text_col = None
-    for col in df.columns:
-        if col.lower() in ["text", "content", "document", "sentence"]:
-            text_col = col
-            break
+    text_col = find_column(df, TEXT_COL_NAMES)
 
     if text_col:
         # Text length analysis
@@ -538,7 +551,105 @@ def get_ner_analysis(df):
             "max": word_counts.max(),
         }
 
+    analysis.update(entity_statistics(df))
     return analysis
+
+
+def entity_statistics(df):
+    """Entity types, their counts and most common entities, from an NER file's
+    ``entities`` column (``file_entity_rows``).
+
+    Every key is always present. ``rows`` counts the rows holding at least one
+    entity of a type, so it equals the rows the Browse data filter
+    ``entity_type`` keeps; a top entity's ``rows`` likewise equals the rows
+    ``entity`` with ``entity_type`` keeps. A cell that looks like spans but does
+    not fit its row's text counts in ``unreadable_rows`` and nowhere else.
+    """
+    stats = {
+        "entity_column": None,
+        "total_entities": 0,
+        "entity_types": [],
+        "rows_without_entities": {"count": 0, "percent": 0.0},
+        "entities_per_row": {"mean": 0.0, "median": 0.0, "max": 0},
+        "rare_entity_types": [],
+        "unreadable_rows": 0,
+        "entity_message": None,
+    }
+    entity_col, rows = file_entity_rows(df)
+    if entity_col is None:
+        if find_column(df, ["entities"]) is None:
+            stats["entity_message"] = (
+                "This dataset has no entities column, so its entity types cannot be counted."
+            )
+        else:
+            stats["entity_message"] = (
+                "This dataset has no text column, so its entities cannot be read."
+            )
+        return stats
+    stats["entity_column"] = str(entity_col)
+
+    unreadable = sum(1 for _, bad in rows if bad)
+    stats["unreadable_rows"] = unreadable
+    readable = [spans or [] for spans, bad in rows if not bad]
+    per_row = [len(spans) for spans in readable]
+    if per_row:
+        stats["entities_per_row"] = {
+            "mean": float(np.mean(per_row)),
+            "median": float(np.median(per_row)),
+            "max": int(max(per_row)),
+        }
+    without = sum(1 for n in per_row if n == 0)
+    stats["rows_without_entities"] = {
+        "count": without,
+        "percent": 100.0 * without / len(rows) if rows else 0.0,
+    }
+
+    counts = Counter()
+    type_rows = Counter()
+    words = Counter()
+    entity_counts = {}
+    entity_rows = {}
+    for spans in readable:
+        for kind in {span["type"] for span in spans}:
+            type_rows[kind] += 1
+        for key in {(span["type"], span["text"]) for span in spans}:
+            entity_rows.setdefault(key[0], Counter())[key[1]] += 1
+        for span in spans:
+            counts[span["type"]] += 1
+            words[span["type"]] += len(span["text"].split())
+            entity_counts.setdefault(span["type"], Counter())[span["text"]] += 1
+
+    total = sum(counts.values())
+    stats["total_entities"] = total
+    if total == 0:
+        stats["entity_message"] = (
+            "No row's entities could be read. Each entities cell should be a list of "
+            "spans like {\"text\", \"start\", \"end\", \"type\"} that fit the row's text."
+            if unreadable
+            else "No row has any entities."
+        )
+        return stats
+    types = sorted(counts, key=lambda kind: (-counts[kind], kind))
+    stats["entity_types"] = [
+        {
+            "type": kind,
+            "count": counts[kind],
+            "share": counts[kind] / total,
+            "rows": type_rows[kind],
+            "mean_length_words": words[kind] / counts[kind],
+            "top_entities": [
+                {"text": text, "count": n, "rows": entity_rows[kind][text]}
+                for text, n in sorted(
+                    entity_counts[kind].items(), key=lambda item: (-item[1], item[0])
+                )[:TOP_ENTITIES]
+            ],
+        }
+        for kind in types
+    ]
+    stats["rare_entity_types"] = [
+        kind for kind in types if counts[kind] / total < RARE_ENTITY_SHARE
+    ]
+    return stats
 
 
 def get_summarization_analysis(df):
@@ -898,12 +1009,7 @@ def create_ner_visualizations(df):
     """Create NER-specific visualizations"""
     visualizations = {}
 
-    # Find text column
-    text_col = None
-    for col in df.columns:
-        if col.lower() in ["text", "content", "document", "sentence"]:
-            text_col = col
-            break
+    text_col = find_column(df, TEXT_COL_NAMES)
 
     if text_col:
         # Text length distribution
@@ -937,6 +1043,25 @@ def create_ner_visualizations(df):
         visualizations["word_count_distribution"] = json.dumps(
             fig, cls=PlotlyJSONEncoder
         )
+
+    # Entities per type, most common first, as the analysis lists them.
+    entity_types = entity_statistics(df)["entity_types"]
+    if entity_types:
+        fig = go.Figure(
+            data=[
+                go.Bar(
+                    x=[entry["type"] for entry in entity_types],
+                    y=[entry["count"] for entry in entity_types],
+                )
+            ]
+        )
+        fig.update_layout(
+            title="Entities per Type",
+            xaxis_title="Entity type",
+            yaxis_title="Entities",
+            height=400,
+        )
+        visualizations["entities_per_type"] = json.dumps(fig, cls=PlotlyJSONEncoder)
 
     return visualizations
 

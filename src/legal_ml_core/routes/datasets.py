@@ -6,7 +6,14 @@ from ..db import db
 from ..dataset_creation import DatasetInvalid, create_dataset
 from ..models import AnnotationTask, Dataset, LLMPrompt
 from ..annotation_format import label_from_assignment, label_text, stored_payload
-from ..annotation_queue import LABEL_COLUMNS, create_annotation_tasks, file_labels, read_rows
+from ..annotation_queue import (
+    LABEL_COLUMNS,
+    create_annotation_tasks,
+    file_entity_rows,
+    file_labels,
+    read_rows,
+    read_rows_exact,
+)
 from ..llm.suggest import current_prompt
 from ..kit_exchange import ExchangeError, rows_from_task_data, task_data_from_dataset
 from ..text_terms import (
@@ -763,6 +770,28 @@ def paginated_dataset_rows(dataset_id):
             if label_col is None:
                 return jsonify({"error": "This Dataset has no label column to filter by"}), 400
             df = df[(label_values(df, label_col) == label).to_numpy()]
+
+        # Optional filters for opening an entity from NER EDA: the rows whose
+        # entities cell holds a span of that exact text and/or type. The cells
+        # are read as EDA reads them (``file_entity_rows`` over the file as
+        # written), so the filtered total equals the entity's ``rows`` there.
+        entity = request.args.get("entity", default=None, type=str)
+        entity_type = request.args.get("entity_type", default=None, type=str)
+        if entity is not None or entity_type is not None:
+            entity_col, entity_rows = file_entity_rows(read_rows_exact(dataset.file_path))
+            if entity_col is None:
+                return jsonify({"error": "This Dataset has no entities column to filter by"}), 400
+            keep = [
+                any(
+                    (entity is None or span["text"] == entity)
+                    and (entity_type is None or span["type"] == entity_type)
+                    for span in spans or []
+                )
+                for spans, _ in entity_rows
+            ]
+            # ``keep`` is by position in the whole file, which is still each
+            # row's index label after the earlier filters.
+            df = df[pd.Series(keep).reindex(df.index, fill_value=False).to_numpy()]
 
         total = len(df)
         window = df.iloc[offset : offset + limit]
