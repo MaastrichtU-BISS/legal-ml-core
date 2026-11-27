@@ -38,4 +38,6 @@ def texts_containing(texts, term):
     """Boolean mask of the texts whose words include `term` (case-insensitive)."""
     analyzer = CountVectorizer().build_analyzer()
     term = str(term).lower()
-    return texts.map(lambda text: term in set(analyzer(text)))
+    # astype(bool): an empty Series maps to object dtype, which as a mask would
+    # select no columns instead of no rows.
+    return texts.map(lambda text: term in set(analyzer(text))).astype(bool)

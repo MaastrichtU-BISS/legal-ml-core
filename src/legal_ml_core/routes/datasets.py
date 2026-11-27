@@ -25,6 +25,7 @@ from ..text_terms import (
     texts_containing,
 )
 import logging
+import numpy as np
 import pandas as pd
 import os
 import uuid
@@ -794,10 +795,11 @@ def paginated_dataset_rows(dataset_id):
                 )
                 for spans, _ in entity_rows
             ]
-            # ``keep`` follows ``df``'s rows, which the earlier filters may have
-            # narrowed. It takes ``df``'s own index, so a JSON file whose rows
-            # are labelled "a", "b" and so on keeps the right rows.
-            df = df[pd.Series(keep, index=df.index).to_numpy()]
+            # ``keep`` follows ``df``'s rows by position, which the earlier
+            # filters may have narrowed, so a JSON file whose rows are labelled
+            # "a", "b" and so on keeps the right rows. A bool array, since an
+            # empty object array would select no columns instead of no rows.
+            df = df[np.asarray(keep, dtype=bool)]
 
         total = len(df)
         window = df.iloc[offset : offset + limit]

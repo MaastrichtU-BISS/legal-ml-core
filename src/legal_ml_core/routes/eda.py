@@ -6,7 +6,7 @@ from collections import Counter
 from flask import Blueprint, jsonify
 from ..auth import jwt_required, get_jwt_identity
 from ..models import Dataset
-from ..annotation_format import SPAN_TYPES
+from ..annotation_format import SPAN_TYPES, label_text
 from ..annotation_queue import LABEL_COLUMNS, file_entity_rows, read_rows, read_rows_exact
 from ..text_terms import (
     LABEL_COL_NAMES,
@@ -44,11 +44,20 @@ def convert_numpy_types(obj):
     elif isinstance(obj, np.ndarray):
         return convert_numpy_types(obj.tolist())
     elif isinstance(obj, dict):
-        return {key: convert_numpy_types(value) for key, value in obj.items()}
+        # JSON keys are text. Mixed key types (a .json column holding both
+        # numbers and strings) would make jsonify's key sort fail with a 500.
+        return {_json_key(key): convert_numpy_types(value) for key, value in obj.items()}
     elif isinstance(obj, list):
         return [convert_numpy_types(item) for item in obj]
     else:
         return obj
+
+
+def _json_key(key):
+    """A dict key as the text JSON would write it: strings as they are, and
+    numbers, booleans and None as ``1``, ``true``, ``null``."""
+    key = convert_numpy_types(key)
+    return key if isinstance(key, str) else json.dumps(key, default=str)
 
 
 eda_bp = Blueprint("eda", __name__)
@@ -588,11 +597,8 @@ _SPAN_SHAPE = (
 
 
 def _is_blank_cell(value):
-    if value is None:
-        return True
-    if isinstance(value, float) and math.isnan(value):
-        return True
-    return isinstance(value, str) and not value.strip()
+    # label_text treats None, NaN, pd.NA, NaT and whitespace as blank.
+    return label_text(value) is None
 
 
 def _rows(n):
@@ -600,25 +606,31 @@ def _rows(n):
 
 
 def _no_entities_message(cells, rows):
-    """Why an NER file shows no entities, in plain words: its rows have none,
-    its cells name types but no spans (``"PER, LOC"``), or they cannot be
-    read. ``rows`` are ``file_entity_rows``' pairs for ``cells``."""
+    """Why an NER file shows no entities, in plain words: its cells name types
+    but no spans (``"PER, LOC"``), they cannot be read, or its rows have none.
+    ``rows`` are ``file_entity_rows``' pairs for ``cells``. A blank cell or
+    ``[]`` is a row read with no entities."""
     unreadable = sum(1 for _, bad in rows if bad)
-    spans_read = sum(1 for spans, bad in rows if spans is not None and not bad)
-    not_spans = sum(
+    read_empty = sum(
+        1
+        for cell, (spans, bad) in zip(cells, rows)
+        if not bad and (spans is not None or _is_blank_cell(cell))
+    )
+    type_lists = sum(
         1
         for cell, (spans, bad) in zip(cells, rows)
         if spans is None and not bad and not _is_blank_cell(cell)
     )
-    if spans_read:
-        if unreadable:
-            return f"No readable row has any entities; {_rows(unreadable)} could not be read."
-        return "No row has any entities."
-    if not_spans and not unreadable:
-        return (
+    if type_lists:
+        message = (
             "The entities column names entity types but not where each entity is in "
             "the text, so the entities cannot be counted. " + _SPAN_SHAPE
         )
+        if unreadable:
+            message += f" {_rows(unreadable)} could not be read either."
+        return message
+    if unreadable and read_empty:
+        return f"No readable row has any entities; {_rows(unreadable)} could not be read."
     if unreadable:
         return "No row's entities could be read. " + _SPAN_SHAPE
     return "No row has any entities."

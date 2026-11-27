@@ -2,6 +2,7 @@
 (shashankmc/reducing_digital_divide#179)."""
 import json
 
+import numpy as np
 import pandas as pd
 import pytest
 
@@ -545,3 +546,99 @@ def test_numpy_integer_offsets_are_read_as_spans():
     assert unreadable is False
     assert spans == [{"text": "Paris", "start": 0, "end": 5, "type": "LOC"}]
     assert type(spans[0]["start"]) is int
+
+
+def test_blank_rows_and_one_malformed_row_do_not_say_nothing_could_be_read(
+    client, auth_headers, app, tmp_path
+):
+    rows = [(f"Row {i} .", None) for i in range(9)] + [("Bad .", "[not json")]
+    dataset_id = _csv_dataset(app, tmp_path, rows)
+
+    stats = _ner_stats(client, auth_headers, dataset_id)
+
+    assert stats["unreadable_rows"] == 1
+    assert stats["entity_message"] == (
+        "No readable row has any entities; 1 row could not be read."
+    )
+
+
+def test_type_lists_beside_an_empty_row_still_say_the_entities_cannot_be_counted(
+    client, auth_headers, app, tmp_path
+):
+    rows = [("Empty .", [])] + [(f"Row {i} .", "PER, LOC") for i in range(9)]
+    dataset_id = _csv_dataset(app, tmp_path, rows)
+
+    stats = _ner_stats(client, auth_headers, dataset_id)
+
+    assert "names entity types but not where" in stats["entity_message"]
+
+
+def test_pandas_missing_values_are_blank_cells_not_type_lists():
+    from legal_ml_core.routes.eda import _is_blank_cell
+
+    for value in (None, float("nan"), np.float32("nan"), pd.NA, pd.NaT, "  "):
+        assert _is_blank_cell(value)
+    assert not _is_blank_cell("PER, LOC")
+    assert not _is_blank_cell([])
+
+
+def test_a_json_column_mixing_lists_and_numbers_is_not_a_500(
+    client, auth_headers, app, tmp_path
+):
+    path = tmp_path / "mixed.json"
+    path.write_text(
+        json.dumps(
+            [
+                {"text": "Paris .", "entities": [_span("Paris .", "Paris", "LOC")], "meta": {"src": "wiki"}},
+                {"text": "Rome .", "entities": 0, "meta": 42},
+                {"text": "Oslo .", "entities": [], "meta": "news"},
+            ]
+        )
+    )
+    dataset_id = _add_dataset(app, path)
+
+    resp = client.get(f"/api/datasets/{dataset_id}/eda", headers=auth_headers)
+
+    assert resp.status_code == 200
+    stats = resp.get_json()["task_specific_analysis"]
+    assert stats["total_entities"] == 1
+
+
+def test_mixed_key_types_become_json_text_keys():
+    from legal_ml_core.routes.eda import convert_numpy_types
+
+    out = convert_numpy_types({1: "a", "b": 2, None: 4, np.int64(5): 6})
+    assert out == {"1": "a", "b": 2, "null": 4, "5": 6}
+    assert convert_numpy_types({True: 1, "x": 2}) == {"true": 1, "x": 2}
+
+
+def test_an_entity_filter_that_empties_the_rows_keeps_the_columns(
+    client, auth_headers, app, tmp_path
+):
+    dataset_id = _csv_dataset(app, tmp_path, _wikiann_rows())
+
+    body = client.get(
+        f"/api/datasets/{dataset_id}/rows",
+        query_string={"term": "zzzunseen", "entity": "Paris"},
+        headers=auth_headers,
+    ).get_json()
+
+    assert body["total_rows"] == 0
+    assert body["columns"] == ["text", "entities"]
+
+
+def test_an_entity_filter_on_a_file_with_no_rows_keeps_the_columns(
+    client, auth_headers, app, tmp_path
+):
+    path = tmp_path / "header_only.csv"
+    path.write_text("text,entities\n")
+    dataset_id = _add_dataset(app, path)
+
+    resp = client.get(
+        f"/api/datasets/{dataset_id}/rows",
+        query_string={"term": "paris", "entity": "Paris"},
+        headers=auth_headers,
+    )
+
+    assert resp.status_code == 200
+    assert resp.get_json()["columns"] == ["text", "entities"]
