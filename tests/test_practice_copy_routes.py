@@ -347,3 +347,65 @@ def test_requires_sign_in(client, app):
     response = client.post(f"/api/datasets/{dataset_id}/practice-copy")
 
     assert response.status_code == 401
+
+
+def _uploads(app):
+    return sorted(os.listdir(app.config["UPLOAD_FOLDER"]))
+
+
+def test_a_failure_after_the_copy_is_saved_removes_its_row_and_file(client, auth_headers, app, monkeypatch):
+    dataset_id = _dataset(app)
+    before = _uploads(app)
+
+    def fail(_dataset):
+        raise RuntimeError("tasks could not be made")
+
+    monkeypatch.setattr("legal_ml_core.routes.datasets.create_annotation_tasks", fail)
+
+    with pytest.raises(RuntimeError, match="tasks could not be made"):
+        _post(client, auth_headers, dataset_id)
+
+    with app.app_context():
+        assert [d.id for d in Dataset.query.all()] == [dataset_id]
+    assert _uploads(app) == before
+
+
+def test_a_half_written_file_is_removed(client, auth_headers, app, monkeypatch):
+    dataset_id = _dataset(app)
+    before = _uploads(app)
+
+    def write_half(self, path, *args, **kwargs):
+        with open(path, "w") as f:
+            f.write("text,label\nThe provider")
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(pd.DataFrame, "to_csv", write_half)
+
+    with pytest.raises(OSError, match="No space left"):
+        _post(client, auth_headers, dataset_id)
+
+    with app.app_context():
+        assert Dataset.query.count() == 1
+    assert _uploads(app) == before
+
+
+def test_a_failing_database_cleanup_still_removes_the_file_and_keeps_the_first_error(
+    client, auth_headers, app, monkeypatch
+):
+    dataset_id = _dataset(app)
+    before = _uploads(app)
+
+    def fail(_dataset):
+        raise RuntimeError("tasks could not be made")
+
+    def database_gone(*args, **kwargs):
+        raise ConnectionError("database gone")
+
+    monkeypatch.setattr("legal_ml_core.routes.datasets.create_annotation_tasks", fail)
+    # The rollback that follows the failure is where a lost connection shows.
+    monkeypatch.setattr(db.session, "rollback", database_gone)
+
+    with pytest.raises(RuntimeError, match="tasks could not be made"):
+        _post(client, auth_headers, dataset_id)
+
+    assert _uploads(app) == before
