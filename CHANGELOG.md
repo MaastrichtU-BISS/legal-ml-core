@@ -58,7 +58,9 @@ While the version is 0.x, minor releases may contain breaking changes.
   blank rows beside a malformed one no longer say that nothing could be read,
   and type lists beside an empty row still say they cannot be counted.
 - The EDA responses write every dict key as JSON text, so a `.json` column
-  mixing numbers with lists or strings no longer fails with a 500.
+  mixing numbers with lists or strings no longer fails with a 500. Keys that
+  become the same text, such as `1` and `"1"`, add their counts, numpy
+  booleans are plain booleans, and a date key is its plain text.
 - A rows filter that leaves no rows keeps the response's `columns`.
 - The OpenAPI document describes the `entity` and `entity_type` parameters and
   the NER entity statistics.

@@ -642,3 +642,14 @@ def test_an_entity_filter_on_a_file_with_no_rows_keeps_the_columns(
 
     assert resp.status_code == 200
     assert resp.get_json()["columns"] == ["text", "entities"]
+
+
+def test_keys_that_become_the_same_text_add_their_counts():
+    import datetime
+
+    from legal_ml_core.routes.eda import convert_numpy_types
+
+    assert convert_numpy_types({1: 2, "1": 1}) == {"1": 3}
+    assert convert_numpy_types({np.bool_(True): 1}) == {"true": 1}
+    assert convert_numpy_types({"flag": np.bool_(False)}) == {"flag": False}
+    assert convert_numpy_types({datetime.datetime(2020, 1, 1): 1}) == {"2020-01-01 00:00:00": 1}

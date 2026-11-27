@@ -36,7 +36,9 @@ def _is_categorical(series, df_len):
 
 def convert_numpy_types(obj):
     """Convert numpy types to Python native types for JSON serialization"""
-    if isinstance(obj, np.integer):
+    if isinstance(obj, np.bool_):
+        return bool(obj)
+    elif isinstance(obj, np.integer):
         return int(obj)
     elif isinstance(obj, (float, np.floating)):
         # NaN and infinity are not JSON: an all-blank column has no statistics.
@@ -46,7 +48,15 @@ def convert_numpy_types(obj):
     elif isinstance(obj, dict):
         # JSON keys are text. Mixed key types (a .json column holding both
         # numbers and strings) would make jsonify's key sort fail with a 500.
-        return {_json_key(key): convert_numpy_types(value) for key, value in obj.items()}
+        converted = {}
+        for key, value in obj.items():
+            text, value = _json_key(key), convert_numpy_types(value)
+            previous = converted.get(text)
+            # 1 and "1" are one key in JSON: add their counts, not drop one.
+            if _is_count(previous) and _is_count(value):
+                value = previous + value
+            converted[text] = value
+        return converted
     elif isinstance(obj, list):
         return [convert_numpy_types(item) for item in obj]
     else:
@@ -54,10 +64,19 @@ def convert_numpy_types(obj):
 
 
 def _json_key(key):
-    """A dict key as the text JSON would write it: strings as they are, and
-    numbers, booleans and None as ``1``, ``true``, ``null``."""
+    """A dict key as the text JSON would write it: strings as they are,
+    numbers, booleans and None as ``1``, ``true``, ``null``, and anything else
+    (a date, say) as its plain text."""
     key = convert_numpy_types(key)
-    return key if isinstance(key, str) else json.dumps(key, default=str)
+    if isinstance(key, str):
+        return key
+    if key is None or isinstance(key, (bool, int, float)):
+        return json.dumps(key)
+    return str(key)
+
+
+def _is_count(value):
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
 
 
 eda_bp = Blueprint("eda", __name__)
