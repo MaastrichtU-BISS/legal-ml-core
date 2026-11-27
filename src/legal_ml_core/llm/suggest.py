@@ -6,15 +6,17 @@ confirmed or bulk-accepted.
 
 import json
 import logging
+import time
 import uuid
 
 from ..db import db
 from ..models import AnnotationTask, Dataset, LLMPrompt, LLMSuggestion
 from ..queue_contract import LLM_JOB_STATUS_TTL_SECONDS, llm_job_status_key
 from .access import CredentialError, credential_for_mode
-from .client import LLMError, estimate_tokens
+from .client import LLMError, ProviderRateLimited, estimate_tokens
 from .config import int_setting
 from .metering import usage_meter
+from .models_list import is_free_model
 from .prompts import (
     DEFAULT_TEMPLATE,
     MAX_EXAMPLES,
@@ -31,8 +33,23 @@ METER_DOWN_MESSAGE = (
 )
 
 
+# A worker job waits out a provider's per-minute limit this many times per
+# item, for the provider's Retry-After (or DEFAULT_WAIT_SECONDS), at most
+# MAX_WAIT_SECONDS each time, before it gives up.
+MAX_WAITS_PER_ITEM = 3
+DEFAULT_WAIT_SECONDS = 20
+MAX_WAIT_SECONDS = 120
+
+# Replaced in tests, so they don't sleep.
+_sleep = time.sleep
+
+
 class BudgetExhausted(Exception):
     pass
+
+
+def is_free_credential(credential):
+    return credential is not None and is_free_model(credential.base_url, credential.model)
 
 
 def current_prompt(dataset):
@@ -94,20 +111,49 @@ def remaining_tokens(owner_id):
 
 
 def call_metered(credential, owner_id, messages):
-    """One LLM call. The shared key is checked before and metered after."""
+    """One LLM call. The shared key is checked before and metered after.
+
+    A free shared model is metered but not capped: its tokens are recorded, a
+    spent budget doesn't stop it, and a meter that can't record is logged only.
+    """
     if credential.mode != "shared":
         return credential.client().chat(messages)[0]
 
-    remaining = remaining_tokens(owner_id)
-    if remaining is not None and remaining <= 0:
-        raise BudgetExhausted()
+    free = is_free_credential(credential)
+    if not free:
+        remaining = remaining_tokens(owner_id)
+        if remaining is not None and remaining <= 0:
+            raise BudgetExhausted()
     content, tokens = credential.client().chat(messages)
     try:
         usage_meter().record(owner_id, tokens, str(uuid.uuid4()))
     except Exception:
         logger.exception("usage meter record failed")
-        raise LLMError(METER_DOWN_MESSAGE)
+        if not free:
+            raise LLMError(METER_DOWN_MESSAGE)
     return content
+
+
+def _call_waiting(credential, owner_id, messages, on_wait):
+    """``call_metered``, waiting out a provider's per-minute limit.
+
+    Waits at most ``MAX_WAITS_PER_ITEM`` times; a daily limit, or one more 429
+    after that, is raised.
+    """
+    waits = 0
+    while True:
+        try:
+            return call_metered(credential, owner_id, messages)
+        except ProviderRateLimited as exc:
+            if exc.daily or waits >= MAX_WAITS_PER_ITEM:
+                raise
+            waits += 1
+            seconds = min(exc.retry_after or DEFAULT_WAIT_SECONDS, MAX_WAIT_SECONDS)
+            if on_wait:
+                on_wait(seconds)
+            _sleep(seconds)
+            if on_wait:
+                on_wait(None)
 
 
 def estimate_job_tokens(dataset, tasks):
@@ -124,11 +170,22 @@ def estimate_job_tokens(dataset, tasks):
     )
 
 
-def suggest_tasks(dataset, tasks, credential, owner_id, on_progress=None):
+def suggest_tasks(
+    dataset,
+    tasks,
+    credential,
+    owner_id,
+    on_progress=None,
+    wait_on_rate_limit=False,
+    on_wait=None,
+):
     """Create suggestions for ``tasks``, one call each, committing as it goes.
 
     Work already done survives ``BudgetExhausted`` and ``LLMError``, and rerunning
     skips it. Output failing the constraint is discarded and counted as invalid.
+    With ``wait_on_rate_limit`` (the worker only: a request never sleeps), a
+    provider's per-minute 429 is waited out and the item retried; ``on_wait``
+    hears the seconds before each wait and ``None`` after it.
     """
     version, template, definitions = current_prompt(dataset)
     examples = confirmed_examples(dataset)
@@ -149,7 +206,10 @@ def suggest_tasks(dataset, tasks, credential, owner_id, on_progress=None):
             messages = build_messages(
                 template, definitions, dataset.labels, examples, task.text
             )
-            content = call_metered(credential, owner_id, messages)
+            if wait_on_rate_limit:
+                content = _call_waiting(credential, owner_id, messages, on_wait)
+            else:
+                content = call_metered(credential, owner_id, messages)
             try:
                 label, rationale = parse_suggestion(content, dataset.labels)
             except InvalidOutput as exc:
@@ -210,11 +270,22 @@ def process_llm_annotation_task(task_info, redis_client):
             invalid=result["invalid"],
         )
 
+    def waiting(seconds):
+        _set_status(redis_client, job_id, waiting_seconds=seconds)
+
     try:
         credential = credential_for_mode(owner_id, task_info["mode"])
         if credential is None:
             raise CredentialError("The LLM key for this job is no longer available.")
-        suggest_tasks(dataset, tasks, credential, owner_id, on_progress=progress)
+        suggest_tasks(
+            dataset,
+            tasks,
+            credential,
+            owner_id,
+            on_progress=progress,
+            wait_on_rate_limit=True,
+            on_wait=waiting,
+        )
     except BudgetExhausted:
         _order_seed(dataset, task_info)
         _set_status(
@@ -222,6 +293,18 @@ def process_llm_annotation_task(task_info, redis_client):
             job_id,
             status="budget_exhausted",
             error="The monthly limit was reached. Add your own API key to continue.",
+        )
+    except ProviderRateLimited as exc:
+        # The work already done is committed and stays; done and created stay too.
+        _order_seed(dataset, task_info)
+        _set_status(
+            redis_client,
+            job_id,
+            status="provider_limited",
+            error=str(exc),
+            retry_after=exc.retry_after,
+            daily=exc.daily,
+            waiting_seconds=None,
         )
     except (LLMError, CredentialError) as exc:
         _set_status(redis_client, job_id, status="failed", error=str(exc))

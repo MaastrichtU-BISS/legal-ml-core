@@ -18,9 +18,14 @@ from ..llm.access import (
     shared_key_allowed,
     validate_byok_url,
 )
-from ..llm.client import LLMError
+from ..llm.client import LLMError, ProviderRateLimited
 from ..llm.config import float_setting, int_setting, shared_endpoint
-from ..llm.models_list import MESSAGES as LISTING_MESSAGES, ModelListError, list_chat_models
+from ..llm.models_list import (
+    MESSAGES as LISTING_MESSAGES,
+    ModelListError,
+    list_chat_models,
+    openrouter_daily_limit,
+)
 from ..llm.prompts import (
     PromptRejected,
     check_template,
@@ -34,6 +39,7 @@ from ..llm.suggest import (
     call_metered,
     current_prompt,
     estimate_job_tokens,
+    is_free_credential,
     remaining_tokens,
     suggest_tasks,
 )
@@ -77,6 +83,22 @@ def _credential_error(error):
 @llm_bp.errorhandler(LLMError)
 def _llm_error(error):
     return jsonify({"error": str(error), "code": "llm_failed"}), 502
+
+
+@llm_bp.errorhandler(ProviderRateLimited)
+def _provider_rate_limited(error):
+    # Registered for the subclass, so it wins over the LLMError handler above.
+    response = jsonify(
+        {
+            "error": str(error),
+            "code": "provider_rate_limited",
+            "retry_after": error.retry_after,
+            "daily": error.daily,
+        }
+    )
+    if error.retry_after is not None:
+        response.headers["Retry-After"] = str(error.retry_after)
+    return response, 429
 
 
 @llm_bp.errorhandler(BudgetExhausted)
@@ -197,13 +219,18 @@ def status():
         # Anything that would spend the key keeps failing closed.
         "shared_key_available": True,
         "shared_key_unavailable_reason": None,
+        # A free model (OpenRouter's ``:free``) isn't held to the shared key's
+        # monthly limit, and the host may relax its own limits for it.
+        "free_model": is_free_credential(credential),
     }
     if credential and credential.mode == "shared":
         try:
             body["remaining_tokens"] = remaining_tokens(owner_id)
         except LLMError:
-            body["shared_key_available"] = False
-            body["shared_key_unavailable_reason"] = METER_DOWN_MESSAGE
+            # A free shared model isn't capped, so a meter that is down doesn't stop it.
+            if not body["free_model"]:
+                body["shared_key_available"] = False
+                body["shared_key_unavailable_reason"] = METER_DOWN_MESSAGE
 
     dataset_id = request.args.get("dataset_id")
     if dataset_id:
@@ -669,16 +696,36 @@ def bulk_accept(dataset_id):
     return jsonify({"accepted": len(suggestions), "agreement": check}), 200
 
 
+def _shared_remaining(credential, free):
+    """Tokens left on the shared key, or None. A free model's meter may be down."""
+    if credential.mode != "shared":
+        return None
+    if not free:
+        return remaining_tokens(_owner())
+    try:
+        return remaining_tokens(_owner())
+    except LLMError:
+        return None
+
+
 def _estimate(dataset, credential, task_ids):
+    """The job's size and cost. ``over_provider_limit`` only warns: nothing refuses on it."""
     tasks = _pending_tasks(dataset, task_ids)
     estimated = estimate_job_tokens(dataset, tasks)
-    remaining = remaining_tokens(_owner()) if credential.mode == "shared" else None
+    free = is_free_credential(credential)
+    remaining = _shared_remaining(credential, free)
+    daily_limit = (
+        openrouter_daily_limit(credential.base_url, credential.api_key) if free else None
+    )
     return tasks, {
         "tasks": len(tasks),
         "estimated_tokens": estimated,
         "remaining_tokens": remaining,
-        "within_budget": remaining is None or estimated <= remaining,
+        "within_budget": free or remaining is None or estimated <= remaining,
         "destination": credential.destination,
+        "free_model": free,
+        "provider_daily_limit": daily_limit,
+        "over_provider_limit": daily_limit is not None and len(tasks) > daily_limit,
     }
 
 

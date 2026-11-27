@@ -82,8 +82,8 @@ def seed_estimate(dataset_id):
     """What an LLM-suggested first batch would send and cost, before starting."""
     from types import SimpleNamespace
 
-    from ..llm.suggest import estimate_job_tokens, remaining_tokens
-    from .llm import ApiError, _credential, _labelable_dataset
+    from ..llm.suggest import estimate_job_tokens, is_free_credential
+    from .llm import ApiError, _credential, _labelable_dataset, _shared_remaining
 
     dataset = _owned_dataset(dataset_id)
     if not dataset:
@@ -97,13 +97,15 @@ def seed_estimate(dataset_id):
     except ApiError as error:
         return jsonify({"success": False, **error.body}), error.status
     estimated = estimate_job_tokens(dataset, [SimpleNamespace(text=text) for text in texts])
-    remaining = remaining_tokens(str(get_jwt_identity())) if credential.mode == "shared" else None
+    free = is_free_credential(credential)
+    remaining = _shared_remaining(credential, free)
     return jsonify(
         {
             "tasks": len(texts),
             "estimated_tokens": estimated,
             "remaining_tokens": remaining,
-            "within_budget": remaining is None or estimated <= remaining,
+            # A free shared model is metered but not held to the monthly limit.
+            "within_budget": free or remaining is None or estimated <= remaining,
             "destination": credential.destination,
         }
     ), 200

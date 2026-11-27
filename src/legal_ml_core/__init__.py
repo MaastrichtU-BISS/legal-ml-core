@@ -27,7 +27,7 @@ from .models import (
     TrainingJob,
     TrainingMetricPoint,
 )
-from .llm import DBUsageMeter, UsageMeter, purge_owner_llm_data
+from .llm import DBUsageMeter, UsageMeter, free_model_for, is_free_model, purge_owner_llm_data
 from .ownership import (
     HostModelOwnerRef,
     KeycloakOwnerRef,
@@ -85,4 +85,6 @@ __all__ = [
     "DBUsageMeter",
     "UsageMeter",
     "purge_owner_llm_data",
+    "free_model_for",
+    "is_free_model",
 ]

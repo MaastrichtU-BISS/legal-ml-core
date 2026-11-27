@@ -8,6 +8,47 @@ While the version is 0.x, minor releases may contain breaking changes.
 
 ## [Unreleased]
 
+## [0.24.0] - 2026-11-27
+
+### Added
+
+- Free models (BAIGLE #225). `is_free_model(base_url, model)` is true only for
+  an OpenRouter model whose id ends in `:free`; every other provider counts as
+  paid. `free_model_for(owner_id, claims)` answers the same for the model
+  `resolve_credential` would pick, from the saved key's row or the shared
+  endpoint, without decrypting the key, and never raises (False on any
+  error), for the host's rate limiter. Both are exported from `legal_ml_core`.
+- `POST /api/llm/models` marks a free model with `"free": true`.
+- `GET /api/llm/status` adds `free_model`.
+- `POST .../annotate/estimate`, and the `estimate` in the 202 of
+  `POST .../annotate`, add `free_model`, `provider_daily_limit` and
+  `over_provider_limit`. For a free OpenRouter model `GET {base_url}/key` is
+  asked with the credential's key: `is_free_tier` true means 50 requests a
+  day, false 1000, and a failed lookup 50. Other models get null and `/key` is
+  not asked. `over_provider_limit` only warns: no job is refused on it.
+- A provider's 429 raises `ProviderRateLimited(retry_after, daily)`, read from
+  `Retry-After` (seconds or an HTTP date), then `X-RateLimit-Reset` (epoch
+  seconds, or milliseconds over 1e12), then the same keys in the body's
+  `error.metadata.headers`, as OpenRouter sends them. It is daily when the
+  message says per day or the reset is more than 15 minutes away. The LLM
+  routes answer it with 429, `code: provider_rate_limited`, `retry_after`,
+  `daily` and a `Retry-After` header when known, in plain words; the
+  provider's body is never shown.
+- The annotation worker waits out a per-minute limit (Retry-After, else 20 s,
+  at most 120 s, at most 3 times per item), showing `waiting_seconds` in the
+  job status, and retries the item. On a daily limit, or after the third
+  wait, the job stops with status `provider_limited`, its `error`,
+  `retry_after` and `daily`, keeping the suggestions and counts made so far.
+  `suggest_tasks` takes `wait_on_rate_limit` (off for API requests, which
+  never sleep).
+
+### Changed
+
+- A free shared model is metered but not capped: `call_metered` records its
+  tokens without checking the remaining monthly budget, and a meter that
+  cannot record is logged without failing the call. The estimates, including
+  `POST .../seed-estimate`, are always `within_budget` for a free model.
+
 ## [0.23.0] - 2026-11-27
 
 ### Added

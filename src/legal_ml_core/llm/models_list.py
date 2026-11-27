@@ -439,8 +439,62 @@ def _name(entry):
     return None
 
 
+# OpenRouter's request allowance for ``:free`` models: 50 a day, or 1000 a day
+# once the account has bought $10 of credit (``is_free_tier`` false).
+# https://openrouter.ai/docs/api-reference/limits
+FREE_TIER_DAILY_REQUESTS = 50
+PAID_TIER_DAILY_REQUESTS = 1000
+KEY_CHECK_TIMEOUT_SECONDS = 5
+
+
+def _host(base_url):
+    """The hostname to compare: lowercase, without a trailing dot."""
+    try:
+        return (urlsplit((base_url or "").rstrip("/")).hostname or "").lower().rstrip(".")
+    except ValueError:
+        return ""
+
+
+def is_free_model(base_url, model):
+    """True only for an OpenRouter model whose id ends in ``:free``.
+
+    No other provider says which of its models cost nothing, so every other
+    model counts as paid.
+    """
+    if not isinstance(base_url, str) or not isinstance(model, str):
+        return False
+    return _host(base_url) == OPENROUTER_HOST and model.strip().endswith(":free")
+
+
+def openrouter_daily_limit(base_url, api_key):
+    """Requests a day OpenRouter allows this key on free models.
+
+    Asks ``GET {base_url}/key``: ``data.is_free_tier`` true means 50, false
+    1000. Any failure gives 50, the lower figure. ``limit_remaining`` there is
+    dollars of credit, not requests, so it isn't used.
+    """
+    if not isinstance(base_url, str) or not isinstance(api_key, str) or not api_key:
+        return FREE_TIER_DAILY_REQUESTS
+    base_url = base_url.rstrip("/")
+    deadline = monotonic() + min(timeout_seconds(), KEY_CHECK_TIMEOUT_SECONDS)
+    raw = None
+    try:
+        raw = _fetch(f"{base_url}/key", _headers(_host(base_url), api_key), deadline)
+    except Exception:  # best effort: any failure is the lower figure
+        return FREE_TIER_DAILY_REQUESTS
+    try:
+        data = json.loads(raw).get("data")
+    except (ValueError, RecursionError, AttributeError):
+        return FREE_TIER_DAILY_REQUESTS
+    if isinstance(data, dict) and data.get("is_free_tier") is False:
+        return PAID_TIER_DAILY_REQUESTS
+    return FREE_TIER_DAILY_REQUESTS
+
+
 def list_chat_models(base_url, api_key):
-    """``[{id, name?}]`` sorted by id, or raise ``ModelListError``.
+    """``[{id, name?, free?}]`` sorted by id, or raise ``ModelListError``.
+
+    ``free`` is there, and true, only for a model ``is_free_model`` says is free.
 
     The caller has already passed ``base_url`` through ``validate_byok_url``.
     """
@@ -471,5 +525,7 @@ def list_chat_models(base_url, api_key):
         name = _name(entry)
         if name and name != model_id and api_key not in name:
             model["name"] = name
+        if is_free_model(base_url, model_id):
+            model["free"] = True
         models[model_id] = model
     return [models[i] for i in sorted(models)]
