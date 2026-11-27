@@ -440,7 +440,8 @@ def _name(entry):
 
 
 # OpenRouter's request allowance for ``:free`` models: 50 a day, or 1000 a day
-# once the account has bought $10 of credit (``is_free_tier`` false).
+# once the account has bought $10 of credit (the key's
+# ``free_model_daily_requests`` says which; ``is_free_tier`` is the fallback).
 # https://openrouter.ai/docs/api-reference/limits
 FREE_TIER_DAILY_REQUESTS = 50
 PAID_TIER_DAILY_REQUESTS = 1000
@@ -455,40 +456,72 @@ def _host(base_url):
         return ""
 
 
+def _is_openrouter_https(base_url):
+    """``https://openrouter.ai/...`` with no user info in the URL."""
+    try:
+        parts = urlsplit(base_url.strip())
+    except ValueError:
+        return False
+    return (
+        parts.scheme.lower() == "https"
+        and "@" not in parts.netloc
+        and _host(base_url.strip()) == OPENROUTER_HOST
+    )
+
+
 def is_free_model(base_url, model):
-    """True only for an OpenRouter model whose id ends in ``:free``.
+    """True only for an OpenRouter model, over https, whose id ends in ``:free``.
 
     No other provider says which of its models cost nothing, so every other
     model counts as paid.
     """
     if not isinstance(base_url, str) or not isinstance(model, str):
         return False
-    return _host(base_url) == OPENROUTER_HOST and model.strip().endswith(":free")
+    return _is_openrouter_https(base_url) and model.strip().endswith(":free")
 
 
-def openrouter_daily_limit(base_url, api_key):
-    """Requests a day OpenRouter allows this key on free models.
+def _count(value):
+    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+        return value
+    return None
 
-    Asks ``GET {base_url}/key``: ``data.is_free_tier`` true means 50, false
-    1000. Any failure gives 50, the lower figure. ``limit_remaining`` there is
-    dollars of credit, not requests, so it isn't used.
+
+def openrouter_free_allowance(base_url, api_key):
+    """``(limit, remaining)``: requests a day OpenRouter allows this key on free models.
+
+    Asks ``GET {base_url}/key``, and only for an https OpenRouter ``base_url``.
+    ``data.free_model_daily_requests`` gives both when there; otherwise
+    ``data.is_free_tier`` true means 50 and false 1000, with ``remaining``
+    None. Any failure gives ``(50, None)``, the lower figure.
+    ``limit_remaining`` there is dollars of credit, not requests.
     """
+    fallback = (FREE_TIER_DAILY_REQUESTS, None)
     if not isinstance(base_url, str) or not isinstance(api_key, str) or not api_key:
-        return FREE_TIER_DAILY_REQUESTS
-    base_url = base_url.rstrip("/")
+        return fallback
+    if not _is_openrouter_https(base_url):
+        return fallback
+    base_url = base_url.strip().rstrip("/")
     deadline = monotonic() + min(timeout_seconds(), KEY_CHECK_TIMEOUT_SECONDS)
-    raw = None
     try:
         raw = _fetch(f"{base_url}/key", _headers(_host(base_url), api_key), deadline)
     except Exception:  # best effort: any failure is the lower figure
-        return FREE_TIER_DAILY_REQUESTS
+        return fallback
     try:
         data = json.loads(raw).get("data")
     except (ValueError, RecursionError, AttributeError):
-        return FREE_TIER_DAILY_REQUESTS
-    if isinstance(data, dict) and data.get("is_free_tier") is False:
-        return PAID_TIER_DAILY_REQUESTS
-    return FREE_TIER_DAILY_REQUESTS
+        return fallback
+    if not isinstance(data, dict):
+        return fallback
+    requests = data.get("free_model_daily_requests")
+    if isinstance(requests, dict):
+        limit, remaining = _count(requests.get("limit")), _count(requests.get("remaining"))
+        if limit is not None:
+            return limit, remaining
+    if data.get("is_free_tier") is False:
+        return PAID_TIER_DAILY_REQUESTS, None
+    if data.get("is_free_tier") is True:
+        return FREE_TIER_DAILY_REQUESTS, None
+    return fallback
 
 
 def list_chat_models(base_url, api_key):

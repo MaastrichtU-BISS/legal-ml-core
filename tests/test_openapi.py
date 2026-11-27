@@ -98,7 +98,13 @@ def test_spec_patch_llm_key_takes_only_a_model():
 
 def test_spec_describes_free_models_and_provider_limits():
     schemas = _load_spec()["components"]["schemas"]
-    assert {"free_model", "provider_daily_limit", "over_provider_limit"} <= set(
+    assert {
+        "free_model",
+        "provider_daily_limit",
+        "provider_daily_remaining",
+        "provider_allowance_shared",
+        "over_provider_limit",
+    } <= set(
         schemas["LlmEstimate"]["properties"]
     )
     assert set(schemas["LlmProviderRateLimited"]["required"]) == {

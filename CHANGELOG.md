@@ -13,31 +13,47 @@ While the version is 0.x, minor releases may contain breaking changes.
 ### Added
 
 - Free models (BAIGLE #225). `is_free_model(base_url, model)` is true only for
-  an OpenRouter model whose id ends in `:free`; every other provider counts as
-  paid. `free_model_for(owner_id, claims)` answers the same for the model
+  an OpenRouter model, over https with no user info in the URL, whose id ends
+  in `:free`; every other provider counts as paid. A shared endpoint whose
+  `extra_body` has a `route`, or `models` naming any id that isn't free, isn't
+  free either, since OpenRouter may then bill a paid fallback.
+  `free_model_for(owner_id, claims)` answers the same for the model
   `resolve_credential` would pick, from the saved key's row or the shared
   endpoint, without decrypting the key, and never raises (False on any
-  error), for the host's rate limiter. Both are exported from `legal_ml_core`.
+  error, after rolling the session back), for the host's rate limiter. Both
+  are exported from `legal_ml_core`.
 - `POST /api/llm/models` marks a free model with `"free": true`.
 - `GET /api/llm/status` adds `free_model`.
 - `POST .../annotate/estimate`, and the `estimate` in the 202 of
-  `POST .../annotate`, add `free_model`, `provider_daily_limit` and
-  `over_provider_limit`. For a free OpenRouter model `GET {base_url}/key` is
-  asked with the credential's key: `is_free_tier` true means 50 requests a
-  day, false 1000, and a failed lookup 50. Other models get null and `/key` is
-  not asked. `over_provider_limit` only warns: no job is refused on it.
+  `POST .../annotate`, add `free_model`, `provider_daily_limit`,
+  `provider_daily_remaining`, `provider_allowance_shared` (true on the shared
+  key, whose allowance all users share) and `over_provider_limit`. For a free
+  OpenRouter model `GET {base_url}/key` is asked with the credential's key,
+  and only of an https OpenRouter URL: `free_model_daily_requests.limit` and
+  `.remaining` when given, else `is_free_tier` true means 50 requests a day
+  and false 1000; a failed lookup is 50. Other models get null and `/key` is
+  not asked; neither does the LLM seed, which only needs `within_budget`.
+  `over_provider_limit` compares the tasks with the remaining requests when
+  known, else the limit, and only warns: no job is refused on it.
+- `LLMJobStatus` in `queue_contract` adds `waiting_seconds`, `retry_after` and
+  `daily`, and the `provider_limited` status.
 - A provider's 429 raises `ProviderRateLimited(retry_after, daily)`, read from
-  `Retry-After` (seconds or an HTTP date), then `X-RateLimit-Reset` (epoch
-  seconds, or milliseconds over 1e12), then the same keys in the body's
-  `error.metadata.headers`, as OpenRouter sends them. It is daily when the
-  message says per day or the reset is more than 15 minutes away. The LLM
+  `Retry-After` (seconds or an HTTP date, UTC when it has no zone), then
+  `X-RateLimit-Reset` (a delta in seconds below 1e9, epoch milliseconds from
+  1e12, epoch seconds between), then the same keys in the body's
+  `error.metadata.headers`, as OpenRouter sends them. A value that can't be
+  read, is negative or names no wait is absent; `retry_after` is at most a
+  week. It is daily when the message names a `per-day` limit, or, for a free
+  model, when `X-RateLimit-Limit` is over 20 (the per-minute allowance); never
+  from how far away the reset is. The LLM
   routes answer it with 429, `code: provider_rate_limited`, `retry_after`,
   `daily` and a `Retry-After` header when known, in plain words; the
   provider's body is never shown.
 - The annotation worker waits out a per-minute limit (Retry-After, else 20 s,
-  at most 120 s, at most 3 times per item), showing `waiting_seconds` in the
-  job status, and retries the item. On a daily limit, or after the third
-  wait, the job stops with status `provider_limited`, its `error`,
+  at most 3 times per item), showing `waiting_seconds` in the job status, and
+  retries the item. On a daily limit, a Retry-After over 120 s (a retry
+  before then would fail and spend the free daily allowance), or after the
+  third wait, the job stops at once with status `provider_limited`, its `error`,
   `retry_after` and `daily`, keeping the suggestions and counts made so far.
   `suggest_tasks` takes `wait_on_rate_limit` (off for API requests, which
   never sleep).
@@ -46,7 +62,8 @@ While the version is 0.x, minor releases may contain breaking changes.
 
 - A free shared model is metered but not capped: `call_metered` records its
   tokens without checking the remaining monthly budget, and a meter that
-  cannot record is logged without failing the call. The estimates, including
+  cannot record is logged, and the session rolled back, without failing the
+  call. The estimates, including
   `POST .../seed-estimate`, are always `within_budget` for a free model.
 
 ## [0.23.0] - 2026-11-27

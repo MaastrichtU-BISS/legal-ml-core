@@ -224,3 +224,27 @@ def test_a_dataset_without_named_labels_cannot_have_an_llm_seed(client, app, hea
 
     assert resp.status_code == 400
     assert "labels" in resp.get_json()["error"]
+
+
+def test_an_llm_seed_on_a_free_model_never_asks_for_the_providers_allowance(
+    client, app, headers, dataset_id, fake_redis, monkeypatch
+):
+    # The seed only needs within_budget; seed-estimate's response is unchanged.
+    from legal_ml_core.routes import llm as llm_routes
+
+    asked = []
+    monkeypatch.setattr(
+        llm_routes, "openrouter_free_allowance", lambda *a: asked.append(a) or (50, None)
+    )
+    app.config["LLM_SHARED_ENDPOINT"] = {
+        **app.config["LLM_SHARED_ENDPOINT"],
+        "base_url": "https://openrouter.ai/api/v1",
+        "model": "meta-llama/llama-3.3-70b-instruct:free",
+    }
+    _ack(client, headers, dataset_id)
+
+    resp = _start_llm_seed(client, headers, dataset_id)
+
+    assert resp.status_code == 201, resp.get_json()
+    assert len(_queued(fake_redis)) == 1
+    assert asked == []

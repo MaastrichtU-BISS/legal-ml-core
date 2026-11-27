@@ -2042,10 +2042,11 @@ paths:
       summary: Status of a standalone annotation job
       description: >-
         On a provider's per-minute limit the worker waits (for its Retry-After,
-        else 20 s, at most 120 s, and at most 3 times per item) and carries on;
+        else 20 s, and at most 3 times per item) and carries on;
         `waiting_seconds` says how long while it waits and is null otherwise.
-        On the provider's daily allowance, or after the third wait, the job
-        stops with `provider_limited`, keeping its work and its counts.
+        On the provider's daily allowance, a Retry-After over 120 s, or after
+        the third wait, the job stops at once with `provider_limited`, keeping
+        its work and its counts.
       operationId: getLlmJob
       responses:
         "200":
@@ -2233,12 +2234,17 @@ components:
         retry_after:
           type: [integer, "null"]
           minimum: 1
-          description: Seconds until the provider allows more, when it said.
+          maximum: 604800
+          description: >-
+            Seconds until the provider allows more, when it said (Retry-After,
+            else X-RateLimit-Reset), at most a week.
         daily:
           type: boolean
           description: >-
-            True when the provider's daily allowance is used up (its message
-            says per day, or the reset is more than 15 minutes away).
+            True when the provider's daily allowance is used up: its message
+            names a `per-day` limit, or, for a free OpenRouter model, its
+            X-RateLimit-Limit is over the 20 a minute. Never judged from how far
+            away the reset is.
     LlmEstimate:
       type: object
       properties:
@@ -2254,12 +2260,26 @@ components:
           type: [integer, "null"]
           description: >-
             For a free OpenRouter model, the requests a day OpenRouter allows
-            this key: 50 on the free tier, 1000 once $10 of credit has been
-            bought (from `GET {base_url}/key`, 50 when that can't be asked).
-            Null for any other model.
+            this key on free models, from `GET {base_url}/key`:
+            `free_model_daily_requests.limit` when given, else 50 when
+            `is_free_tier` is true and 1000 when false, and 50 when that can't
+            be asked. Null for any other model.
+        provider_daily_remaining:
+          type: [integer, "null"]
+          description: >-
+            For a free OpenRouter model, the requests left today
+            (`free_model_daily_requests.remaining`), when the provider says.
+            Null otherwise.
+        provider_allowance_shared:
+          type: boolean
+          description: >-
+            True on the platform's shared key: its daily allowance belongs to
+            the platform's account and is shared by every user.
         over_provider_limit:
           type: boolean
-          description: More tasks than `provider_daily_limit`. A warning only; nothing is refused on it.
+          description: >-
+            More tasks than `provider_daily_remaining` when known, else than
+            `provider_daily_limit`. A warning only; nothing is refused on it.
     SummaryStatus:
       type: object
       properties:

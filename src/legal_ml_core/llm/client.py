@@ -7,14 +7,19 @@ the output is validated by prompts.parse_suggestion instead.
 
 import math
 import time
+from datetime import timezone
 from email.utils import parsedate_to_datetime
 
 import requests
 
 from .config import int_setting
+from .models_list import is_free_model
 
-# A reset further away than this is a daily allowance, not a per-minute one.
-DAILY_THRESHOLD_SECONDS = 15 * 60
+# OpenRouter allows a free model 20 requests a minute; an X-RateLimit-Limit
+# above that names the daily allowance (50 or 1000) that was hit.
+FREE_PER_MINUTE_REQUESTS = 20
+# No provider wait is reported as longer than this.
+MAX_RETRY_AFTER_SECONDS = 7 * 24 * 3600
 
 
 class LLMError(Exception):
@@ -79,49 +84,80 @@ def _header(headers, name):
     return None
 
 
-def _seconds_until(value, now, parse_date):
-    """Seconds from ``now`` that ``value`` names, or None when it names none."""
-    if isinstance(value, (int, float)) and not isinstance(value, bool):
+def _number(value):
+    """``value`` as a finite float, or None. Any conversion failure is None."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, str):
+        value = value.strip()
+        if not value:
+            return None
+    elif not isinstance(value, (int, float)):
+        return None
+    try:
         number = float(value)
-    elif isinstance(value, str) and value.strip():
-        text = value.strip()
-        try:
-            number = float(text)
-        except ValueError:
-            if not parse_date:
-                return None
-            try:
-                when = parsedate_to_datetime(text)
-            except (TypeError, ValueError, IndexError):
-                return None
-            if when is None:
-                return None
-            return when.timestamp() - now
-    else:
+    except (ValueError, TypeError, OverflowError):
         return None
-    if not math.isfinite(number):
+    return number if math.isfinite(number) else None
+
+
+def _retry_after_wait(value, now):
+    """Seconds ``Retry-After`` names: a non-negative number, or an HTTP date."""
+    number = _number(value)
+    if number is not None:
+        return number if number >= 0 else None
+    if not isinstance(value, str) or not value.strip():
         return None
-    return number
+    try:
+        when = parsedate_to_datetime(value.strip())
+    except (TypeError, ValueError, IndexError, OverflowError):
+        return None
+    if when is None:
+        return None
+    if when.tzinfo is None:  # ``-0000`` parses naive; HTTP dates are UTC
+        when = when.replace(tzinfo=timezone.utc)
+    try:
+        return when.timestamp() - now
+    except (OverflowError, ValueError, OSError):
+        return None
 
 
 def _reset_wait(value, now):
-    """``X-RateLimit-Reset`` is an epoch time: milliseconds when over 1e12."""
-    number = _seconds_until(value, now, parse_date=False)
+    """``X-RateLimit-Reset``: a delta in seconds below 1e9, epoch milliseconds
+    from 1e12, epoch seconds in between."""
+    number = _number(value)
     if number is None:
         return None
-    epoch = number / 1000 if number > 1e12 else number
-    return epoch - now
+    if number < 1e9:
+        return number
+    if number >= 1e12:
+        return number / 1000 - now
+    return number - now
+
+
+def _positive(wait):
+    return wait if wait is not None and wait > 0 else None
 
 
 def _wait_from(headers, now):
-    wait = _seconds_until(_header(headers, "retry-after"), now, parse_date=True)
+    wait = _positive(_retry_after_wait(_header(headers, "retry-after"), now))
     if wait is None:
-        wait = _reset_wait(_header(headers, "x-ratelimit-reset"), now)
+        wait = _positive(_reset_wait(_header(headers, "x-ratelimit-reset"), now))
     return wait
 
 
-def parse_rate_limit(response, now=None):
-    """A ``ProviderRateLimited`` for a 429 ``response``. The body is only read, never shown."""
+def _limit_from(headers):
+    number = _number(_header(headers, "x-ratelimit-limit"))
+    return int(number) if number is not None and number.is_integer() else None
+
+
+def parse_rate_limit(response, now=None, free=False):
+    """A ``ProviderRateLimited`` for a 429 ``response``. The body is only read, never shown.
+
+    Daily when the message names OpenRouter's ``...-per-day`` limit, or, for a
+    free model (``free``), when ``X-RateLimit-Limit`` is over the per-minute
+    allowance. Never by how far away the reset is.
+    """
     now = time.time() if now is None else now
     try:
         payload = response.json()
@@ -132,16 +168,19 @@ def parse_rate_limit(response, now=None):
     message = error.get("message") if isinstance(error.get("message"), str) else ""
     metadata = error.get("metadata") if isinstance(error.get("metadata"), dict) else {}
     body_headers = metadata.get("headers") if isinstance(metadata.get("headers"), dict) else {}
+    response_headers = getattr(response, "headers", None)
 
-    wait = _wait_from(getattr(response, "headers", None), now)
+    wait = _wait_from(response_headers, now)
     if wait is None:
         wait = _wait_from(body_headers, now)
-    retry_after = max(1, math.ceil(wait)) if wait is not None else None
-    lowered = message.lower()
-    daily = (
-        "per-day" in lowered
-        or "per day" in lowered
-        or (retry_after is not None and retry_after > DAILY_THRESHOLD_SECONDS)
+    retry_after = (
+        min(max(1, math.ceil(wait)), MAX_RETRY_AFTER_SECONDS) if wait is not None else None
+    )
+    limit = _limit_from(response_headers)
+    if limit is None:
+        limit = _limit_from(body_headers)
+    daily = "per-day" in message.lower() or (
+        free and limit is not None and limit > FREE_PER_MINUTE_REQUESTS
     )
     return ProviderRateLimited(retry_after, daily)
 
@@ -182,7 +221,7 @@ class OpenAICompatibleClient:
         if response.status_code in (401, 403):
             raise LLMError("The LLM service rejected the API key.")
         if response.status_code == 429:
-            raise parse_rate_limit(response)
+            raise parse_rate_limit(response, free=is_free_model(self.base_url, self.model))
         if response.status_code != 200:
             raise LLMError("The LLM service returned an error.")
 

@@ -12,11 +12,10 @@ import uuid
 from ..db import db
 from ..models import AnnotationTask, Dataset, LLMPrompt, LLMSuggestion
 from ..queue_contract import LLM_JOB_STATUS_TTL_SECONDS, llm_job_status_key
-from .access import CredentialError, credential_for_mode
+from .access import CredentialError, credential_for_mode, free_without_paid_fallback
 from .client import LLMError, ProviderRateLimited, estimate_tokens
 from .config import int_setting
 from .metering import usage_meter
-from .models_list import is_free_model
 from .prompts import (
     DEFAULT_TEMPLATE,
     MAX_EXAMPLES,
@@ -35,7 +34,7 @@ METER_DOWN_MESSAGE = (
 
 # A worker job waits out a provider's per-minute limit this many times per
 # item, for the provider's Retry-After (or DEFAULT_WAIT_SECONDS), at most
-# MAX_WAIT_SECONDS each time, before it gives up.
+# MAX_WAIT_SECONDS each time (a longer one is given up at once), before it gives up.
 MAX_WAITS_PER_ITEM = 3
 DEFAULT_WAIT_SECONDS = 20
 MAX_WAIT_SECONDS = 120
@@ -49,7 +48,10 @@ class BudgetExhausted(Exception):
 
 
 def is_free_credential(credential):
-    return credential is not None and is_free_model(credential.base_url, credential.model)
+    """A free model with no paid fallback (see ``access.free_without_paid_fallback``)."""
+    return credential is not None and free_without_paid_fallback(
+        credential.base_url, credential.model, getattr(credential, "extra_body", None)
+    )
 
 
 def current_prompt(dataset):
@@ -131,24 +133,33 @@ def call_metered(credential, owner_id, messages):
         logger.exception("usage meter record failed")
         if not free:
             raise LLMError(METER_DOWN_MESSAGE)
+        # The failed record may leave the session needing a rollback; without
+        # one the suggestion's own commit would fail.
+        try:
+            db.session.rollback()
+        except Exception:
+            logger.exception("rollback after a failed usage record failed")
     return content
 
 
 def _call_waiting(credential, owner_id, messages, on_wait):
     """``call_metered``, waiting out a provider's per-minute limit.
 
-    Waits at most ``MAX_WAITS_PER_ITEM`` times; a daily limit, or one more 429
-    after that, is raised.
+    Waits at most ``MAX_WAITS_PER_ITEM`` times; a daily limit, a wait known to
+    be longer than ``MAX_WAIT_SECONDS``, or one more 429 after the last wait, is
+    raised at once. A retry that is sure to fail would only spend the free
+    model's daily allowance.
     """
     waits = 0
     while True:
         try:
             return call_metered(credential, owner_id, messages)
         except ProviderRateLimited as exc:
-            if exc.daily or waits >= MAX_WAITS_PER_ITEM:
+            too_long = exc.retry_after is not None and exc.retry_after > MAX_WAIT_SECONDS
+            if exc.daily or too_long or waits >= MAX_WAITS_PER_ITEM:
                 raise
             waits += 1
-            seconds = min(exc.retry_after or DEFAULT_WAIT_SECONDS, MAX_WAIT_SECONDS)
+            seconds = exc.retry_after or DEFAULT_WAIT_SECONDS
             if on_wait:
                 on_wait(seconds)
             _sleep(seconds)

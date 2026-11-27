@@ -183,12 +183,16 @@ class LLMAnnotationTaskPayload(TypedDict):
 
 class LLMJobStatus(TypedDict, total=False):
     owner_id: str
-    status: str  # "queued" | "running" | "completed" | "failed" | "budget_exhausted"
+    # "queued" | "running" | "completed" | "failed" | "budget_exhausted" | "provider_limited"
+    status: str
     total: int
     done: int
     created: int
     invalid: int
     error: str
+    waiting_seconds: Optional[int]  # set while waiting out a provider's per-minute limit
+    retry_after: Optional[int]  # provider_limited: seconds until it may work again, if known
+    daily: bool  # provider_limited: the provider's daily allowance is used up
 
 
 class SummarizationTaskPayload(TypedDict):

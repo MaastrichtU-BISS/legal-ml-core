@@ -24,7 +24,7 @@ from ..llm.models_list import (
     MESSAGES as LISTING_MESSAGES,
     ModelListError,
     list_chat_models,
-    openrouter_daily_limit,
+    openrouter_free_allowance,
 )
 from ..llm.prompts import (
     PromptRejected,
@@ -708,15 +708,25 @@ def _shared_remaining(credential, free):
         return None
 
 
-def _estimate(dataset, credential, task_ids):
-    """The job's size and cost. ``over_provider_limit`` only warns: nothing refuses on it."""
+def _estimate(dataset, credential, task_ids, provider_allowance=True):
+    """The job's size and cost. ``over_provider_limit`` only warns: nothing refuses on it.
+
+    ``provider_allowance`` False skips asking the provider for a free model's
+    daily allowance (the seed only needs ``within_budget``).
+    """
     tasks = _pending_tasks(dataset, task_ids)
     estimated = estimate_job_tokens(dataset, tasks)
     free = is_free_credential(credential)
     remaining = _shared_remaining(credential, free)
-    daily_limit = (
-        openrouter_daily_limit(credential.base_url, credential.api_key) if free else None
-    )
+    daily_limit = daily_remaining = None
+    if free and provider_allowance:
+        daily_limit, daily_remaining = openrouter_free_allowance(
+            credential.base_url, credential.api_key
+        )
+    if daily_remaining is not None:
+        over = len(tasks) > daily_remaining
+    else:
+        over = daily_limit is not None and len(tasks) > daily_limit
     return tasks, {
         "tasks": len(tasks),
         "estimated_tokens": estimated,
@@ -725,7 +735,10 @@ def _estimate(dataset, credential, task_ids):
         "destination": credential.destination,
         "free_model": free,
         "provider_daily_limit": daily_limit,
-        "over_provider_limit": daily_limit is not None and len(tasks) > daily_limit,
+        "provider_daily_remaining": daily_remaining,
+        # The shared key's allowance is the platform's, shared by every user.
+        "provider_allowance_shared": credential.mode == "shared",
+        "over_provider_limit": over,
     }
 
 

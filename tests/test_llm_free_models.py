@@ -63,7 +63,9 @@ def test_retry_after_in_seconds():
 
 def test_retry_after_is_rounded_up_and_at_least_one():
     assert parse_rate_limit(Limited({"retry-after": "2.1"}), now=NOW).retry_after == 3
-    assert parse_rate_limit(Limited({"Retry-After": "0"}), now=NOW).retry_after == 1
+    assert parse_rate_limit(Limited({"Retry-After": "0.2"}), now=NOW).retry_after == 1
+    # A wait of nothing names no wait: the caller's default applies.
+    assert parse_rate_limit(Limited({"Retry-After": "0"}), now=NOW).retry_after is None
 
 
 def test_retry_after_as_an_http_date():
@@ -104,9 +106,66 @@ def test_a_per_day_message_is_daily():
     )
 
 
-def test_a_reset_more_than_fifteen_minutes_away_is_daily():
-    assert parse_rate_limit(Limited({"Retry-After": "901"}), now=NOW).daily is True
-    assert parse_rate_limit(Limited({"Retry-After": "900"}), now=NOW).daily is False
+def test_a_far_reset_alone_is_not_daily():
+    exc = parse_rate_limit(Limited({"Retry-After": "3600"}, _openrouter_body()), now=NOW)
+    assert (exc.retry_after, exc.daily) == (3600, False)
+
+
+def test_the_prose_per_day_is_not_the_limit_name():
+    body = _openrouter_body("You may send 50 requests per day")
+    assert parse_rate_limit(Limited(body=body), now=NOW).daily is False
+
+
+@pytest.mark.parametrize(
+    "limit, free, daily",
+    [("50", True, True), ("1000", True, True), ("20", True, False), ("1000", False, False)],
+)
+def test_a_free_models_limit_header_names_the_allowance_hit(limit, free, daily):
+    # OpenRouter's real body: the message doesn't say which limit.
+    body = _openrouter_body("Rate limit exceeded", {"X-RateLimit-Limit": limit})
+    assert parse_rate_limit(Limited(body=body), now=NOW, free=free).daily is daily
+    in_headers = Limited({"X-RateLimit-Limit": limit}, _openrouter_body("Rate limit exceeded"))
+    assert parse_rate_limit(in_headers, now=NOW, free=free).daily is daily
+
+
+def test_the_client_says_whether_its_model_is_free(monkeypatch):
+    answer = Limited({"X-RateLimit-Limit": "50"}, _openrouter_body("Rate limit exceeded"))
+    monkeypatch.setattr(llm_client.requests, "post", lambda *a, **k: answer)
+    for model, daily in ((FREE, True), ("paid/model", False)):
+        with pytest.raises(ProviderRateLimited) as caught:
+            llm_client.OpenAICompatibleClient(OPENROUTER, "k", model).chat(
+                [{"role": "user", "content": "hi"}]
+            )
+        assert caught.value.daily is daily
+
+
+def test_a_huge_number_in_the_body_is_absent():
+    body = _openrouter_body(headers={"Retry-After": 10**400, "X-RateLimit-Limit": 10**400})
+    exc = parse_rate_limit(Limited(body=body), now=NOW, free=True)
+    assert (exc.retry_after, exc.daily) == (None, False)
+
+
+def test_a_very_long_wait_is_capped_at_a_week():
+    exc = parse_rate_limit(Limited({"Retry-After": "1e50"}), now=NOW)
+    assert exc.retry_after == 7 * 24 * 3600
+
+
+def test_a_negative_retry_after_is_absent_and_the_reset_is_used():
+    exc = parse_rate_limit(Limited({"Retry-After": "-5", "X-RateLimit-Reset": "60"}), now=NOW)
+    assert exc.retry_after == 60  # a small reset is a delta in seconds
+
+
+def test_a_past_reset_falls_back_to_the_body():
+    body = _openrouter_body(headers={"Retry-After": "30"})
+    exc = parse_rate_limit(Limited({"X-RateLimit-Reset": str(int(NOW - 10))}, body), now=NOW)
+    assert exc.retry_after == 30
+    assert parse_rate_limit(Limited({"X-RateLimit-Reset": str(int(NOW - 10))}), now=NOW).retry_after is None
+
+
+def test_an_http_date_without_a_zone_is_utc():
+    when = datetime.fromtimestamp(NOW + 300, tz=timezone.utc)
+    text = when.strftime("%a, %d %b %Y %H:%M:%S -0000")
+    assert parse_rate_limit(Limited({"Retry-After": text}), now=NOW).retry_after == 300
 
 
 def test_an_unknown_reset():
@@ -155,6 +214,8 @@ def test_the_client_raises_the_typed_error(monkeypatch):
         (OPENROUTER, "free/model", False),
         ("https://api.openai.com/v1", "gpt:free", False),
         ("https://openrouter.ai.evil.test/v1", FREE, False),
+        ("http://openrouter.ai/api/v1", FREE, False),
+        ("https://user:pw@openrouter.ai/api/v1", FREE, False),
         (None, FREE, False),
         (OPENROUTER, None, False),
     ],
@@ -196,6 +257,38 @@ def test_free_model_for_never_raises(app, monkeypatch):
     with app.app_context():
         monkeypatch.setattr(type(LLMCredential.query), "filter_by", broken)
         assert free_model_for(TEST_USER_ID, {}) is False
+
+
+def test_free_model_for_rolls_back_a_failed_query(app, monkeypatch):
+    rolled = []
+    with app.app_context():
+        monkeypatch.setattr(
+            type(LLMCredential.query), "filter_by", lambda *a, **k: (_ for _ in ()).throw(RuntimeError())
+        )
+        original = db.session.rollback
+        monkeypatch.setattr(db.session, "rollback", lambda: (rolled.append(1), original()))
+        assert free_model_for(TEST_USER_ID, {}) is False
+    assert rolled == [1]
+
+
+@pytest.mark.parametrize(
+    "extra_body, free",
+    [
+        ({"provider": {"zdr": True}}, True),
+        ({"models": [FREE, "other/model:free"]}, True),
+        ({"models": [FREE, "paid/model"]}, False),
+        ({"route": "fallback"}, False),
+        ({"models": "paid/model"}, False),
+    ],
+)
+def test_a_shared_model_with_a_paid_fallback_is_not_free(client, app, gated, extra_body, free):
+    app.config["LLM_SHARED_ENDPOINT"] = {
+        **app.config["LLM_SHARED_ENDPOINT"], "base_url": OPENROUTER, "model": FREE,
+        "extra_body": extra_body,
+    }
+    assert client.get("/api/llm/status", headers=gated).get_json()["free_model"] is free
+    with app.app_context():
+        assert free_model_for(TEST_USER_ID, {"email": "a@um.test", "email_verified": True}) is free
 
 
 def test_listing_marks_free_models(client, outsider, listing):
@@ -347,6 +440,31 @@ def test_a_free_shared_model_survives_a_meter_that_cannot_record(
     assert _suggest(client, dataset_id, task_ids, gated).status_code == 200
 
 
+def test_a_failed_record_is_rolled_back_so_the_suggestion_is_saved(
+    client, app, gated, provider, free_shared
+):
+    from legal_ml_core import AnnotationTask
+
+    class Poisoning:
+        """Flushes a row that breaks a constraint, leaving the session needing a rollback."""
+
+        def remaining(self, owner_id):
+            return None
+
+        def record(self, owner_id, tokens, key):
+            db.session.add(AnnotationTask(dataset_id=None, text=None))
+            db.session.flush()
+
+    app.config["USAGE_METER"] = Poisoning()
+    dataset_id, task_ids = _dataset(app, tasks=2)
+    _ack(client, dataset_id, gated)
+    resp = _suggest(client, dataset_id, task_ids, gated)
+    assert resp.status_code == 200, resp.get_json()
+    assert len(resp.get_json()["suggestions"]) == 2
+    with app.app_context():
+        assert LLMSuggestion.query.count() == 2
+
+
 def test_a_paid_shared_model_still_stops_at_the_cap(client, app, gated, provider):
     app.config["LLM_MONTHLY_TOKEN_CAP"] = 0
     dataset_id, task_ids = _dataset(app, tasks=1)
@@ -373,16 +491,37 @@ def _estimate(client, dataset_id, headers):
 
 
 @pytest.mark.parametrize(
-    "key_answer, daily_limit",
+    "key_answer, daily_limit, daily_remaining, over",
     [
-        ((200, b'{"data": {"is_free_tier": true, "limit_remaining": 3}}'), 50),
-        ((200, b'{"data": {"is_free_tier": false}}'), 1000),
-        ((500, b"oops"), 50),
-        ((200, b"not json"), 50),
+        ((200, b'{"data": {"is_free_tier": true, "limit_remaining": 3}}'), 50, None, False),
+        ((200, b'{"data": {"is_free_tier": false}}'), 1000, None, False),
+        (
+            (200, b'{"data": {"is_free_tier": true, "free_model_daily_requests": '
+                  b'{"used": 998, "limit": 1000, "remaining": 2}}}'),
+            1000,
+            2,
+            True,
+        ),
+        (
+            (200, b'{"data": {"is_free_tier": true, "free_model_daily_requests": '
+                  b'{"used": 0, "limit": 1000, "remaining": 1000}}}'),
+            1000,
+            1000,
+            False,
+        ),
+        (
+            (200, b'{"data": {"is_free_tier": false, "free_model_daily_requests": '
+                  b'{"limit": -1, "remaining": "x"}}}'),
+            1000,
+            None,
+            False,
+        ),
+        ((500, b"oops"), 50, None, False),
+        ((200, b"not json"), 50, None, False),
     ],
 )
 def test_a_free_model_estimate_names_the_daily_allowance(
-    client, app, gated, listing, free_shared, key_answer, daily_limit
+    client, app, gated, listing, free_shared, key_answer, daily_limit, daily_remaining, over
 ):
     app.config["LLM_MONTHLY_TOKEN_CAP"] = 0
     listing.responses["/key"] = key_answer
@@ -391,7 +530,9 @@ def test_a_free_model_estimate_names_the_daily_allowance(
     assert body["free_model"] is True
     assert body["within_budget"] is True
     assert body["provider_daily_limit"] == daily_limit
-    assert body["over_provider_limit"] is False
+    assert body["provider_daily_remaining"] == daily_remaining
+    assert body["provider_allowance_shared"] is True
+    assert body["over_provider_limit"] is over
     assert [c["url"] for c in listing.calls] == [f"{OPENROUTER}/key"]
     assert listing.calls[0]["headers"]["Authorization"] == "Bearer shared-key"
 
@@ -399,7 +540,19 @@ def test_a_free_model_estimate_names_the_daily_allowance(
 def test_a_failing_key_lookup_is_the_lower_figure(client, app, gated, listing, free_shared):
     listing.error = OSError("unreachable")
     dataset_id, _ = _dataset(app, tasks=1)
-    assert _estimate(client, dataset_id, gated)["provider_daily_limit"] == 50
+    body = _estimate(client, dataset_id, gated)
+    assert (body["provider_daily_limit"], body["provider_daily_remaining"]) == (50, None)
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    ["http://openrouter.ai/api/v1", "https://llm.test/v1", "https://u:p@openrouter.ai/api/v1"],
+)
+def test_the_allowance_is_only_asked_of_openrouter_over_https(listing, base_url):
+    from legal_ml_core.llm.models_list import openrouter_free_allowance
+
+    assert openrouter_free_allowance(base_url, SECRET) == (50, None)
+    assert listing.calls == []
 
 
 def test_a_paid_model_estimate_never_asks_for_the_key(client, app, gated, listing):
@@ -410,6 +563,7 @@ def test_a_paid_model_estimate_never_asks_for_the_key(client, app, gated, listin
         None,
         False,
     )
+    assert body["provider_daily_remaining"] is None
     assert listing.calls == []
 
 
@@ -431,6 +585,8 @@ def test_an_own_free_key_asks_with_its_own_key(client, app, outsider, listing, m
         50,
         True,
     )
+    # An own key's allowance is the user's own, not the platform's.
+    assert body["provider_allowance_shared"] is False
     assert listing.calls[0]["headers"]["Authorization"] == f"Bearer {SECRET}"
 
 
@@ -490,13 +646,15 @@ def test_the_worker_waits_out_a_per_minute_limit_and_carries_on(
     assert body["waiting_seconds"] is None
 
 
-def test_a_long_retry_after_is_capped(client, app, gated, fake_redis, limited, slept):
-    limited.answers = [(429, {"Retry-After": "1000"}, _openrouter_body())]
-    body, _ = _run_job(client, app, gated, fake_redis, tasks=1)
-    # Over 15 minutes reads as daily, so it isn't waited out.
-    assert body["status"] == "provider_limited"
-    assert slept == []
+def test_a_retry_after_too_long_to_wait_stops_at_once(client, app, gated, fake_redis, limited, slept):
     limited.answers = [(429, {"Retry-After": "600"}, _openrouter_body())]
+    body, _ = _run_job(client, app, gated, fake_redis, tasks=1)
+    # Retrying before then is sure to fail, and spends the free daily allowance.
+    assert body["status"] == "provider_limited"
+    assert (body["retry_after"], body["daily"]) == (600, False)
+    assert slept == []
+    assert len(limited.calls) == 1
+    limited.answers = [(429, {"Retry-After": "120"}, _openrouter_body())]
     body, _ = _run_job(client, app, gated, fake_redis, tasks=1)
     assert body["status"] == "completed"
     assert slept == [120]

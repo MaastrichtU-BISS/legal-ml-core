@@ -128,7 +128,13 @@ def _llm_seed_job(dataset, credential):
     # start_loop adds the config without the dataset seeing it yet.
     db.session.flush()
     db.session.refresh(dataset)
-    tasks, estimate = _estimate(dataset, credential, [task.id for task in llm_seed_sample(dataset)])
+    # Only within_budget is used here, so the provider isn't asked for its allowance.
+    tasks, estimate = _estimate(
+        dataset,
+        credential,
+        [task.id for task in llm_seed_sample(dataset)],
+        provider_allowance=False,
+    )
     if not estimate["within_budget"]:
         raise ApiError(
             429,
