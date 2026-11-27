@@ -15,6 +15,7 @@ from ..annotation_queue import (
     TRAINED_ON_LABELS,
     _find_column,
     _rows_needing_label,
+    confirmed_label_counts,
     create_annotation_tasks,
     file_labels,
     read_rows,
@@ -365,17 +366,8 @@ def _current_round(dataset_id):
 
 def _confirmed_label_counts(config):
     """Per class, every label training would use."""
-    rows = (
-        db.session.query(AnnotationTask.annotation_label, db.func.count())
-        .filter(
-            AnnotationTask.dataset_id == config.dataset_id,
-            AnnotationTask.status == "annotated",
-            AnnotationTask.is_holdout.is_(False),
-        )
-        .group_by(AnnotationTask.annotation_label)
-        .all()
-    )
-    return Counter(dict(rows)) + Counter(config.file_label_counts or {})
+    rows = confirmed_label_counts(AnnotationTask.query.filter(AnnotationTask.dataset_id == config.dataset_id))
+    return Counter(rows) + Counter(config.file_label_counts or {})
 
 
 def _labels_at_last_train(dataset_id):

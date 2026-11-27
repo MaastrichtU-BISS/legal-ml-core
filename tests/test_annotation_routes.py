@@ -175,3 +175,99 @@ def test_reset_leaves_other_users_tasks_untouched(client, auth_headers, app):
         f"/api/annotation/projects/{project_id}/queue/stats", headers=_headers_for(OTHER_USER_ID)
     )
     assert resp.get_json()["stats"]["annotated"] == 2
+
+
+def _add_tasks(app, dataset_id, rows):
+    """Add tasks to ``dataset_id``: one per (status, label, is_holdout) row."""
+    with app.app_context():
+        start = db.session.query(db.func.count()).filter(AnnotationTask.dataset_id == dataset_id).scalar()
+        for offset, (status, label, holdout) in enumerate(rows):
+            db.session.add(
+                AnnotationTask(
+                    dataset_id=dataset_id,
+                    item_index=start + offset,
+                    text=f"item {start + offset}",
+                    status=status,
+                    annotation_label=label,
+                    is_holdout=holdout,
+                )
+            )
+        db.session.commit()
+
+
+def _stats(client, project_id, headers, dataset_id=None):
+    url = f"/api/annotation/projects/{project_id}/queue/stats"
+    if dataset_id is not None:
+        url += f"?dataset_id={dataset_id}"
+    resp = client.get(url, headers=headers)
+    assert resp.status_code == 200
+    return resp.get_json()["stats"]
+
+
+def test_queue_stats_count_confirmed_labels_per_label_in_one_query(client, auth_headers, app):
+    from sqlalchemy import event
+
+    project_id, dataset_id, _ = _make_project_and_dataset(app, project_id="proj-a")
+    _add_tasks(app, dataset_id, [
+        ("annotated", "positive", False),
+        ("annotated", "positive", False),
+        ("annotated", "negative", False),
+        # Held out, pending, skipped and blank-labelled rows count nothing.
+        ("annotated", "positive", True),
+        ("annotated", "neutral", True),
+        ("pending", "negative", False),
+        ("skipped", "negative", False),
+        ("annotated", "", False),
+        ("annotated", "   ", False),
+        ("annotated", "\t\n", False),
+        ("annotated", None, False),
+    ])
+    # Another of the caller's Datasets on the same project does not count.
+    _, other_dataset_id, _ = _make_project_and_dataset(app, project_id="proj-a")
+    _add_tasks(app, other_dataset_id, [("annotated", "positive", False), ("annotated", "other", False)])
+
+    with app.app_context():
+        engine = db.engine
+    statements = []
+
+    def record(conn, cursor, statement, *args):
+        statements.append(statement)
+
+    event.listen(engine, "before_cursor_execute", record)
+    try:
+        stats = _stats(client, project_id, auth_headers, dataset_id)
+    finally:
+        event.remove(engine, "before_cursor_execute", record)
+
+    assert stats["label_counts"] == {"positive": 2, "negative": 1}
+    grouped = [s for s in statements if "GROUP BY" in s.upper()]
+    assert len(grouped) == 1
+    # The project-wide counts keep their meaning: they are not scoped to the Dataset.
+    assert stats["total"] == 1 + 11 + 1 + 2
+    assert stats["annotated"] == 9 + 2
+
+
+def test_queue_stats_without_dataset_id_have_no_label_counts(client, auth_headers, app):
+    project_id, dataset_id, _ = _make_project_and_dataset(app, project_id="proj-a")
+    _add_tasks(app, dataset_id, [("annotated", "positive", False)])
+
+    assert _stats(client, project_id, auth_headers) == {
+        "total": 2,
+        "pending": 1,
+        "annotated": 1,
+        "skipped": 0,
+        "percentage_complete": 50,
+    }
+
+
+def test_queue_stats_label_counts_empty_for_unowned_or_off_project_dataset(client, auth_headers, app):
+    project_id, _, _ = _make_project_and_dataset(app, project_id="proj-a")
+    foreign_dataset_id = _foreign_dataset_on_project(app, project_id)
+    _add_tasks(app, foreign_dataset_id, [("annotated", "positive", False)])
+    _, off_project_dataset_id, _ = _make_project_and_dataset(app, project_id="proj-b")
+    _add_tasks(app, off_project_dataset_id, [("annotated", "positive", False)])
+
+    for dataset_id in (foreign_dataset_id, off_project_dataset_id, "no-such-dataset"):
+        stats = _stats(client, project_id, auth_headers, dataset_id)
+        assert stats["label_counts"] == {}
+        assert stats["total"] == 1
