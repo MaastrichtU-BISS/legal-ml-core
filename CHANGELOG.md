@@ -8,6 +8,8 @@ While the version is 0.x, minor releases may contain breaking changes.
 
 ## [Unreleased]
 
+## [0.22.2] - 2026-11-27
+
 ### Added
 
 - `GET /annotation/projects/<id>/queue/stats?dataset_id=<id>` adds
@@ -774,7 +776,8 @@ version was not tagged; it corresponds to commit `02c5b61`.
 - Worker foreign-key resolution and the missing `psycopg2` dependency.
 - Model/task compatibility checks, live progress and failure reasons.
 
-[Unreleased]: https://github.com/shashankmc/legal-ml-core/compare/v0.22.1...HEAD
+[Unreleased]: https://github.com/shashankmc/legal-ml-core/compare/v0.22.2...HEAD
+[0.22.2]: https://github.com/shashankmc/legal-ml-core/compare/v0.22.1...v0.22.2
 [0.22.1]: https://github.com/shashankmc/legal-ml-core/compare/v0.22.0...v0.22.1
 [0.22.0]: https://github.com/shashankmc/legal-ml-core/compare/v0.21.0...v0.22.0
 [0.21.0]: https://github.com/shashankmc/legal-ml-core/compare/v0.20.0...v0.21.0
