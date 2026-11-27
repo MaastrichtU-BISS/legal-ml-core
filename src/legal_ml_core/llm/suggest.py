@@ -65,7 +65,8 @@ def confirmed_examples(dataset):
         for (label,) in confirmed.with_entities(AnnotationTask.annotation_label).distinct()
         if label is not None
     }
-    named = [label for label in (dataset.labels or []) if label in used]
+    # Each label once, in the Dataset's order: a label named twice would give its items twice.
+    named = [label for label in dict.fromkeys(dataset.labels or []) if label in used]
     labels = named + sorted(used - set(named))
     per_label = [
         confirmed.filter(AnnotationTask.annotation_label == label)

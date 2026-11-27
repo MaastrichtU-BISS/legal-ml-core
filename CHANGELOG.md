@@ -8,6 +8,12 @@ While the version is 0.x, minor releases may contain breaking changes.
 
 ## [Unreleased]
 
+### Fixed
+
+- A Dataset that names a label twice no longer gives that label's items twice
+  among a suggestion's worked examples (BAIGLE #211): each label is taken once,
+  in the order the Dataset first names it.
+
 ## [0.22.1] - 2026-11-26
 
 ### Fixed

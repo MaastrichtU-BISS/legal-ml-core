@@ -961,6 +961,23 @@ def test_worked_examples_take_one_per_label_before_a_second_of_any(
     assert [label for _, label in examples] == ["a", "b", "c", "d", "e"]
 
 
+def test_worked_examples_never_repeat_an_item_when_the_dataset_names_a_label_twice(
+    client, app, gated, provider
+):
+    dataset_id, task_ids = _dataset(app, tasks=8)
+    with app.app_context():
+        dataset = db.session.get(Dataset, dataset_id)
+        dataset.labels = ["a", "a", "b", "c", "d", "e"]
+        db.session.commit()
+    _label_items(app, task_ids, ["a", "a", "b", "c", "d", "e", "e", None])
+    _ack(client, dataset_id, gated)
+
+    examples = _examples_sent(client, dataset_id, task_ids[-1], gated, provider)
+
+    assert len(examples) == len(set(examples))
+    assert [label for _, label in examples] == ["a", "b", "c", "d", "e"]
+
+
 def test_worked_examples_stop_at_five(client, app, gated, provider):
     dataset_id, task_ids = _dataset(app, tasks=13)
     _label_items(app, task_ids, ["obligation", "permission"] * 6 + [None])
