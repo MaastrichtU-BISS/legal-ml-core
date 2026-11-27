@@ -8,6 +8,63 @@ While the version is 0.x, minor releases may contain breaking changes.
 
 ## [Unreleased]
 
+## [0.23.0] - 2026-11-27
+
+### Added
+
+- Explore data counts an NER Dataset's entities (BAIGLE #179). For task types
+  `ner` and `named_entity_recognition`, `GET /datasets/<id>/eda` adds to
+  `task_specific_analysis`: `entity_column`, `total_entities`, `entity_types`
+  (each type's `count`, `share`, `rows` holding it, `mean_length_words` and up
+  to 10 `top_entities` with their `count` and `rows`, most common first),
+  `rows_without_entities`, `entities_per_row`, `rare_entity_types` (under 5%
+  of all entities), `unreadable_rows` and `entity_message`. Every key is there
+  even without an entities column, and a cell that cannot be read is counted,
+  never a 500. `GET /datasets/<id>/eda/visualizations` adds an
+  `entities_per_type` bar chart.
+- `GET /datasets/<id>/rows` takes `entity` and `entity_type`, alone or
+  together, keeping the rows whose entities cell holds such a span, so opening
+  a type or a top entity in Browse data shows as many rows as its `rows` count.
+  A Dataset without an entities column, or without a text column to read the
+  spans against, answers 400 with a message saying which.
+
+### Changed
+
+- Explore data reads an NER file as written (`read_rows_exact`) for the span
+  work only, so the spans' offsets point into the same text the annotation
+  queue checks them against. The overview, column analysis, data quality,
+  statistics and generic charts still read the file with pandas' usual types,
+  so blank cells count as missing and numeric columns keep their summary and
+  chart; a JSON file's list and dict cells are JSON text there, so data quality
+  is scored instead of failing to 0. `perform_eda_analysis` and
+  `generate_visualizations` take the as-written frame as `exact_df`, which
+  falls back to `df`. Explore data also reads `.json` files, which gave 400
+  before. The entities cells are read by one helper,
+  `annotation_queue.read_span_cell`, which the queue uses too.
+- The entities column is left out of the categorical columns summary, like a
+  text column, even when most of its cells are `[]` or blank.
+- `rows_without_entities.percent` is a share of the readable rows, as `count`
+  and `entities_per_row` are.
+- `entity_message` says an entities column of type lists such as `"PER, LOC"`
+  names types but not where the entities are, so they cannot be counted; and
+  when some rows were read with no entities and others could not be read, it
+  says how many could not be read instead of that none could.
+- `GET /datasets/<id>/rows` reads an NER Dataset once, as written, for the
+  whole request, so "NA" and "00123" show and match as they are in the file,
+  and the entity filter keeps the right rows of a JSON file whose rows are
+  labelled rather than numbered.
+- Span offsets held as numpy integers are read as spans.
+- Blank entities cells count as rows read with no entities, as `[]` does, so
+  blank rows beside a malformed one no longer say that nothing could be read,
+  and type lists beside an empty row still say they cannot be counted.
+- The EDA responses write every dict key as JSON text, so a `.json` column
+  mixing numbers with lists or strings no longer fails with a 500. Keys that
+  become the same text, such as `1` and `"1"`, add their counts, numpy
+  booleans are plain booleans, and a date key is its plain text.
+- A rows filter that leaves no rows keeps the response's `columns`.
+- The OpenAPI document describes the `entity` and `entity_type` parameters and
+  the NER entity statistics.
+
 ## [0.22.2] - 2026-11-27
 
 ### Added

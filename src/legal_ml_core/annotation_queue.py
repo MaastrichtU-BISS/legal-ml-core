@@ -2,12 +2,14 @@
 import json
 import logging
 
+import numpy as np
 import pandas as pd
 from sqlalchemy.exc import IntegrityError
 
 from .annotation_format import SPAN_TYPES, _stored_entities, label_text
 from .db import db
 from .models import AnnotationTask, Dataset
+from .text_terms import TEXT_COL_NAMES, find_column
 
 logger = logging.getLogger(__name__)
 
@@ -191,6 +193,11 @@ def _file_spans(value, text):
         start, end, kind = span.get("start"), span.get("end"), span.get("type")
         if isinstance(start, bool) or isinstance(end, bool):
             return None
+        # An in-memory frame's cells can hold numpy integers.
+        if isinstance(start, np.integer):
+            start = int(start)
+        if isinstance(end, np.integer):
+            end = int(end)
         if not isinstance(start, int) or not isinstance(end, int):
             return None
         if not 0 <= start < end <= len(text):
@@ -208,13 +215,43 @@ def _file_spans(value, text):
     return checked
 
 
+def read_span_cell(value, text):
+    """``(spans, unreadable)`` for one ``entities`` cell: the spans it holds
+    (``_file_spans``), or ``None``, and whether the cell looks like spans (a
+    list, or text starting with ``[``) yet does not fit ``text``. A blank cell,
+    or a type list such as ``"PERSON, ORG"``, is ``(None, False)``."""
+    if isinstance(value, np.ndarray):
+        # An in-memory frame (a Hugging Face to_pandas()) can hold arrays.
+        value = value.tolist()
+    spans = _file_spans(value, text)
+    looks_like_spans = isinstance(value, (list, tuple)) or str(value).strip().startswith("[")
+    return spans, spans is None and looks_like_spans
+
+
+def file_entity_rows(df, text_column=None, entity_column=None):
+    """Each row's entities in an NER file, as ``(entity_column, rows)``.
+
+    ``rows`` holds one ``(spans, unreadable)`` pair per row, from
+    ``read_span_cell`` against the row's text. ``entity_column`` is ``None``,
+    and ``rows`` empty, when the file has no entities column or no text column
+    to check the offsets against. The columns are found by name, as the import
+    writes them, unless given.
+    """
+    text_column = text_column or find_column(df, TEXT_COL_NAMES)
+    entity_column = entity_column or find_column(df, [LABEL_COLUMNS["ner"]])
+    if text_column is None or entity_column is None:
+        return None, []
+    texts = df[text_column].tolist()
+    cells = df[entity_column].tolist()
+    return entity_column, [read_span_cell(cell, str(text)) for cell, text in zip(cells, texts)]
+
+
 def _checked_spans(value, text, dataset, position):
     """The spans one ``entities`` cell holds (``_file_spans``), with a warning
     when a cell that looks like spans does not fit the row's text. The warning
     names the dataset and the row, never the text."""
-    spans = _file_spans(value, text)
-    looks_like_spans = isinstance(value, (list, tuple)) or str(value).strip().startswith("[")
-    if spans is None and looks_like_spans:
+    spans, unreadable = read_span_cell(value, text)
+    if unreadable:
         logger.warning(
             "dataset %s row %s: entities cell looks like spans but does not fit the text",
             dataset.id,
