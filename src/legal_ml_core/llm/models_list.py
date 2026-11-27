@@ -15,6 +15,7 @@ on the ``urllib3.connection`` logger are dropped, since urllib3 logs raw header
 text there when a provider's headers fail to parse.
 """
 
+import hashlib
 import json
 import logging
 import re
@@ -441,10 +442,9 @@ def _name(entry):
 
 # OpenRouter's request allowance for ``:free`` models: 50 a day, or 1000 a day
 # once the account has bought $10 of credit (the key's
-# ``free_model_daily_requests`` says which; ``is_free_tier`` is the fallback).
+# ``free_model_daily_requests`` says which; ``is_free_tier`` true means 50).
 # https://openrouter.ai/docs/api-reference/limits
 FREE_TIER_DAILY_REQUESTS = 50
-PAID_TIER_DAILY_REQUESTS = 1000
 KEY_CHECK_TIMEOUT_SECONDS = 5
 
 
@@ -480,10 +480,48 @@ def is_free_model(base_url, model):
     return _is_openrouter_https(base_url) and model.strip().endswith(":free")
 
 
+# Request fields that let OpenRouter bill something on a ``:free`` model: a
+# fallback route, plugins and web search, tools, or a preset that may add them.
+PAID_EXTRAS = ("route", "plugins", "tools", "preset", "web_search_options")
+
+
+def free_without_paid_fallback(base_url, model, extra_body):
+    """``is_free_model``, unless ``extra_body`` lets OpenRouter bill something.
+
+    Any of ``PAID_EXTRAS``, or ``models`` naming an id that isn't free, may be
+    billed (a paid fallback, web search, a plugin), so the paid limits stay.
+    """
+    if not is_free_model(base_url, model):
+        return False
+    extra = extra_body or {}
+    if not isinstance(extra, dict):
+        return False
+    if any(name in extra for name in PAID_EXTRAS):
+        return False
+    models = extra.get("models")
+    if models is None:
+        return True
+    return isinstance(models, list) and all(is_free_model(base_url, m) for m in models)
+
+
 def _count(value):
     if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
         return value
     return None
+
+
+# A key's allowance is asked at most once a minute per key: the estimate and
+# the panel may ask again and again. Keyed by base URL and the key's SHA-256,
+# never the key itself; a failed lookup isn't kept.
+ALLOWANCE_CACHE_SECONDS = 60
+_allowance_cache = {}
+_allowance_lock = threading.Lock()
+_cache_clock = monotonic  # replaced in tests
+
+
+def clear_allowance_cache():
+    with _allowance_lock:
+        _allowance_cache.clear()
 
 
 def openrouter_free_allowance(base_url, api_key):
@@ -491,9 +529,11 @@ def openrouter_free_allowance(base_url, api_key):
 
     Asks ``GET {base_url}/key``, and only for an https OpenRouter ``base_url``.
     ``data.free_model_daily_requests`` gives both when there; otherwise
-    ``data.is_free_tier`` true means 50 and false 1000, with ``remaining``
-    None. Any failure gives ``(50, None)``, the lower figure.
-    ``limit_remaining`` there is dollars of credit, not requests.
+    ``data.is_free_tier`` true means ``(50, None)``. ``is_free_tier`` false
+    alone says too little (an account that bought under $10 of credit still has
+    50), so it is ``(None, None)``: unknown. Any failure gives ``(50, None)``,
+    the lower figure. ``limit_remaining`` there is dollars of credit, not
+    requests. An answer is kept for ``ALLOWANCE_CACHE_SECONDS``.
     """
     fallback = (FREE_TIER_DAILY_REQUESTS, None)
     if not isinstance(base_url, str) or not isinstance(api_key, str) or not api_key:
@@ -501,27 +541,45 @@ def openrouter_free_allowance(base_url, api_key):
     if not _is_openrouter_https(base_url):
         return fallback
     base_url = base_url.strip().rstrip("/")
+    cache_key = (base_url, hashlib.sha256(api_key.encode()).hexdigest())
+    now = _cache_clock()
+    with _allowance_lock:
+        cached = _allowance_cache.get(cache_key)
+        if cached is not None and now < cached[0]:
+            return cached[1]
+    answer = _ask_free_allowance(base_url, api_key)
+    if answer is None:
+        return fallback
+    with _allowance_lock:
+        for key in [k for k, (until, _) in _allowance_cache.items() if until <= now]:
+            del _allowance_cache[key]
+        _allowance_cache[cache_key] = (now + ALLOWANCE_CACHE_SECONDS, answer)
+    return answer
+
+
+def _ask_free_allowance(base_url, api_key):
+    """``openrouter_free_allowance``'s lookup; None when it failed."""
     deadline = monotonic() + min(timeout_seconds(), KEY_CHECK_TIMEOUT_SECONDS)
     try:
         raw = _fetch(f"{base_url}/key", _headers(_host(base_url), api_key), deadline)
     except Exception:  # best effort: any failure is the lower figure
-        return fallback
+        return None
     try:
         data = json.loads(raw).get("data")
     except (ValueError, RecursionError, AttributeError):
-        return fallback
+        return None
     if not isinstance(data, dict):
-        return fallback
+        return None
     requests = data.get("free_model_daily_requests")
     if isinstance(requests, dict):
         limit, remaining = _count(requests.get("limit")), _count(requests.get("remaining"))
         if limit is not None:
             return limit, remaining
     if data.get("is_free_tier") is False:
-        return PAID_TIER_DAILY_REQUESTS, None
+        return None, None
     if data.get("is_free_tier") is True:
         return FREE_TIER_DAILY_REQUESTS, None
-    return fallback
+    return None
 
 
 def list_chat_models(base_url, api_key):

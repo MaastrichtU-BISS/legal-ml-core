@@ -38,6 +38,9 @@ METER_DOWN_MESSAGE = (
 MAX_WAITS_PER_ITEM = 3
 DEFAULT_WAIT_SECONDS = 20
 MAX_WAIT_SECONDS = 120
+# The worker is the only LLM consumer, so one job's waits are bounded in all:
+# a wait that would take the job's total over this stops it as provider_limited.
+MAX_WAIT_SECONDS_PER_JOB = 600
 
 # Replaced in tests, so they don't sleep.
 _sleep = time.sleep
@@ -48,7 +51,7 @@ class BudgetExhausted(Exception):
 
 
 def is_free_credential(credential):
-    """A free model with no paid fallback (see ``access.free_without_paid_fallback``)."""
+    """A free model with no paid fallback (see ``models_list.free_without_paid_fallback``)."""
     return credential is not None and free_without_paid_fallback(
         credential.base_url, credential.model, getattr(credential, "extra_body", None)
     )
@@ -142,13 +145,14 @@ def call_metered(credential, owner_id, messages):
     return content
 
 
-def _call_waiting(credential, owner_id, messages, on_wait):
+def _call_waiting(credential, owner_id, messages, on_wait, waited):
     """``call_metered``, waiting out a provider's per-minute limit.
 
     Waits at most ``MAX_WAITS_PER_ITEM`` times; a daily limit, a wait known to
-    be longer than ``MAX_WAIT_SECONDS``, or one more 429 after the last wait, is
-    raised at once. A retry that is sure to fail would only spend the free
-    model's daily allowance.
+    be longer than ``MAX_WAIT_SECONDS``, one more 429 after the last wait, or a
+    wait that would take the job's total (``waited[0]``, seconds, shared by
+    its items) over ``MAX_WAIT_SECONDS_PER_JOB``, is raised at once. A retry
+    that is sure to fail would only spend the free model's daily allowance.
     """
     waits = 0
     while True:
@@ -158,8 +162,11 @@ def _call_waiting(credential, owner_id, messages, on_wait):
             too_long = exc.retry_after is not None and exc.retry_after > MAX_WAIT_SECONDS
             if exc.daily or too_long or waits >= MAX_WAITS_PER_ITEM:
                 raise
-            waits += 1
             seconds = exc.retry_after or DEFAULT_WAIT_SECONDS
+            if waited[0] + seconds > MAX_WAIT_SECONDS_PER_JOB:
+                raise
+            waits += 1
+            waited[0] += seconds
             if on_wait:
                 on_wait(seconds)
             _sleep(seconds)
@@ -195,8 +202,9 @@ def suggest_tasks(
     Work already done survives ``BudgetExhausted`` and ``LLMError``, and rerunning
     skips it. Output failing the constraint is discarded and counted as invalid.
     With ``wait_on_rate_limit`` (the worker only: a request never sleeps), a
-    provider's per-minute 429 is waited out and the item retried; ``on_wait``
-    hears the seconds before each wait and ``None`` after it.
+    provider's per-minute 429 is waited out and the item retried, up to
+    ``MAX_WAIT_SECONDS_PER_JOB`` of waiting in all; ``on_wait`` hears the
+    seconds before each wait and ``None`` after it.
     """
     version, template, definitions = current_prompt(dataset)
     examples = confirmed_examples(dataset)
@@ -209,6 +217,7 @@ def suggest_tasks(
         )
     }
     result = {"created": [], "skipped": 0, "invalid": 0}
+    waited = [0]  # seconds this job has waited on the provider, across its items
 
     for task in tasks:
         if task.id in existing:
@@ -218,7 +227,7 @@ def suggest_tasks(
                 template, definitions, dataset.labels, examples, task.text
             )
             if wait_on_rate_limit:
-                content = _call_waiting(credential, owner_id, messages, on_wait)
+                content = _call_waiting(credential, owner_id, messages, on_wait, waited)
             else:
                 content = call_metered(credential, owner_id, messages)
             try:

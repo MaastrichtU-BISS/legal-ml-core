@@ -13,13 +13,18 @@ from email.utils import parsedate_to_datetime
 import requests
 
 from .config import int_setting
-from .models_list import is_free_model
+from .models_list import free_without_paid_fallback
 
 # OpenRouter allows a free model 20 requests a minute; an X-RateLimit-Limit
 # above that names the daily allowance (50 or 1000) that was hit.
 FREE_PER_MINUTE_REQUESTS = 20
 # No provider wait is reported as longer than this.
 MAX_RETRY_AFTER_SECONDS = 7 * 24 * 3600
+
+NO_QUOTA_MESSAGE = (
+    "The LLM service says this key has no quota left. "
+    "Check your provider's billing, or pick another model."
+)
 
 
 class LLMError(Exception):
@@ -151,22 +156,46 @@ def _limit_from(headers):
     return int(number) if number is not None and number.is_integer() else None
 
 
-def parse_rate_limit(response, now=None, free=False):
-    """A ``ProviderRateLimited`` for a 429 ``response``. The body is only read, never shown.
-
-    Daily when the message names OpenRouter's ``...-per-day`` limit, or, for a
-    free model (``free``), when ``X-RateLimit-Limit`` is over the per-minute
-    allowance. Never by how far away the reset is.
-    """
-    now = time.time() if now is None else now
+def _error_of(response):
+    """The body's ``error`` object, or ``{}``. Nothing in it is ever shown."""
     try:
         payload = response.json()
     except Exception:
         payload = None
     error = payload.get("error") if isinstance(payload, dict) else None
-    error = error if isinstance(error, dict) else {}
+    return error if isinstance(error, dict) else {}
+
+
+def _metadata_of(error):
+    metadata = error.get("metadata")
+    return metadata if isinstance(metadata, dict) else {}
+
+
+def is_insufficient_quota(response):
+    """A 429 that means the key has no quota or credit left, not a rate limit.
+
+    OpenAI says ``insufficient_quota`` in ``error.code`` or ``error.type``;
+    OpenRouter relays an upstream's in ``error.metadata.error_type``.
+    """
+    error = _error_of(response)
+    values = (error.get("code"), error.get("type"), _metadata_of(error).get("error_type"))
+    return any(isinstance(v, str) and v.lower() == "insufficient_quota" for v in values)
+
+
+def parse_rate_limit(response, now=None, free=False):
+    """A ``ProviderRateLimited`` for a 429 ``response``. The body is only read, never shown.
+
+    Daily when the message names OpenRouter's ``...-per-day`` limit, or, for a
+    free model (``free``), when ``X-RateLimit-Limit`` is over the per-minute
+    allowance. Never by how far away the reset is. An upstream provider's 429
+    that OpenRouter relays (``error.metadata.provider_code``) is daily only by
+    the ``per-day`` name: its limit header is that provider's, not OpenRouter's.
+    """
+    now = time.time() if now is None else now
+    error = _error_of(response)
     message = error.get("message") if isinstance(error.get("message"), str) else ""
-    metadata = error.get("metadata") if isinstance(error.get("metadata"), dict) else {}
+    metadata = _metadata_of(error)
+    upstream = metadata.get("provider_code") is not None
     body_headers = metadata.get("headers") if isinstance(metadata.get("headers"), dict) else {}
     response_headers = getattr(response, "headers", None)
 
@@ -180,7 +209,7 @@ def parse_rate_limit(response, now=None, free=False):
     if limit is None:
         limit = _limit_from(body_headers)
     daily = "per-day" in message.lower() or (
-        free and limit is not None and limit > FREE_PER_MINUTE_REQUESTS
+        free and not upstream and limit is not None and limit > FREE_PER_MINUTE_REQUESTS
     )
     return ProviderRateLimited(retry_after, daily)
 
@@ -221,7 +250,12 @@ class OpenAICompatibleClient:
         if response.status_code in (401, 403):
             raise LLMError("The LLM service rejected the API key.")
         if response.status_code == 429:
-            raise parse_rate_limit(response, free=is_free_model(self.base_url, self.model))
+            if is_insufficient_quota(response):
+                raise LLMError(NO_QUOTA_MESSAGE)
+            # A paid fallback's limit header names its per-minute limit, not a
+            # daily one, so only a free model with no paid extras reads it so.
+            free = free_without_paid_fallback(self.base_url, self.model, self.extra_body)
+            raise parse_rate_limit(response, free=free)
         if response.status_code != 200:
             raise LLMError("The LLM service returned an error.")
 

@@ -13,7 +13,9 @@ from ..db import db
 from ..models import LLMAcknowledgement, LLMCredential, LLMUsage
 from .client import OpenAICompatibleClient
 from .config import setting, shared_endpoint
-from .models_list import is_free_model
+# free_without_paid_fallback lives with is_free_model; it is re-exported here
+# for the callers that import it from access.
+from .models_list import free_without_paid_fallback, is_free_model  # noqa: F401
 
 SHARED_KEY_FEATURE = "llm.shared_key"
 
@@ -141,25 +143,6 @@ def resolve_credential(owner_id, claims):
     if byok is not None:
         return _checked(byok)
     return _shared_credential() if shared_key_allowed(claims) else None
-
-
-def free_without_paid_fallback(base_url, model, extra_body):
-    """``is_free_model``, unless ``extra_body`` lets OpenRouter bill a paid fallback.
-
-    A ``route``, or ``models`` naming any id that isn't free, may fall back to
-    a paid model, so the paid limits must stay.
-    """
-    if not is_free_model(base_url, model):
-        return False
-    extra = extra_body or {}
-    if not isinstance(extra, dict):
-        return False
-    if "route" in extra:
-        return False
-    models = extra.get("models")
-    if models is None:
-        return True
-    return isinstance(models, list) and all(is_free_model(base_url, m) for m in models)
 
 
 def free_model_for(owner_id, claims):

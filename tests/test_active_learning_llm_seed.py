@@ -248,3 +248,31 @@ def test_an_llm_seed_on_a_free_model_never_asks_for_the_providers_allowance(
     assert resp.status_code == 201, resp.get_json()
     assert len(_queued(fake_redis)) == 1
     assert asked == []
+
+
+def test_an_llm_seed_on_a_free_shared_model_never_reads_the_balance(
+    client, app, headers, dataset_id, fake_redis
+):
+    class BalanceUnread:
+        reads = 0
+
+        def remaining(self, owner_id):
+            BalanceUnread.reads += 1
+            raise ConnectionError("down")
+
+        def record(self, owner_id, tokens, key):
+            pass
+
+    app.config["USAGE_METER"] = BalanceUnread()
+    app.config["LLM_SHARED_ENDPOINT"] = {
+        **app.config["LLM_SHARED_ENDPOINT"],
+        "base_url": "https://openrouter.ai/api/v1",
+        "model": "meta-llama/llama-3.3-70b-instruct:free",
+    }
+    _ack(client, headers, dataset_id)
+
+    resp = _estimate(client, headers, dataset_id)
+    assert resp.status_code == 200, resp.get_json()
+    assert (resp.get_json()["remaining_tokens"], resp.get_json()["within_budget"]) == (None, True)
+    assert _start_llm_seed(client, headers, dataset_id).status_code == 201
+    assert BalanceUnread.reads == 0

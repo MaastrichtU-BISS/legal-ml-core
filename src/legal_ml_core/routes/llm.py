@@ -21,6 +21,7 @@ from ..llm.access import (
 from ..llm.client import LLMError, ProviderRateLimited
 from ..llm.config import float_setting, int_setting, shared_endpoint
 from ..llm.models_list import (
+    FREE_TIER_DAILY_REQUESTS,
     MESSAGES as LISTING_MESSAGES,
     ModelListError,
     list_chat_models,
@@ -223,14 +224,20 @@ def status():
         # monthly limit, and the host may relax its own limits for it.
         "free_model": is_free_credential(credential),
     }
-    if credential and credential.mode == "shared":
+    # A free shared model isn't capped, so its balance isn't read at all: it
+    # stays null, and a meter that is down doesn't stop it.
+    if credential and credential.mode == "shared" and not body["free_model"]:
         try:
             body["remaining_tokens"] = remaining_tokens(owner_id)
         except LLMError:
-            # A free shared model isn't capped, so a meter that is down doesn't stop it.
-            if not body["free_model"]:
-                body["shared_key_available"] = False
-                body["shared_key_unavailable_reason"] = METER_DOWN_MESSAGE
+            # The failed meter read may leave the session needing a rollback
+            # before the dataset lookup below.
+            try:
+                db.session.rollback()
+            except Exception:
+                current_app.logger.exception("rollback after a failed meter read failed")
+            body["shared_key_available"] = False
+            body["shared_key_unavailable_reason"] = METER_DOWN_MESSAGE
 
     dataset_id = request.args.get("dataset_id")
     if dataset_id:
@@ -697,22 +704,19 @@ def bulk_accept(dataset_id):
 
 
 def _shared_remaining(credential, free):
-    """Tokens left on the shared key, or None. A free model's meter may be down."""
-    if credential.mode != "shared":
+    """Tokens left on the shared key, or None. A free model's balance isn't read."""
+    if credential.mode != "shared" or free:
         return None
-    if not free:
-        return remaining_tokens(_owner())
-    try:
-        return remaining_tokens(_owner())
-    except LLMError:
-        return None
+    return remaining_tokens(_owner())
 
 
 def _estimate(dataset, credential, task_ids, provider_allowance=True):
     """The job's size and cost. ``over_provider_limit`` only warns: nothing refuses on it.
 
     ``provider_allowance`` False skips asking the provider for a free model's
-    daily allowance (the seed only needs ``within_budget``).
+    daily allowance (the seed only needs ``within_budget``, and Start follows
+    the estimate the user already saw); the provider fields are then null and
+    ``over_provider_limit`` false.
     """
     tasks = _pending_tasks(dataset, task_ids)
     estimated = estimate_job_tokens(dataset, tasks)
@@ -723,10 +727,16 @@ def _estimate(dataset, credential, task_ids, provider_allowance=True):
         daily_limit, daily_remaining = openrouter_free_allowance(
             credential.base_url, credential.api_key
         )
-    if daily_remaining is not None:
-        over = len(tasks) > daily_remaining
-    else:
-        over = daily_limit is not None and len(tasks) > daily_limit
+    over = False
+    if free and provider_allowance:
+        # Warn-only: by what is left today, else the allowance, else the lower
+        # allowance (50) when the provider didn't say which applies.
+        if daily_remaining is not None:
+            over = len(tasks) > daily_remaining
+        elif daily_limit is not None:
+            over = len(tasks) > daily_limit
+        else:
+            over = len(tasks) > FREE_TIER_DAILY_REQUESTS
     return tasks, {
         "tasks": len(tasks),
         "estimated_tokens": estimated,
@@ -760,7 +770,10 @@ def start_annotation(dataset_id):
         raise ApiError(400, "Review the estimate, then send confirm_estimate: true.")
 
     credential = _ready_credential(dataset)
-    tasks, estimate = _estimate(dataset, credential, data.get("task_ids"))
+    # The user saw the provider's allowance in the estimate; Start doesn't ask again.
+    tasks, estimate = _estimate(
+        dataset, credential, data.get("task_ids"), provider_allowance=False
+    )
     if not tasks:
         raise ApiError(400, "There are no pending items to annotate.")
     if not estimate["within_budget"]:
