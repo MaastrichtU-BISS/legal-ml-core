@@ -1,10 +1,12 @@
 """POST /api/datasets/<id>/practice-copy makes an unlabelled copy of a labelled
 single-label Dataset (BAIGLE #197)."""
 
+import logging
 import os
 
 import pandas as pd
 import pytest
+from sqlalchemy.exc import SQLAlchemyError
 
 from legal_ml_core import AnnotationTask, Dataset, db
 from legal_ml_core.annotation_queue import create_annotation_tasks
@@ -390,7 +392,7 @@ def test_a_half_written_file_is_removed(client, auth_headers, app, monkeypatch):
 
 
 def test_a_failing_database_cleanup_still_removes_the_file_and_keeps_the_first_error(
-    client, auth_headers, app, monkeypatch
+    client, auth_headers, app, monkeypatch, caplog
 ):
     dataset_id = _dataset(app)
     before = _uploads(app)
@@ -402,10 +404,47 @@ def test_a_failing_database_cleanup_still_removes_the_file_and_keeps_the_first_e
         raise ConnectionError("database gone")
 
     monkeypatch.setattr("legal_ml_core.routes.datasets.create_annotation_tasks", fail)
-    # The rollback that follows the failure is where a lost connection shows.
+    # A lost connection fails every call the cleanup makes.
     monkeypatch.setattr(db.session, "rollback", database_gone)
+    monkeypatch.setattr(db.session, "get", database_gone)
 
-    with pytest.raises(RuntimeError, match="tasks could not be made"):
+    with caplog.at_level(logging.WARNING, logger="legal_ml_core.routes.datasets"):
+        with pytest.raises(RuntimeError, match="tasks could not be made"):
+            _post(client, auth_headers, dataset_id)
+
+    assert _uploads(app) == before
+    assert "practice_copy_cleanup_dataset_failed" in caplog.text
+    assert "exception_type=ConnectionError" in caplog.text
+    assert "_practice.csv" in caplog.text
+
+
+def test_a_failed_final_commit_removes_the_copy_its_prompt_tasks_and_file(client, auth_headers, app, monkeypatch):
+    dataset_id = _dataset(app)
+    _add_prompt(app, dataset_id, 1, {"Obligation": "Someone must do something."})
+    before = _uploads(app)
+    real_tasks = create_annotation_tasks
+    real_commit = db.session.commit
+    armed = {"fail": False}
+
+    def tasks_then_arm(dataset):
+        real_tasks(dataset)
+        armed["fail"] = True
+
+    def commit():
+        if armed["fail"]:
+            armed["fail"] = False
+            raise SQLAlchemyError("commit failed")
+        real_commit()
+
+    monkeypatch.setattr("legal_ml_core.routes.datasets.create_annotation_tasks", tasks_then_arm)
+    monkeypatch.setattr(db.session, "commit", commit)
+
+    with pytest.raises(SQLAlchemyError, match="commit failed"):
         _post(client, auth_headers, dataset_id)
 
+    monkeypatch.undo()
+    with app.app_context():
+        assert [d.id for d in Dataset.query.all()] == [dataset_id]
+        assert [p.dataset_id for p in LLMPrompt.query.all()] == [dataset_id]
+        assert AnnotationTask.query.filter(AnnotationTask.dataset_id != dataset_id).count() == 0
     assert _uploads(app) == before
