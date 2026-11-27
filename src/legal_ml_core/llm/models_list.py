@@ -524,6 +524,18 @@ def clear_allowance_cache():
         _allowance_cache.clear()
 
 
+def _allowance_cache_key(base_url, api_key):
+    return (base_url.strip().rstrip("/"), hashlib.sha256(api_key.encode()).hexdigest())
+
+
+def forget_openrouter_allowance(base_url, api_key):
+    """Drop this key's kept allowance, so the next estimate asks OpenRouter again."""
+    if not isinstance(base_url, str) or not isinstance(api_key, str) or not api_key:
+        return
+    with _allowance_lock:
+        _allowance_cache.pop(_allowance_cache_key(base_url, api_key), None)
+
+
 def openrouter_free_allowance(base_url, api_key):
     """``(limit, remaining)``: requests a day OpenRouter allows this key on free models.
 
@@ -540,8 +552,8 @@ def openrouter_free_allowance(base_url, api_key):
         return fallback
     if not _is_openrouter_https(base_url):
         return fallback
-    base_url = base_url.strip().rstrip("/")
-    cache_key = (base_url, hashlib.sha256(api_key.encode()).hexdigest())
+    cache_key = _allowance_cache_key(base_url, api_key)
+    base_url = cache_key[0]
     now = _cache_clock()
     with _allowance_lock:
         cached = _allowance_cache.get(cache_key)

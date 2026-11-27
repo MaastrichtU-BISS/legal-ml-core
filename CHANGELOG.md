@@ -53,9 +53,11 @@ While the version is 0.x, minor releases may contain breaking changes.
   week. It is daily when the message names a `per-day` limit, or, for a free
   model with no paid extras, when `X-RateLimit-Limit` is over 20 (the
   per-minute allowance), unless the 429 is an upstream provider's relayed by
-  OpenRouter (`error.metadata.provider_code`); never from how far away the
-  reset is. An `insufficient_quota` 429 (in `error.code`, `error.type` or
-  `error.metadata.error_type`) is not a rate limit: it is an `LLMError`
+  OpenRouter (`error.metadata.provider_code`, or a non-empty
+  `error.metadata.provider_name`); never from how far away the reset is. An
+  `insufficient_quota` 429 (in `error.code`, `error.type`,
+  `error.metadata.provider_code`, where OpenRouter relays an upstream's own
+  code, or `error.metadata.error_type`) is not a rate limit: it is an `LLMError`
   saying the key has no quota left, and a job ends `failed`. The LLM
   routes answer it with 429, `code: provider_rate_limited`, `retry_after`,
   `daily` and a `Retry-After` header when known, in plain words; the
@@ -70,6 +72,18 @@ While the version is 0.x, minor releases may contain breaking changes.
   `retry_after` and `daily`, keeping the suggestions and counts made so far.
   `suggest_tasks` takes `wait_on_rate_limit` (off for API requests, which
   never sleep).
+- One LLM job per user at a time, since the worker runs one job at a time and
+  a job may wait out a provider's limit. `POST .../annotate` and an LLM seed
+  in `POST /api/active-learning/datasets/<id>/start` answer 409 `job_running`
+  with the active `job_id` while that user has one queued or running. The
+  active job is `llm_active_job:{owner_id}` (`llm_active_job_key` in
+  `queue_contract`), set NX with the job status's TTL when the job is queued
+  (`claim_llm_job`) and deleted by the worker on any final status, only while
+  it still names that job (`release_llm_job`). A key naming a job whose status
+  is gone or final is taken over. A seed whose loop fails to commit frees it.
+- Starting a job on a free OpenRouter model drops that key's kept `/key`
+  answer (`forget_openrouter_allowance`), so the next estimate reads the
+  requests left afresh.
 
 ### Changed
 

@@ -132,6 +132,51 @@ def test_an_llm_seed_needs_the_acknowledgement(client, headers, dataset_id, fake
     assert _queued(fake_redis) == []
 
 
+def test_an_llm_seed_waits_for_the_owners_running_job(client, headers, dataset_id, fake_redis):
+    from legal_ml_core.queue_contract import llm_active_job_key, llm_job_status_key
+
+    fake_redis.set(llm_active_job_key(TEST_USER_ID), "busy")
+    fake_redis.set(llm_job_status_key("busy"), json.dumps({"status": "running"}))
+    _ack(client, headers, dataset_id)
+
+    resp = _start_llm_seed(client, headers, dataset_id)
+
+    assert resp.status_code == 409
+    body = resp.get_json()
+    assert (body["success"], body["code"], body["job_id"]) == (False, "job_running", "busy")
+    assert state(client, headers, dataset_id)["active"] is False
+    assert _queued(fake_redis) == []
+    assert fake_redis.keys("llm_job_status_*") == [llm_job_status_key("busy")]
+
+
+def test_an_llm_seed_becomes_the_owners_active_job_until_it_ends(
+    client, headers, dataset_id, fake_redis, provider
+):
+    from legal_ml_core.queue_contract import llm_active_job_key
+
+    _ack(client, headers, dataset_id)
+    assert _start_llm_seed(client, headers, dataset_id).status_code == 201
+    [job] = _queued(fake_redis)
+    assert fake_redis.get(llm_active_job_key(TEST_USER_ID)) == job["job_id"]
+    _run_seed_job(fake_redis)
+    assert fake_redis.get(llm_active_job_key(TEST_USER_ID)) is None
+
+
+def test_a_failed_commit_frees_the_claimed_seed(client, headers, dataset_id, fake_redis, monkeypatch):
+    from legal_ml_core.queue_contract import llm_active_job_key
+
+    _ack(client, headers, dataset_id)
+
+    def boom():
+        raise RuntimeError("db down")
+
+    monkeypatch.setattr(db.session, "commit", boom)
+    with pytest.raises(RuntimeError):
+        _start_llm_seed(client, headers, dataset_id)
+    assert fake_redis.get(llm_active_job_key(TEST_USER_ID)) is None
+    assert fake_redis.keys("llm_job_status_*") == []
+
+
 def _run_seed_job(fake_redis):
     [raw] = fake_redis.lrange("llm_queue", 0, -1)
     fake_redis.delete("llm_queue")

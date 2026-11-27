@@ -11,7 +11,12 @@ import uuid
 
 from ..db import db
 from ..models import AnnotationTask, Dataset, LLMPrompt, LLMSuggestion
-from ..queue_contract import LLM_JOB_STATUS_TTL_SECONDS, llm_job_status_key
+from ..queue_contract import (
+    LLM_JOB_FINAL_STATUSES,
+    LLM_JOB_STATUS_TTL_SECONDS,
+    llm_job_status_key,
+    release_llm_job,
+)
 from .access import CredentialError, credential_for_mode, free_without_paid_fallback
 from .client import LLMError, ProviderRateLimited, estimate_tokens
 from .config import int_setting
@@ -257,6 +262,9 @@ def _set_status(redis_client, job_id, **fields):
     status = json.loads(raw) if raw else {}
     status.update(fields)
     redis_client.setex(key, LLM_JOB_STATUS_TTL_SECONDS, json.dumps(status))
+    # A final status frees the owner to start another job.
+    if status.get("status") in LLM_JOB_FINAL_STATUSES and status.get("owner_id"):
+        release_llm_job(redis_client, status["owner_id"], job_id)
 
 
 def process_llm_annotation_task(task_info, redis_client):

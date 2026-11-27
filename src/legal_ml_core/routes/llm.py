@@ -24,6 +24,7 @@ from ..llm.models_list import (
     FREE_TIER_DAILY_REQUESTS,
     MESSAGES as LISTING_MESSAGES,
     ModelListError,
+    forget_openrouter_allowance,
     list_chat_models,
     openrouter_free_allowance,
 )
@@ -52,7 +53,7 @@ from ..models import (
     LLMPrompt,
     LLMSuggestion,
 )
-from ..queue_contract import LLM_JOB_STATUS_TTL_SECONDS, llm_job_status_key
+from ..queue_contract import claim_llm_job, llm_job_status_key
 
 llm_bp = Blueprint("llm", __name__)
 
@@ -703,6 +704,22 @@ def bulk_accept(dataset_id):
     return jsonify({"accepted": len(suggestions), "agreement": check}), 200
 
 
+JOB_RUNNING_MESSAGE = (
+    "A labelling job is already running for you. Wait for it to finish, or stop it first."
+)
+
+
+def refuse_if_job_running(redis_client, owner_id, job_id, total):
+    """Queue this job's status as the owner's one active job, or refuse with 409.
+
+    The LLM worker runs one job at a time and a job may wait out a provider's
+    limit, so one owner's jobs queued back to back would hold up everyone's.
+    """
+    active = claim_llm_job(redis_client, owner_id, job_id, total)
+    if active is not None:
+        raise ApiError(409, JOB_RUNNING_MESSAGE, code="job_running", job_id=active)
+
+
 def _shared_remaining(credential, free):
     """Tokens left on the shared key, or None. A free model's balance isn't read."""
     if credential.mode != "shared" or free:
@@ -788,13 +805,10 @@ def start_annotation(dataset_id):
     job_id = str(uuid.uuid4())
     owner_id = _owner()
     redis_client = current_app.redis_client
-    redis_client.setex(
-        llm_job_status_key(job_id),
-        LLM_JOB_STATUS_TTL_SECONDS,
-        json.dumps(
-            {"owner_id": owner_id, "status": "queued", "total": len(tasks), "done": 0}
-        ),
-    )
+    refuse_if_job_running(redis_client, owner_id, job_id, len(tasks))
+    if estimate["free_model"]:
+        # Start uses up the free allowance; the next estimate reads it again.
+        forget_openrouter_allowance(credential.base_url, credential.api_key)
     redis_client.lpush(
         "llm_queue",
         json.dumps(

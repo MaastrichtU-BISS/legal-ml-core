@@ -19,7 +19,7 @@ from ..active_learning.loop import (
 from ..auth import get_jwt_identity, jwt_required
 from ..db import db
 from ..models import Dataset
-from ..queue_contract import LLM_JOB_STATUS_TTL_SECONDS, llm_job_status_key, llm_seed_job_key
+from ..queue_contract import LLM_JOB_STATUS_TTL_SECONDS, llm_job_status_key, llm_seed_job_key, release_llm_job
 
 active_learning_bp = Blueprint("active_learning", __name__)
 
@@ -70,7 +70,12 @@ def start(dataset_id):
     except ApiError as error:
         db.session.rollback()
         return jsonify({"success": False, **error.body}), error.status
-    db.session.commit()
+    try:
+        db.session.commit()
+    except Exception:
+        if seed_job:
+            _drop_llm_seed(seed_job)
+        raise
     if seed_job:
         _queue_llm_seed(dataset, seed_job)
     return jsonify({"success": True, **loop_state(dataset)}), 201
@@ -123,7 +128,7 @@ def _llm_seed_credential(dataset, options):
 
 def _llm_seed_job(dataset, credential):
     """The worker message for the seed, refused when over the monthly limit."""
-    from .llm import ApiError, _estimate
+    from .llm import ApiError, _estimate, refuse_if_job_running
 
     # start_loop adds the config without the dataset seeing it yet.
     db.session.flush()
@@ -143,7 +148,7 @@ def _llm_seed_job(dataset, credential):
             byok_available=True,
             estimate=estimate,
         )
-    return {
+    job = {
         "job_id": str(uuid.uuid4()),
         "dataset_id": dataset.id,
         "owner_id": str(get_jwt_identity()),
@@ -151,15 +156,20 @@ def _llm_seed_job(dataset, credential):
         "task_ids": [task.id for task in tasks],
         "seed_batch_size": dataset.al_config.batch_size,
     }
+    # One LLM job per owner on the shared worker; last, so a refusal above claims nothing.
+    refuse_if_job_running(current_app.redis_client, job["owner_id"], job["job_id"], len(tasks))
+    return job
+
+
+def _drop_llm_seed(job):
+    """The loop didn't start: the claimed job never runs, so free the owner."""
+    redis_client = current_app.redis_client
+    release_llm_job(redis_client, job["owner_id"], job["job_id"])
+    redis_client.delete(llm_job_status_key(job["job_id"]))
 
 
 def _queue_llm_seed(dataset, job):
     redis_client = current_app.redis_client
-    redis_client.setex(
-        llm_job_status_key(job["job_id"]),
-        LLM_JOB_STATUS_TTL_SECONDS,
-        json.dumps({"owner_id": job["owner_id"], "status": "queued", "total": len(job["task_ids"]), "done": 0}),
-    )
     redis_client.setex(llm_seed_job_key(dataset.id), LLM_JOB_STATUS_TTL_SECONDS, job["job_id"])
     redis_client.lpush("llm_queue", json.dumps(job))
 

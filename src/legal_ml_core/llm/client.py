@@ -175,10 +175,17 @@ def is_insufficient_quota(response):
     """A 429 that means the key has no quota or credit left, not a rate limit.
 
     OpenAI says ``insufficient_quota`` in ``error.code`` or ``error.type``;
-    OpenRouter relays an upstream's in ``error.metadata.error_type``.
+    OpenRouter relays an upstream's own code in ``error.metadata.provider_code``
+    (and may say it in ``error.metadata.error_type``).
     """
     error = _error_of(response)
-    values = (error.get("code"), error.get("type"), _metadata_of(error).get("error_type"))
+    metadata = _metadata_of(error)
+    values = (
+        error.get("code"),
+        error.get("type"),
+        metadata.get("provider_code"),
+        metadata.get("error_type"),
+    )
     return any(isinstance(v, str) and v.lower() == "insufficient_quota" for v in values)
 
 
@@ -188,14 +195,18 @@ def parse_rate_limit(response, now=None, free=False):
     Daily when the message names OpenRouter's ``...-per-day`` limit, or, for a
     free model (``free``), when ``X-RateLimit-Limit`` is over the per-minute
     allowance. Never by how far away the reset is. An upstream provider's 429
-    that OpenRouter relays (``error.metadata.provider_code``) is daily only by
-    the ``per-day`` name: its limit header is that provider's, not OpenRouter's.
+    that OpenRouter relays (``error.metadata.provider_code``, or a non-empty
+    ``error.metadata.provider_name``) is daily only by the ``per-day`` name: its
+    limit header is that provider's, not OpenRouter's.
     """
     now = time.time() if now is None else now
     error = _error_of(response)
     message = error.get("message") if isinstance(error.get("message"), str) else ""
     metadata = _metadata_of(error)
-    upstream = metadata.get("provider_code") is not None
+    provider_name = metadata.get("provider_name")
+    upstream = metadata.get("provider_code") is not None or (
+        isinstance(provider_name, str) and provider_name.strip() != ""
+    )
     body_headers = metadata.get("headers") if isinstance(metadata.get("headers"), dict) else {}
     response_headers = getattr(response, "headers", None)
 

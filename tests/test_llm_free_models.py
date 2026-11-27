@@ -10,7 +10,7 @@ from legal_ml_core import LLMCredential, LLMSuggestion, db, free_model_for, is_f
 from legal_ml_core.llm import client as llm_client, suggest
 from legal_ml_core.llm.client import ProviderRateLimited, parse_rate_limit
 from legal_ml_core.llm.suggest import process_llm_annotation_task
-from legal_ml_core.queue_contract import llm_job_status_key
+from legal_ml_core.queue_contract import llm_active_job_key, llm_job_status_key
 from tests.conftest import TEST_USER_ID
 from tests.test_llm_routes import (  # noqa: F401 - fixtures used by name
     DESTINATION,
@@ -784,6 +784,23 @@ def test_an_upstream_providers_limit_header_is_not_daily():
     assert parse_rate_limit(in_headers, now=NOW, free=True).daily is False
 
 
+def test_an_upstream_named_only_by_provider_name_is_upstream():
+    # A relayed upstream error may carry provider_name and raw but no provider_code.
+    body = _openrouter_body(headers={"X-RateLimit-Limit": "60"})
+    body["error"]["metadata"].update({"provider_name": "Chutes", "raw": "slow down"})
+    assert parse_rate_limit(Limited(body=body), now=NOW, free=True).daily is False
+    # OpenRouter's own 429 with that header is the free daily allowance.
+    own = _openrouter_body(headers={"X-RateLimit-Limit": "60"})
+    assert parse_rate_limit(Limited(body=own), now=NOW, free=True).daily is True
+
+
+@pytest.mark.parametrize("provider_name", ["", "   ", None, 7])
+def test_an_empty_provider_name_is_not_upstream(provider_name):
+    body = _openrouter_body(headers={"X-RateLimit-Limit": "60"})
+    body["error"]["metadata"]["provider_name"] = provider_name
+    assert parse_rate_limit(Limited(body=body), now=NOW, free=True).daily is True
+
+
 def test_an_upstream_providers_per_day_name_is_still_daily():
     body = _upstream_body("free-models-per-day", {"X-RateLimit-Limit": "50"})
     assert parse_rate_limit(Limited(body=body), now=NOW, free=True).daily is True
@@ -800,7 +817,13 @@ NO_QUOTA = (
     [
         {"code": "insufficient_quota", "message": "You exceeded your current quota"},
         {"type": "insufficient_quota", "message": "You exceeded your current quota"},
-        {"code": 429, "message": "x", "metadata": {"provider_code": 429, "error_type": "insufficient_quota"}},
+        # OpenRouter relays the upstream's own code in metadata.provider_code.
+        {
+            "code": 429,
+            "message": "x",
+            "metadata": {"error_type": "rate_limit_exceeded", "provider_code": "insufficient_quota"},
+        },
+        {"code": 429, "message": "x", "metadata": {"error_type": "insufficient_quota"}},
     ],
 )
 def test_no_quota_left_is_not_a_rate_limit(monkeypatch, error):
@@ -958,3 +981,135 @@ def test_a_failed_allowance_lookup_is_not_kept(listing, monkeypatch):
     listing.responses["/key"] = (200, b'{"data": {"is_free_tier": false}}')
     assert openrouter_free_allowance(OPENROUTER, SECRET) == (None, None)
     assert len(listing.calls) == 2
+
+
+# One active job per owner: the worker runs one job at a time, so a stack of one
+# owner's jobs, each waiting out a provider limit, would hold up everyone's.
+
+
+def _start(client, dataset_id, headers):
+    return client.post(
+        f"/api/llm/datasets/{dataset_id}/annotate", json={"confirm_estimate": True}, headers=headers
+    )
+
+
+def test_a_second_start_while_a_job_is_queued_is_refused(client, app, gated, fake_redis):
+    dataset_id, _ = _dataset(app, tasks=3)
+    _ack(client, dataset_id, gated)
+    first = _start_job(client, dataset_id, gated)
+    resp = _start(client, dataset_id, gated)
+    assert resp.status_code == 409
+    assert resp.get_json() == {
+        "error": "A labelling job is already running for you. Wait for it to finish, or stop it first.",
+        "code": "job_running",
+        "job_id": first,
+    }
+    assert fake_redis.llen("llm_queue") == 1
+    # The refused job leaves no status behind.
+    assert sorted(fake_redis.keys("llm_job_status_*")) == [llm_job_status_key(first)]
+
+
+def test_a_running_job_also_refuses(client, app, gated, fake_redis):
+    dataset_id, _ = _dataset(app, tasks=3)
+    _ack(client, dataset_id, gated)
+    first = _start_job(client, dataset_id, gated)
+    suggest._set_status(fake_redis, first, status="running")
+    resp = _start(client, dataset_id, gated)
+    assert (resp.status_code, resp.get_json()["job_id"]) == (409, first)
+
+
+@pytest.mark.parametrize("final", ["completed", "failed", "budget_exhausted", "provider_limited"])
+def test_a_final_status_frees_the_owner(client, app, gated, fake_redis, final):
+    dataset_id, _ = _dataset(app, tasks=3)
+    _ack(client, dataset_id, gated)
+    first = _start_job(client, dataset_id, gated)
+    suggest._set_status(fake_redis, first, status=final)
+    assert fake_redis.get(llm_active_job_key(TEST_USER_ID)) is None
+    assert _start(client, dataset_id, gated).status_code == 202
+
+
+def test_the_worker_finishing_a_job_frees_the_owner(client, app, gated, fake_redis, provider):
+    body, _ = _run_job(client, app, gated, fake_redis)
+    assert body["status"] == "completed"
+    dataset_id, _ = _dataset(app, tasks=2)
+    _ack(client, dataset_id, gated)
+    assert _start(client, dataset_id, gated).status_code == 202
+
+
+def test_a_job_that_crashes_the_worker_frees_the_owner(client, app, gated, fake_redis):
+    dataset_id, _ = _dataset(app, tasks=3)
+    _ack(client, dataset_id, gated)
+    _start_job(client, dataset_id, gated)
+    suggest.fail_llm_job(fake_redis.rpop("llm_queue"), fake_redis)
+    assert _start(client, dataset_id, gated).status_code == 202
+
+
+def test_an_old_jobs_end_never_frees_a_newer_job(client, app, gated, fake_redis):
+    dataset_id, _ = _dataset(app, tasks=3)
+    _ack(client, dataset_id, gated)
+    old = _start_job(client, dataset_id, gated)
+    suggest._set_status(fake_redis, old, status="completed")
+    new = _start_job(client, dataset_id, gated)
+    # A late final status for the old job leaves the new one active.
+    suggest._set_status(fake_redis, old, status="failed")
+    assert fake_redis.get(llm_active_job_key(TEST_USER_ID)) == new
+    assert _start(client, dataset_id, gated).status_code == 409
+
+
+@pytest.mark.parametrize("old_status", [None, "completed", "provider_limited", "not json"])
+def test_a_stale_active_job_is_taken_over(client, app, gated, fake_redis, old_status):
+    fake_redis.set(llm_active_job_key(TEST_USER_ID), "gone")
+    if old_status == "not json":
+        fake_redis.set(llm_job_status_key("gone"), "{")
+    elif old_status:
+        fake_redis.set(llm_job_status_key("gone"), json.dumps({"status": old_status}))
+    dataset_id, _ = _dataset(app, tasks=3)
+    _ack(client, dataset_id, gated)
+    job_id = _start_job(client, dataset_id, gated)
+    assert fake_redis.get(llm_active_job_key(TEST_USER_ID)) == job_id
+    assert fake_redis.ttl(llm_active_job_key(TEST_USER_ID)) > 0
+
+
+def test_another_owners_job_does_not_refuse(client, app, gated, fake_redis):
+    fake_redis.set(llm_active_job_key("someone-else"), "theirs")
+    fake_redis.set(llm_job_status_key("theirs"), json.dumps({"status": "running"}))
+    dataset_id, _ = _dataset(app, tasks=3)
+    _ack(client, dataset_id, gated)
+    assert _start(client, dataset_id, gated).status_code == 202
+
+
+# Start uses up a free allowance: the next estimate asks OpenRouter again.
+
+
+def test_start_on_a_free_model_forgets_the_kept_allowance(client, app, gated, listing, free_shared):
+    listing.responses["/key"] = (
+        200,
+        b'{"data": {"is_free_tier": true, "free_model_daily_requests": '
+        b'{"used": 0, "limit": 1000, "remaining": 1000}}}',
+    )
+    dataset_id, _ = _dataset(app, tasks=3)
+    _ack(client, dataset_id, gated)
+    _estimate(client, dataset_id, gated)
+    _estimate(client, dataset_id, gated)
+    assert len(listing.calls) == 1  # kept a minute
+    _start_job(client, dataset_id, gated)
+    assert len(listing.calls) == 1  # Start itself doesn't ask
+    listing.responses["/key"] = (
+        200,
+        b'{"data": {"is_free_tier": true, "free_model_daily_requests": '
+        b'{"used": 3, "limit": 1000, "remaining": 997}}}',
+    )
+    assert _estimate(client, dataset_id, gated)["provider_daily_remaining"] == 997
+    assert len(listing.calls) == 2
+
+
+def test_forgetting_one_keys_allowance_keeps_the_others():
+    from legal_ml_core.llm import models_list
+
+    models_list.clear_allowance_cache()
+    models_list._allowance_cache[models_list._allowance_cache_key(OPENROUTER, "a")] = (1e18, (50, 1))
+    models_list._allowance_cache[models_list._allowance_cache_key(OPENROUTER, "b")] = (1e18, (50, 2))
+    models_list.forget_openrouter_allowance(OPENROUTER + "/", "a")
+    assert list(models_list._allowance_cache.values()) == [(1e18, (50, 2))]
+    models_list.forget_openrouter_allowance(None, "b")  # never raises
+    models_list.clear_allowance_cache()

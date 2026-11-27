@@ -1300,7 +1300,7 @@ paths:
         "201": {description: Started}
         "400": {description: "Not text classification, nothing to label, no named labels, or the estimate not confirmed"}
         "403": {description: "No LLM access: `code` no_llm_access, `byok_available` true"}
-        "409": {description: "Already started, or the project has not acknowledged the destination (`code` acknowledgement_required)"}
+        "409": {description: "Already started, the project has not acknowledged the destination (`code` acknowledgement_required), or an LLM job of yours is still queued or running (`code` job_running, its `job_id`)"}
         "429": {description: "The seed is larger than the remaining monthly limit (`code` budget_exhausted)"}
   /api/active-learning/datasets/{dataset_id}/seed-estimate:
     parameters:
@@ -2021,7 +2021,10 @@ paths:
         status `provider_limited` and keeps the suggestions already made. The
         provider isn't asked for its allowance again: the `estimate` here has
         `provider_daily_limit` and `provider_daily_remaining` null and
-        `over_provider_limit` false.
+        `over_provider_limit` false. One LLM job per user at a time: while one
+        is queued or running another is refused with 409 `job_running`. On a
+        free OpenRouter model the kept `/key` answer is dropped, so the next
+        estimate reads the allowance afresh.
       responses:
         "202":
           description: Job queued
@@ -2036,7 +2039,11 @@ paths:
         "401": { $ref: "#/components/responses/Unauthorized" }
         "403": { $ref: "#/components/responses/Forbidden" }
         "404": { $ref: "#/components/responses/NotFound" }
-        "409": { description: Acknowledgement required or destination changed }
+        "409":
+          description: >-
+            Acknowledgement required, destination changed, or an LLM job of
+            yours is still queued or running (`code` job_running, with that
+            job's `job_id`).
         "429": { description: Monthly limit reached }
         "502": { description: The LLM service failed }
   /api/llm/jobs/{job_id}:
@@ -2251,10 +2258,12 @@ components:
             True when the provider's daily allowance is used up: its message
             names a `per-day` limit, or, for a free OpenRouter model, its
             X-RateLimit-Limit is over the 20 a minute (unless the 429 is an
-            upstream provider's that OpenRouter relays, `error.metadata.provider_code`,
-            or the request may reach a paid fallback, web search, plugins or tools).
+            upstream provider's that OpenRouter relays, with `error.metadata.provider_code`
+            or a non-empty `error.metadata.provider_name`, or the request may reach a paid fallback, web search, plugins or tools).
             Never judged from how far away the reset is. A provider's
-            `insufficient_quota` is not a rate limit: it fails with 502
+            `insufficient_quota` (in `error.code`, `error.type`,
+            `error.metadata.provider_code` or `error.metadata.error_type`) is not
+            a rate limit: it fails with 502
             `llm_failed`, saying the key has no quota left.
     LlmEstimate:
       type: object
